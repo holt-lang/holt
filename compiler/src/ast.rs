@@ -10,10 +10,28 @@ pub struct Program {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportDecl {
+    pub path: Vec<String>,
+    pub path_span: Span,
+    pub symbols: Option<Vec<(String, Span)>>, // None = whole module
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
+    Import(ImportDecl),
     Function(Function),
     Struct(StructDecl),
     Class(ClassDecl),
+    Enum(EnumDecl),
+    Trait(TraitDecl),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum Visibility {
+    Public,
+    Private,
+    Default,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +41,11 @@ pub struct Function {
     pub name_span: Span,
     pub params: Vec<Param>,
     pub body: Block,
+    pub visibility: Visibility,
+    pub is_static: bool,
+    pub is_sealed: bool,
+    pub is_override: bool,
+    pub is_open: bool,
     pub span: Span,
 }
 
@@ -93,6 +116,7 @@ pub struct StructField {
     pub ty: Type,
     pub name: String,
     pub name_span: Span,
+    pub visibility: Visibility,
     pub span: Span,
 }
 
@@ -101,8 +125,81 @@ pub struct StructField {
 pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
+    pub is_open: bool,
+    pub is_sealed: bool,
+    pub extends: Option<Type>,
+    pub implements: Vec<Type>,
     pub fields: Vec<StructField>,
     pub methods: Vec<Function>,
+    pub constructors: Vec<ConstructorDecl>,
+    pub destructors: Vec<DestructorDecl>,
+    pub properties: Vec<PropertyDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub params: Vec<Param>,
+    pub body: Option<Block>,
+    pub visibility: Visibility,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestructorDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub body: Block,
+    pub visibility: Visibility,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyDecl {
+    pub ty: Option<Type>,
+    pub name: String,
+    pub name_span: Span,
+    pub visibility: Visibility,
+    pub getter: Option<Block>,
+    pub setter: Option<(Param, Block)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub methods: Vec<TraitMethod>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitMethod {
+    pub ret_ty: Type,
+    pub name: String,
+    pub name_span: Span,
+    pub params: Vec<Param>,
+    pub is_sealed: bool,
+    pub span: Span,
+}
+
+// Phase 4: enum (EBNF §28)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub variants: Vec<EnumVariant>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub name_span: Span,
+    pub discriminant: Option<i64>,
+    pub payload_ty: Option<Type>, // minimal single payload type e.g. Some(int)
     pub span: Span,
 }
 
@@ -260,6 +357,12 @@ pub enum ExprKind {
         ty: Type,
         fields: Vec<(String, Span, Expr)>,
     }, // Type has field = expr ... end
+    EnumVariant {
+        enum_name: Option<String>, // qualified prefix if any, e.g. Option in Option.Some
+        variant: String,
+        variant_span: Span,
+        args: Vec<Expr>,
+    },
     Match(MatchExpr),
 }
 
@@ -306,9 +409,14 @@ pub struct MatchArm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pattern {
     Wildcard(Span), // _
+    Var(String, Span),
     LitInt(i64, Span),
     LitBool(bool, Span),
-    // For Phase 2 we ignore enum/tuple patterns
+    Enum {
+        variant: String,
+        variant_span: Span,
+        payload: Option<Box<Pattern>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

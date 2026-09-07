@@ -140,6 +140,21 @@ fn main() -> miette::Result<()> {
         }
     };
 
+    // ── Import resolver (EBNF §32, pure Holt stdlib) ─────────────────
+    let program = match expand_imports(program, &args.file) {
+        Ok(p) => p,
+        Err(e) => {
+            let diag = error::SingleDiagnostic::new(
+                filename.clone(),
+                source.clone(),
+                e.span,
+                e.message,
+            );
+            eprintln!("{:?}", Report::new(diag));
+            std::process::exit(1);
+        }
+    };
+
     if args.print_ast {
         println!("{:#?}", program);
     }
@@ -258,4 +273,92 @@ fn codegen_to_object(
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn find_stdlib_root(start: &Path) -> Option<PathBuf> {
+    // Walk up from start dir looking for `stdlib` folder; fallback to CWD/stdlib
+    let mut dir = if start.is_dir() { start.to_path_buf() } else { start.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")) };
+    loop {
+        let candidate = dir.join("stdlib");
+        if candidate.is_dir() { return Some(candidate); }
+        if let Some(parent) = dir.parent() { dir = parent.to_path_buf(); } else { break; }
+    }
+    let cwd = PathBuf::from("stdlib");
+    if cwd.is_dir() { return Some(cwd); }
+    // workspace-relative fallback (holt-rs/stdlib)
+    let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../stdlib");
+    if ws.is_dir() { return Some(ws); }
+    None
+}
+
+fn expand_imports(mut program: ast::Program, importer: &Path) -> Result<ast::Program, crate::parse::ParseError> {
+    use std::collections::HashSet;
+    let stdlib_root = find_stdlib_root(importer);
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut out_items: Vec<ast::Item> = Vec::new();
+    let mut pending: Vec<ast::Item> = std::mem::take(&mut program.items);
+    // Preserve order: imports first? We inline at point of import.
+    // To avoid borrow issues, iterate and expand recursively.
+    let mut idx = 0;
+    while idx < pending.len() {
+        let item = pending[idx].clone();
+        if let ast::Item::Import(imp) = item {
+            let key = imp.path.join("::");
+            if visited.contains(&key) { idx += 1; continue; }
+            visited.insert(key.clone());
+
+            // Resolve file: qualified-name → path/to/file.hlt
+            let rel = imp.path.join("/") + ".hlt";
+            let mut file_path: Option<PathBuf> = None;
+            // 1. stdlib root
+            if let Some(ref root) = stdlib_root {
+                let p = root.join(&rel);
+                if p.is_file() { file_path = Some(p); }
+            }
+            // 2. relative to importer dir
+            if file_path.is_none() {
+                if let Some(parent) = importer.parent() {
+                    let p = parent.join(&rel);
+                    if p.is_file() { file_path = Some(p); }
+                }
+            }
+            // 3. relative to CWD
+            if file_path.is_none() {
+                let p = PathBuf::from(&rel);
+                if p.is_file() { file_path = Some(p); }
+            }
+            let path = file_path.ok_or_else(|| crate::parse::ParseError{message: format!("cannot resolve import `{}`", imp.path.join("::")), span: imp.span})?;
+            let src = fs::read_to_string(&path).map_err(|e| crate::parse::ParseError{message: format!("failed to read import {}: {e}", path.display()), span: imp.span})?;
+            let toks = crate::lexer::lex(&src);
+            if !toks.errors.is_empty() {
+                return Err(crate::parse::ParseError{message: format!("lex error in import {}", path.display()), span: imp.span});
+            }
+            let mut sub = crate::parse::parse(toks.tokens, src).map_err(|e| crate::parse::ParseError{message: format!("parse error in {}: {}", path.display(), e.message), span: imp.span})?;
+            // Recursively expand sub-imports
+            sub = expand_imports(sub, &path)?;
+            // Filter by symbols if selective import
+            if let Some(ref syms) = imp.symbols {
+                let wanted: HashSet<String> = syms.iter().map(|(s,_)| s.clone()).collect();
+                for it in sub.items {
+                    match &it {
+                        ast::Item::Function(f) if wanted.contains(&f.name) => out_items.push(it),
+                        ast::Item::Struct(s) if wanted.contains(&s.name) => out_items.push(it),
+                        ast::Item::Class(c) if wanted.contains(&c.name) => out_items.push(it),
+                        ast::Item::Enum(e) if wanted.contains(&e.name) => out_items.push(it),
+                        ast::Item::Import(_) => {} // already expanded
+                        _ => {} // skip non-selected
+                    }
+                }
+            } else {
+                // Whole module: inline all non-import items
+                for it in sub.items.into_iter().filter(|i| !matches!(i, ast::Item::Import(_))) {
+                    out_items.push(it);
+                }
+            }
+        } else {
+            out_items.push(item);
+        }
+        idx += 1;
+    }
+    Ok(ast::Program{items: out_items, span: program.span})
 }

@@ -1,0 +1,107 @@
+// abstraction.hlt — Phase 4: classes, traits, enums, properties, constructors, visibility, inheritance
+// A single well-rounded program exercising the entire abstraction layer.
+
+trait Drawable has
+    void draw()
+end
+
+open class Shape has
+    private int id
+    public int x
+    public int y
+
+    // Constructor with `initialize` sugar: this.x = x, this.y = y automatically
+    // Block is optional when only field assignment is needed
+    Shape(int x, int y) initialize
+
+    public open int area() do
+        return 0
+    end
+
+    // Property with getter and setter
+    public int idVal get do
+        return this.id
+    end
+    set(int v) do
+        this.id = v
+    end
+end
+
+class Rect extends Shape implements Drawable has
+    public int w
+    public int h
+
+    // No explicit constructor: inherits Shape's field layout (id,x,y) plus w,h
+    // Override parent method (no `override` needed for trait, but needed for class extends)
+    public override int area() do
+        return this.w * this.h
+    end
+
+    // Trait implementation: `override` not required here
+    public void draw() do
+        return
+    end
+end
+
+class Counter has
+    private int _count
+    public int count get do
+        return this._count
+    end
+    set(int v) do
+        this._count = v
+    end
+
+    Counter(int _count) initialize
+end
+
+enum Status has
+    Ok
+    Err(int code)
+    Pending
+end
+
+int handle(Status s) do
+    return match s do
+        .Ok -> 0
+        .Err(c) -> c
+        .Pending -> 99
+        _ -> -1
+    end
+end
+
+int main() do
+    // Struct literal style initialization (works for classes too)
+    Rect r = Rect has
+        id = 0
+        x = 10
+        y = 20
+        w = 5
+        h = 6
+    end
+
+    // Constructor sugar: Shape(int x, int y) initialize
+    Shape sh = Shape(3, 4)
+    int shArea = sh.area() // 0 (base)
+
+    int a = r.area() // 30
+
+    // Property access (getter/setter syntactic sugar for method calls)
+    r.idVal = 99
+    int id = r.idVal // 99
+
+    Counter c = Counter(42) // initialize sugar sets _count = 42
+    c.count = id // setter
+    int cnt = c.count // getter -> 99
+
+    // Enum with payload + match with variable binding
+    Status s1 = .Ok
+    Status s2 = .Err(5)
+    int code1 = handle(s1) // 0
+    int code2 = handle(s2) // 5
+
+    // Trait object via class that implements Drawable
+    r.draw()
+
+    return a + id + cnt + code1 + code2 // 30 + 99 + 99 + 0 + 5 = 233
+end

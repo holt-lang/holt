@@ -210,6 +210,18 @@ impl Parser {
         }
     }
 
+    fn peek_decl_kind(&self) -> Option<Token> {
+        let mut p = self.pos;
+        // skip optional visibility/open/sealed for class/struct
+        while p < self.tokens.len() {
+            match self.tokens[p].token {
+                Token::Public | Token::Private | Token::Open | Token::Sealed => p += 1,
+                _ => break,
+            }
+        }
+        self.tokens.get(p).map(|t| t.token.clone())
+    }
+
     // ── Entry ─────────────────────────────────────────────────────────
     pub fn parse_program(&mut self) -> Result<Program, ParseError> {
         let start = 0;
@@ -220,13 +232,22 @@ impl Parser {
             if self.is_eof() {
                 break;
             }
-            // Top-level: struct/class decl vs function decl
-            if self.peek_token() == Some(&Token::Struct) {
+            // Top-level: import / struct/class/enum/trait decl vs function decl (EBNF §32 §35)
+            if self.peek_token() == Some(&Token::Import) {
+                let decl = self.parse_import()?;
+                items.push(Item::Import(decl));
+            } else if self.peek_decl_kind() == Some(Token::Struct) {
                 let decl = self.parse_struct_decl()?;
                 items.push(Item::Struct(decl));
-            } else if self.peek_token() == Some(&Token::Class) {
+            } else if self.peek_decl_kind() == Some(Token::Class) {
                 let decl = self.parse_class_decl()?;
                 items.push(Item::Class(decl));
+            } else if self.peek_decl_kind() == Some(Token::Enum) {
+                let decl = self.parse_enum_decl()?;
+                items.push(Item::Enum(decl));
+            } else if self.peek_decl_kind() == Some(Token::Trait) {
+                let decl = self.parse_trait_decl()?;
+                items.push(Item::Trait(decl));
             } else {
                 let func = self.parse_function()?;
                 items.push(Item::Function(func));
@@ -240,6 +261,8 @@ impl Parser {
     }
 
     fn parse_struct_decl(&mut self) -> Result<StructDecl, ParseError> {
+        // optional visibility
+        if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
         let start = self.expect(Token::Struct, "expected `struct`")?.span.start;
         let (name, name_span) = self.parse_ident()?;
         self.expect(Token::Has, "expected `has` after struct name")?;
@@ -266,6 +289,7 @@ impl Parser {
                 ty,
                 name: fname,
                 name_span: fspan,
+                visibility: Visibility::Default,
                 span,
             });
             self.consume_newlines();
@@ -282,29 +306,231 @@ impl Parser {
         })
     }
 
+    fn parse_visibility(&mut self) -> Visibility {
+        match self.peek_token() {
+            Some(Token::Public) => { self.advance(); Visibility::Public },
+            Some(Token::Private) => { self.advance(); Visibility::Private },
+            _ => Visibility::Default,
+        }
+    }
+
     fn parse_class_decl(&mut self) -> Result<ClassDecl, ParseError> {
-        let start = self.expect(Token::Class, "expected `class`")?.span.start;
-        // optional `open` before class already handled at top-level? For Phase 4 minimal ignore `open`
+        // EBNF: [visibility] [open] class ident [generics] [extends type] [implements trait-list] has {class-member} end
+        let mut is_open = false;
+        let mut is_sealed = false;
+        let start_vis = self.peek_span().start;
+        let mut class_vis = self.parse_visibility();
+        if self.peek_token() == Some(&Token::Open) { is_open = true; self.advance(); }
+        if self.peek_token() == Some(&Token::Sealed) { is_sealed = true; self.advance(); }
+        // also allow visibility after open? e.g. open public class - handle again
+        if class_vis == Visibility::Default { class_vis = self.parse_visibility(); }
+        let class_start = self.expect(Token::Class, "expected `class`")?.span.start;
+        let start = if start_vis < class_start { start_vis } else { class_start };
         let (name, name_span) = self.parse_ident()?;
-        // ignore generics/extends/implements for minimal
+        // generics: ignore < ... > if present
+        if self.peek_token() == Some(&Token::Lt) {
+            self.advance();
+            let mut depth = 1;
+            while !self.is_eof() && depth > 0 {
+                match self.peek_token() {
+                    Some(Token::Lt) => { depth+=1; self.advance(); },
+                    Some(Token::Gt) => { depth-=1; self.advance(); },
+                    _ => { self.advance(); },
+                }
+            }
+        }
+        let mut extends = None;
+        if self.peek_token() == Some(&Token::Extends) {
+            self.advance();
+            extends = Some(self.parse_type()?);
+        }
+        let mut implements = Vec::new();
+        if self.peek_token() == Some(&Token::Implements) {
+            self.advance();
+            loop {
+                implements.push(self.parse_type()?);
+                if !self.consume_if(Token::Comma) { break; }
+            }
+        }
         self.expect(Token::Has, "expected `has` after class name")?;
         self.consume_newlines();
         let mut fields = Vec::new();
         let mut methods = Vec::new();
+        let mut constructors = Vec::new();
+        let mut destructors = Vec::new();
+        let mut properties = Vec::new();
         while !self.is_eof() && self.peek_token() != Some(&Token::End) {
             if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
-            // Consume optional visibility
-            if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
-            // Lookahead: function if type ident '('
+            // member modifiers: [visibility] [static] [sealed] [override] [open]
+            let vis = self.parse_visibility();
+            let mut is_static = false;
+            let mut m_sealed = false;
+            let mut is_override = false;
+            let mut m_open = false;
+            // loop for flags
+            loop {
+                match self.peek_token() {
+                    Some(Token::Static) => { is_static = true; self.advance(); },
+                    Some(Token::Sealed) => { m_sealed = true; self.advance(); },
+                    Some(Token::Override) => { is_override = true; self.advance(); },
+                    Some(Token::Open) => { m_open = true; self.advance(); },
+                    _ => break,
+                }
+            }
+            // Check for destructor: ~ ident ( ) block
+            if self.peek_token() == Some(&Token::Tilde) {
+                let dstart = self.advance().unwrap().span.start;
+                let (dname, dspan) = self.parse_ident().map_err(|_| ParseError{message: "expected destructor name after `~`".into(), span: self.peek_span()})?;
+                self.expect(Token::LParen, "expected `(` for destructor")?;
+                self.expect(Token::RParen, "expected `)` for destructor")?;
+                let body = self.parse_block()?;
+                let span = Span::new(dstart, body.span.end);
+                destructors.push(DestructorDecl{name: dname, name_span: dspan, body, visibility: vis, span});
+                self.consume_newlines();
+                continue;
+            }
+            // Check for constructor: ident ( params ) initialize [block]
+            let is_constructor = {
+                let save = self.pos;
+                let res = if self.peek_token() == Some(&Token::Ident) {
+                    let _ = self.parse_ident();
+                    if self.peek_token() == Some(&Token::LParen) {
+                        self.advance();
+                        let mut depth = 1;
+                        while !self.is_eof() && depth>0 {
+                            match self.peek_token() {
+                                Some(Token::LParen) => { depth+=1; self.advance(); },
+                                Some(Token::RParen) => { depth-=1; self.advance(); },
+                                _ => { self.advance(); },
+                            }
+                        }
+                        self.peek_token() == Some(&Token::Initialize)
+                    } else { false }
+                } else { false };
+                self.pos = save;
+                res
+            };
+            if is_constructor {
+                let (cname, cspan) = self.parse_ident()?;
+                self.expect(Token::LParen, "expected `(` for constructor params")?;
+                let mut params = Vec::new();
+                if self.peek_token() != Some(&Token::RParen) {
+                    loop {
+                        let pty = self.parse_type()?;
+                        let (pn, pn_span) = self.parse_ident()?;
+                        let pspan = Span::new(pty.span().start, pn_span.end);
+                        params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                        if self.consume_if(Token::Comma) { continue; } else { break; }
+                    }
+                }
+                self.expect(Token::RParen, "expected `)` after constructor params")?;
+                let istart = self.expect(Token::Initialize, "expected `initialize` for constructor")?.span.start;
+                let body = if self.peek_token() == Some(&Token::Do) { Some(self.parse_block()?) } else {
+                    self.expect_terminator("constructor")?;
+                    None
+                };
+                let span = Span::new(cspan.start, body.as_ref().map(|b| b.span.end).unwrap_or(istart+10));
+                constructors.push(ConstructorDecl{name: cname, name_span: cspan, params, body, visibility: vis, span});
+                self.consume_newlines();
+                continue;
+            }
+            // Check for property: [type] ident (get|set) ...
+            // Property has forms: [vis] type ident get block [set (param) block]  OR  [vis] type ident set (param) block [get block]  OR simplified [vis] ident set ...
+            // Detect: after type+ident, next is Get/Set; or after ident next is Set
+            let is_property = {
+                let save = self.pos;
+                let mut is_prop = false;
+                // try type+ident+get/set
+                if let Ok(_) = self.parse_type() {
+                    if self.peek_token() == Some(&Token::Ident) {
+                        let _ = self.parse_ident();
+                        if matches!(self.peek_token(), Some(Token::Get) | Some(Token::Set)) { is_prop = true; }
+                    }
+                }
+                if !is_prop {
+                    self.pos = save;
+                    if self.peek_token() == Some(&Token::Ident) {
+                        let _ = self.parse_ident();
+                        if self.peek_token() == Some(&Token::Set) { is_prop = true; }
+                    }
+                }
+                self.pos = save;
+                is_prop
+            };
+            if is_property {
+                // Parse property: attempt with type
+                let save = self.pos;
+                let mut ty_opt = None;
+                let mut pname = String::new();
+                let mut pspan = Span::new(0,0);
+                let mut prop_vis = vis;
+                // try type+ident
+                let mut parsed_with_type = false;
+                if let Ok(t) = self.parse_type() {
+                    if let Ok((n,s)) = self.parse_ident() {
+                        if matches!(self.peek_token(), Some(Token::Get) | Some(Token::Set)) {
+                            ty_opt = Some(t);
+                            pname = n; pspan = s; parsed_with_type = true;
+                        }
+                    }
+                }
+                if !parsed_with_type {
+                    self.pos = save;
+                    let (n,s) = self.parse_ident()?;
+                    pname = n; pspan = s;
+                    ty_opt = None;
+                }
+                // now parse getter/setter blocks
+                let mut getter = None;
+                let mut setter = None;
+                // EBNF allows getter then optional setter OR setter then optional getter
+                // Parse first accessor
+                if self.peek_token() == Some(&Token::Get) {
+                    self.advance();
+                    getter = Some(self.parse_block()?);
+                    self.consume_newlines();
+                    if self.peek_token() == Some(&Token::Set) {
+                        self.advance();
+                        self.expect(Token::LParen, "expected `(` for property setter")?;
+                        let pty = self.parse_type()?;
+                        let (pn, pn_span) = self.parse_ident()?;
+                        let pspan = Span::new(pty.span().start, pn_span.end);
+                        let param = Param{ty: pty, name: pn, name_span: pn_span, span: pspan};
+                        self.expect(Token::RParen, "expected `)` after setter param")?;
+                        let body = self.parse_block()?;
+                        setter = Some((param, body));
+                    }
+                } else if self.peek_token() == Some(&Token::Set) {
+                    self.advance();
+                    self.expect(Token::LParen, "expected `(` for property setter")?;
+                    let pty = self.parse_type()?;
+                    let (pn, pn_span) = self.parse_ident()?;
+                    let pspan = Span::new(pty.span().start, pn_span.end);
+                    let param = Param{ty: pty, name: pn, name_span: pn_span, span: pspan};
+                    self.expect(Token::RParen, "expected `)` after setter param")?;
+                    let body = self.parse_block()?;
+                    setter = Some((param, body));
+                    self.consume_newlines();
+                    if self.peek_token() == Some(&Token::Get) {
+                        self.advance();
+                        getter = Some(self.parse_block()?);
+                    }
+                } else {
+                    return Err(ParseError{message: "expected `get` or `set` for property".into(), span: self.peek_span()});
+                }
+                let end = setter.as_ref().map(|(_,b)| b.span.end).or(getter.as_ref().map(|b| b.span.end)).unwrap_or(pspan.end);
+                properties.push(PropertyDecl{ty: ty_opt, name: pname, name_span: pspan, visibility: prop_vis, getter, setter, span: Span::new(pspan.start, end)});
+                self.consume_newlines();
+                continue;
+            }
+            // Check for method vs field: lookahead type ident '(' => method
             let is_func = {
                 let save = self.pos;
                 let ty_ok = self.parse_type().is_ok();
                 let after_ty = self.peek_token().cloned();
                 let is_ident = after_ty == Some(Token::Ident);
-                // need '(' after ident
                 let mut is_func2 = false;
                 if is_ident {
-                    // peek after ident
                     if let Some(tok) = self.tokens.get(self.pos+1) {
                         if tok.token == Token::LParen { is_func2 = true; }
                     }
@@ -313,7 +539,7 @@ impl Parser {
                 ty_ok && is_func2
             };
             if is_func {
-                // function/method
+                // function/method with modifiers
                 let ret_ty = self.parse_type()?;
                 let (mname, mspan) = self.parse_ident()?;
                 self.expect(Token::LParen, "expected `(` for method params")?;
@@ -330,21 +556,164 @@ impl Parser {
                 self.expect(Token::RParen, "expected `)` after params")?;
                 let body = self.parse_block()?;
                 let span = Span::new(ret_ty.span().start, body.span.end);
-                methods.push(Function{ret_ty, name: mname, name_span: mspan, params, body, span});
+                methods.push(Function{ret_ty, name: mname, name_span: mspan, params, body, visibility: vis, is_static, is_sealed: m_sealed, is_override, is_open: m_open, span});
             } else {
                 // field
+                // handle const field? EBNF class-member includes constant-declaration: const [type] ident = expr terminator
+                if self.peek_token() == Some(&Token::Const) {
+                    self.advance();
+                    // optional type
+                    let _ty_opt = if matches!(self.peek_token(), Some(Token::Int)|Some(Token::Bool)|Some(Token::StringKw)|Some(Token::CharKw)|Some(Token::Ident)|Some(Token::Void)) {
+                        let save = self.pos;
+                        if self.parse_type().is_ok() {
+                            if self.peek_token()==Some(&Token::Ident) { Some(()) } else { self.pos = save; None }
+                        } else { None }
+                    } else { None };
+                    if _ty_opt.is_some() { let _ = self.parse_type()?; } // actually need to capture but ignore const type
+                    let (fname, fspan) = self.parse_ident()?;
+                    self.expect(Token::Eq, "expected `=` for const")?;
+                    let _ = self.parse_expr()?;
+                    self.expect_terminator("const declaration")?;
+                    // const treated as field with default visibility but skip adding? For now treat as field without ty
+                    // Use void type placeholder? Instead skip
+                    // We'll add as field with int type placeholder to keep struct layout? Simpler ignore.
+                    continue;
+                }
                 let ty = self.parse_type()?;
                 let (fname, fspan) = self.parse_ident()?;
                 let fend = fspan.end;
                 if self.consume_if(Token::Eq) { let _ = self.parse_expr()?; }
                 self.expect_terminator("class field")?;
                 let span = Span::new(ty.span().start, fend);
-                fields.push(StructField{ty, name: fname, name_span: fspan, span});
+                fields.push(StructField{ty, name: fname, name_span: fspan, visibility: vis, span});
             }
             self.consume_newlines();
         }
         let end = self.expect(Token::End, "expected `end` to close class")?.span.end;
-        Ok(ClassDecl{name, name_span, fields, methods, span: Span::new(start, end)})
+        Ok(ClassDecl{name, name_span, fields, methods, is_open, is_sealed, extends, implements, constructors, destructors, properties, span: Span::new(start, end)})
+    }
+
+    fn parse_trait_decl(&mut self) -> Result<TraitDecl, ParseError> {
+        if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
+        let start = self.expect(Token::Trait, "expected `trait`")?.span.start;
+        let (name, name_span) = self.parse_ident()?;
+        self.expect(Token::Has, "expected `has` after trait name")?;
+        self.consume_newlines();
+        let mut methods = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            let mut is_sealed = false;
+            if self.peek_token() == Some(&Token::Sealed) { is_sealed = true; self.advance(); }
+            let ret_ty = self.parse_type()?;
+            let (mname, mspan) = self.parse_ident()?;
+            self.expect(Token::LParen, "expected `(` for trait method")?;
+            let mut params = Vec::new();
+            if self.peek_token() != Some(&Token::RParen) {
+                loop {
+                    let pty = self.parse_type()?;
+                    let (pn, pn_span) = self.parse_ident()?;
+                    let pspan = Span::new(pty.span().start, pn_span.end);
+                    params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                    if self.consume_if(Token::Comma) { continue; } else { break; }
+                }
+            }
+            self.expect(Token::RParen, "expected `)` after trait params")?;
+            self.expect_terminator("trait method")?;
+            let span = Span::new(ret_ty.span().start, mspan.end);
+            methods.push(TraitMethod{ret_ty, name: mname, name_span: mspan, params, is_sealed, span});
+            self.consume_newlines();
+        }
+        let end = self.expect(Token::End, "expected `end` to close trait")?.span.end;
+        Ok(TraitDecl{name, name_span, methods, span: Span::new(start, end)})
+    }
+
+    fn parse_enum_decl(&mut self) -> Result<EnumDecl, ParseError> {
+        if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
+        let start = self.expect(Token::Enum, "expected `enum`")?.span.start;
+        let (name, name_span) = self.parse_ident()?;
+        self.expect(Token::Has, "expected `has` after enum name")?;
+        self.consume_newlines();
+        let mut variants = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            let (vname, vspan) = self.parse_ident()?;
+            let mut discriminant = None;
+            let mut payload_ty = None;
+            if self.consume_if(Token::Eq) {
+                // discriminant expression should be int literal; evaluate later, for now try parse int
+                let expr = self.parse_expr()?;
+                if let ExprKind::IntLit(v) = expr.kind { discriminant = Some(v); } else { discriminant = Some(0); }
+            }
+            if self.peek_token() == Some(&Token::LParen) {
+                self.advance(); // (
+                // payload: expect type [ident]
+                if self.peek_token() != Some(&Token::RParen) {
+                    let ty = self.parse_type()?;
+                    // optional param name
+                    if self.peek_token() == Some(&Token::Ident) { let _ = self.parse_ident()?; }
+                    payload_ty = Some(ty);
+                    // ignore extra params for minimal, but handle comma
+                    while self.consume_if(Token::Comma) {
+                        let _ = self.parse_type()?;
+                        if self.peek_token() == Some(&Token::Ident) { let _ = self.parse_ident()?; }
+                    }
+                }
+                self.expect(Token::RParen, "expected `)` after enum payload")?;
+            }
+            self.expect_terminator("enum variant")?;
+            let span = Span::new(vspan.start, vspan.end);
+            variants.push(EnumVariant{name: vname, name_span: vspan, discriminant, payload_ty, span});
+            self.consume_newlines();
+        }
+        let end = self.expect(Token::End, "expected `end` to close enum")?.span.end;
+        Ok(EnumDecl{name, name_span, variants, span: Span::new(start, end)})
+    }
+
+    fn parse_import(&mut self) -> Result<ImportDecl, ParseError> {
+        // EBNF §32: import qualified-name [:: { import-list }] terminator
+        let start = self.expect(Token::Import, "expected `import`")?.span.start;
+        let (first, fspan) = self.parse_ident()?;
+        let mut path = vec![first];
+        let mut path_end = fspan.end;
+        while self.peek_token() == Some(&Token::ColonColon) {
+            // Stop if this `::` introduces the `{` import list (e.g. `std::io::{a}`)
+            if self.tokens.get(self.pos + 1).map(|t| t.token == Token::LBrace).unwrap_or(false) {
+                break;
+            }
+            self.advance(); // ::
+            let (seg, sspan) = self.parse_ident()?;
+            path.push(seg);
+            path_end = sspan.end;
+        }
+        // Optional :: { import-list }
+        let mut symbols: Option<Vec<(String, Span)>> = None;
+        if self.peek_token() == Some(&Token::ColonColon) {
+            // Lookahead :: {
+            if self.tokens.get(self.pos + 1).map(|t| t.token == Token::LBrace).unwrap_or(false) {
+                self.advance(); // ::
+                self.advance(); // {
+                let mut list = Vec::new();
+                // handle empty? EBNF requires at least one, but allow empty gracefully
+                while !self.is_eof() && self.peek_token() != Some(&Token::RBrace) {
+                    if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+                    let (nm, ns) = self.parse_ident()?;
+                    list.push((nm, ns));
+                    if self.consume_if(Token::Comma) { continue; } else { // allow trailing
+                    }
+                    // consume newlines between symbols
+                    self.consume_newlines();
+                }
+                self.expect(Token::RBrace, "expected `}` to close import list")?;
+                path_end = self.tokens[self.pos - 1].span.end;
+                symbols = Some(list);
+            }
+        }
+        // Also handle direct `::` already consumed? Support `import std::io::{a,b}` where the `::` before `{` is part of above.
+        // Alternative form `import std::io :: {a}` already handled; handle plain `{` without leading `::`? EBNF requires `::`, so ignore.
+        self.expect_terminator("import")?;
+        let span = Span::new(start, path_end);
+        let path_span = Span::new(start, path_end);
+        Ok(ImportDecl{path, path_span, symbols, span})
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -434,6 +803,20 @@ impl Parser {
     }
 
     fn parse_function(&mut self) -> Result<Function, ParseError> {
+        let vis = self.parse_visibility();
+        let mut is_static = false;
+        let mut is_sealed = false;
+        let mut is_override = false;
+        let mut is_open = false;
+        loop {
+            match self.peek_token() {
+                Some(Token::Static) => { is_static = true; self.advance(); },
+                Some(Token::Sealed) => { is_sealed = true; self.advance(); },
+                Some(Token::Override) => { is_override = true; self.advance(); },
+                Some(Token::Open) => { is_open = true; self.advance(); },
+                _ => break,
+            }
+        }
         let start_span = self.peek_span();
         let ret_ty = self.parse_type()?;
         let (name, name_span) = self.parse_ident()?;
@@ -459,8 +842,7 @@ impl Parser {
             }
         }
         self.expect(Token::RParen, "closing `)`")?;
-        // function body: block (do ... end)
-        // Note EBNF function-body = block ; phase 1 only block
+        // function body: block (do ... end) or initialize? For free functions only block
         let body = self.parse_block()?;
         let span = Span::new(start_span.start, body.span.end);
         Ok(Function {
@@ -469,6 +851,11 @@ impl Parser {
             name_span,
             params,
             body,
+            visibility: vis,
+            is_static,
+            is_sealed,
+            is_override,
+            is_open,
             span,
         })
     }
@@ -1157,6 +1544,27 @@ impl Parser {
                 self.advance();
                 Ok(Expr{kind: ExprKind::This, span: st.span})
             }
+            Token::Dot => {
+                // Enum variant `.Variant` or `.Variant(args)` (Phase 4)
+                let dot_span = st.span;
+                self.advance(); // '.'
+                let (vname, vspan) = self.parse_ident()?;
+                let mut args = Vec::new();
+                let mut end = vspan.end;
+                if self.peek_token() == Some(&Token::LParen) {
+                    self.advance(); // '('
+                    if self.peek_token() != Some(&Token::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if self.consume_if(Token::Comma) { continue; } else { break; }
+                        }
+                    }
+                    let rp = self.expect(Token::RParen, "expected `)` after enum variant args")?;
+                    end = rp.span.end;
+                }
+                let span = Span::new(dot_span.start, end);
+                Ok(Expr{kind: ExprKind::EnumVariant{enum_name: None, variant: vname, variant_span: vspan, args}, span})
+            }
             Token::Ident => {
                 self.advance();
                 Ok(Expr {
@@ -1252,20 +1660,27 @@ impl Parser {
             span: Span::new(self.source.len(), self.source.len()),
         })?;
         match st.token {
+            Token::Dot => {
+                self.advance(); // '.'
+                let (vname, vspan) = self.parse_ident()?;
+                let payload = if self.peek_token() == Some(&Token::LParen) {
+                    self.advance(); // '('
+                    let inner = if self.peek_token() != Some(&Token::RParen) {
+                        Some(Box::new(self.parse_pattern()?))
+                    } else { None };
+                    self.expect(Token::RParen, "expected `)` after enum payload pattern")?;
+                    inner
+                } else { None };
+                Ok(Pattern::Enum{variant: vname, variant_span: vspan, payload})
+            }
             Token::Ident => {
                 let s = self.slice(st.span).to_string();
                 if s == "_" {
                     self.advance();
                     Ok(Pattern::Wildcard(st.span))
                 } else {
-                    // For Phase 2 we don't support variable binding patterns; treat as wildcard error?
-                    // But allow `_` only; any other ident we treat as error for now to keep simple
-                    Err(ParseError {
-                        message: format!(
-                            "unsupported pattern `{s}`; expected `_` or literal"
-                        ),
-                        span: st.span,
-                    })
+                    self.advance();
+                    Ok(Pattern::Var(s, st.span))
                 }
             }
             Token::IntLit | Token::HexInt | Token::BinInt => {

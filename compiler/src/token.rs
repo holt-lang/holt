@@ -169,6 +169,8 @@ pub enum Token {
     Get,
     #[token("set")]
     Set,
+    #[token("initialize")]
+    Initialize,
     // soft keywords / literals that look like keywords
     #[token("true")]
     True,
@@ -369,6 +371,7 @@ impl std::fmt::Display for Token {
             Self::End => "end",
             Self::Get => "get",
             Self::Set => "set",
+            Self::Initialize => "initialize",
             Self::True => "true",
             Self::False => "false",
             Self::SelfType => "Self",

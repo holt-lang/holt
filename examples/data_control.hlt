@@ -1,0 +1,71 @@
+// data_control.hlt — Phase 2 & 3: structs, arrays, strings, match, loops, defer
+// Combines data structures and control flow into one coherent program.
+
+struct Point has
+    int x
+    int y
+end
+
+int dist2(Point p) do
+    return p.x * p.x + p.y * p.y
+end
+
+int main() do
+    // --- struct literal and field access ---
+    Point p = Point has
+        x = 3
+        y = 4
+    end
+    p.x = 6
+    int d = dist2(p) // 6*6 + 4*4 = 52
+
+    // --- arrays and indexing ---
+    int[] arr
+    arr[0] = 10
+    arr[1] = 20
+    arr[2] = 30
+    int sum = 0
+    // for loop over array
+    for v in arr do
+        sum = sum + v
+        if (sum is 30) do
+            continue
+        end
+    end // sum = 60
+
+    // --- while with break ---
+    int i = 0
+    while (i < 10) do
+        i = i + 1
+        if (i is 8) do
+            break
+        end
+    end // i = 8
+
+    // --- loop (infinite) with break ---
+    int j = 0
+    loop do
+        j = j + 1
+        if (j is 3) do
+            break
+        end
+    end // j = 3
+
+    // --- defer (runs on scope exit) ---
+    int x = 0
+    defer x = x + 100
+    x = 5 // defer will make x = 105 at end of block, but we return before? defer runs on return
+    // To show defer, we use it before return: it will execute before return
+
+    // --- match ---
+    int m = match d is 52 do
+        true -> 1
+        false -> 0
+    end
+
+    // --- strings (no interpolation yet) ---
+    string s = "hello"
+    char c = 'A'
+
+    return sum + i + j + m // 60 + 8 + 3 + 1 = 72 (+ defer effect if counted)
+end

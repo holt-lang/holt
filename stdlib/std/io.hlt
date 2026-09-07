@@ -1,0 +1,19 @@
+// std::io — minimal IO for Holt (Phase 1 + pure Holt sources).
+// Import via: import std::io
+// or selective: import std::io::{print, println, printInt, putChar}
+//
+ // This module is intrinsified by codegen until `extern "c" from "stdio.h"` (§36)
+// is fully wired. The Holt signatures below are canonical; bodies are supplied
+// by the runtime (libc puts/printf/putchar) via LLVM declarations.
+
+void print(string s) do
+end
+
+void println(string s) do
+end
+
+void printInt(int n) do
+end
+
+void putChar(char c) do
+end
