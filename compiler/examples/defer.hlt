@@ -1,0 +1,6 @@
+int main() do
+    int x = 0
+    defer x = x + 100
+    x = 5
+    return x
+end

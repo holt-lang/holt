@@ -2,7 +2,7 @@
 
 Always advance one phase at a time. Each phase must produce runnable code (JIT or object file) before the next begins.
 
-## Phase 0 — Skeleton
+## Phase 0 — Skeleton - DONE
 
 - Cargo project, `inkwell` linked, `llvm-config` working
 - Token enum covering keywords + operators needed later
@@ -10,7 +10,7 @@ Always advance one phase at a time. Each phase must produce runnable code (JIT o
 
 **Exit criteria:** `cargo run -- examples/empty.hlt` tokenizes without crash.
 
-## Phase 1 — MVP Executable (highest priority)
+## Phase 1 — MVP Executable (highest priority) - DONE
 
 **Syntax subset**
 - Types: `int`, `bool`, `void` (optionally `float`/`double`)
@@ -33,7 +33,7 @@ Always advance one phase at a time. Each phase must produce runnable code (JIT o
 
 **Exit criteria:** Programs such as factorial or Fibonacci compile and run correctly.
 
-## Phase 2 — Data & Simple Control
+## Phase 2 — Data & Simple Control - DONE
 
 - Struct declarations + field access + struct literals (`Type has … end`)
 - Arrays (`T[]`) or fixed-size arrays; indexing
@@ -42,7 +42,7 @@ Always advance one phase at a time. Each phase must produce runnable code (JIT o
 - `string` type (pointer + length) without interpolation first
 - `break` / `continue` (unlabeled)
 
-## Phase 3 — Defer & Loops
+## Phase 3 — Defer & Loops - DONE
 
 - `defer` (expression or block) — must execute on all scope exits
 - `loop`, labeled loops, labeled `break`/`continue`

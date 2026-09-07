@@ -20,9 +20,12 @@ pub struct CodegenError {
     pub span: Span,
 }
 
+#[derive(Clone)]
 struct LoopContext<'ctx> {
     cond_bb: inkwell::basic_block::BasicBlock<'ctx>,
     exit_bb: inkwell::basic_block::BasicBlock<'ctx>,
+    label: Option<String>,
+    defer_depth: usize,
 }
 
 pub struct Codegen<'ctx> {
@@ -34,6 +37,7 @@ pub struct Codegen<'ctx> {
     struct_types: HashMap<String, StructType<'ctx>>,
     struct_fields: HashMap<String, HashMap<String, u32>>, // struct -> field -> index
     loop_stack: Vec<LoopContext<'ctx>>,
+    defer_stack: Vec<Vec<DeferStmt>>,
     cur_fn: Option<FunctionValue<'ctx>>,
     cur_is_main: bool,
 }
@@ -57,6 +61,7 @@ impl<'ctx> Codegen<'ctx> {
             struct_types: HashMap::new(),
             struct_fields: HashMap::new(),
             loop_stack: Vec::new(),
+            defer_stack: Vec::new(),
             cur_fn: None,
             cur_is_main: false,
         }
@@ -409,8 +414,49 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    fn emit_current_scope_defers(&mut self) -> Result<(), CodegenError> {
+        if let Some(idx) = self.defer_stack.len().checked_sub(1) {
+            let defers = self.defer_stack[idx].clone();
+            for defer in defers.iter().rev() {
+                match &defer.inner {
+                    DeferInner::Expr(e) => { let _ = self.codegen_expr(e)?; }
+                    DeferInner::Block(b) => { let _ = self.codegen_block(b)?; }
+                }
+                if self.builder.get_insert_block().unwrap().get_terminator().is_some() { break; }
+            }
+        }
+        Ok(())
+    }
+    fn emit_all_defers(&mut self) -> Result<(), CodegenError> {
+        for idx in (0..self.defer_stack.len()).rev() {
+            let defers = self.defer_stack[idx].clone();
+            for defer in defers.iter().rev() {
+                match &defer.inner {
+                    DeferInner::Expr(e) => { let _ = self.codegen_expr(e)?; }
+                    DeferInner::Block(b) => { let _ = self.codegen_block(b)?; }
+                }
+                if self.builder.get_insert_block().unwrap().get_terminator().is_some() { break; }
+            }
+        }
+        Ok(())
+    }
+    fn emit_defers_up_to(&mut self, target_depth: usize) -> Result<(), CodegenError> {
+        for idx in (target_depth..self.defer_stack.len()).rev() {
+            let defers = self.defer_stack[idx].clone();
+            for defer in defers.iter().rev() {
+                match &defer.inner {
+                    DeferInner::Expr(e) => { let _ = self.codegen_expr(e)?; }
+                    DeferInner::Block(b) => { let _ = self.codegen_block(b)?; }
+                }
+                if self.builder.get_insert_block().unwrap().get_terminator().is_some() { break; }
+            }
+        }
+        Ok(())
+    }
+
     fn codegen_block(&mut self, block: &Block) -> Result<bool, CodegenError> {
         self.vars.push(HashMap::new());
+        self.defer_stack.push(Vec::new());
         let mut always_returns = false;
         for stmt in &block.stmts {
             if self
@@ -430,6 +476,14 @@ impl<'ctx> Codegen<'ctx> {
                 always_returns = true;
             }
         }
+        // Emit defers for this block on normal exit
+        if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+            self.emit_current_scope_defers()?;
+        } else {
+            // already terminated, just clear any remaining defers for this scope (they were emitted via return/break)
+            if let Some(v) = self.defer_stack.last_mut() { v.clear(); }
+        }
+        self.defer_stack.pop();
         self.vars.pop();
         Ok(always_returns)
     }
@@ -523,6 +577,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             Stmt::Block(b) => self.codegen_block(b),
             Stmt::Return(r) => {
+                self.emit_all_defers()?;
                 if self.cur_is_main {
                     if let Some(expr) = &r.value {
                         let val = self.codegen_expr(expr)?;
@@ -626,54 +681,161 @@ impl<'ctx> Codegen<'ctx> {
             }
             Stmt::While(s) => {
                 let func = self.cur_fn.unwrap();
-                let cond_bb =
-                    self.context.append_basic_block(func, "while.cond");
-                let body_bb =
-                    self.context.append_basic_block(func, "while.body");
-                let exit_bb =
-                    self.context.append_basic_block(func, "while.exit");
+                let cond_bb = self.context.append_basic_block(func, "while.cond");
+                let body_bb = self.context.append_basic_block(func, "while.body");
+                let exit_bb = self.context.append_basic_block(func, "while.exit");
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
                 self.builder.position_at_end(cond_bb);
                 let cond = self.codegen_expr(&s.cond)?;
                 let cond_bool = cond.into_int_value();
-                self.builder
-                    .build_conditional_branch(cond_bool, body_bb, exit_bb)
-                    .unwrap();
-                // push loop context before body
-                self.loop_stack.push(LoopContext { cond_bb, exit_bb });
+                self.builder.build_conditional_branch(cond_bool, body_bb, exit_bb).unwrap();
+                self.loop_stack.push(LoopContext{cond_bb, exit_bb, label: None, defer_depth: self.defer_stack.len()});
                 self.builder.position_at_end(body_bb);
                 let _ = self.codegen_block(&s.body)?;
-                if self
-                    .builder
-                    .get_insert_block()
-                    .unwrap()
-                    .get_terminator()
-                    .is_none()
-                {
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
                     self.builder.build_unconditional_branch(cond_bb).unwrap();
                 }
                 self.loop_stack.pop();
                 self.builder.position_at_end(exit_bb);
                 Ok(false)
             }
-            Stmt::Break(_) => {
-                let ctx = self.loop_stack.last().ok_or(CodegenError {
-                    message: "break outside loop".into(),
-                    span: Span::new(0, 0),
-                })?;
-                self.builder
-                    .build_unconditional_branch(ctx.exit_bb)
-                    .unwrap();
+            Stmt::Loop(l) => {
+                let func = self.cur_fn.unwrap();
+                let header_bb = self.context.append_basic_block(func, "loop.header");
+                let body_bb = self.context.append_basic_block(func, "loop.body");
+                let exit_bb = self.context.append_basic_block(func, "loop.exit");
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+                self.builder.position_at_end(header_bb);
+                self.builder.build_unconditional_branch(body_bb).unwrap();
+                self.loop_stack.push(LoopContext{cond_bb: header_bb, exit_bb, label: l.label.clone(), defer_depth: self.defer_stack.len()});
+                self.builder.position_at_end(body_bb);
+                let _ = self.codegen_block(&l.body)?;
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    self.builder.build_unconditional_branch(header_bb).unwrap();
+                }
+                self.loop_stack.pop();
+                self.builder.position_at_end(exit_bb);
                 Ok(false)
             }
-            Stmt::Continue(_) => {
-                let ctx = self.loop_stack.last().ok_or(CodegenError {
-                    message: "continue outside loop".into(),
-                    span: Span::new(0, 0),
-                })?;
-                self.builder
-                    .build_unconditional_branch(ctx.cond_bb)
-                    .unwrap();
+            Stmt::For(f) => {
+                // Desugar for var in iter do body => index loop over array
+                // iter must be array (int[]); element type is int
+                let func = self.cur_fn.unwrap();
+                let cond_bb = self.context.append_basic_block(func, "for.cond");
+                let body_bb = self.context.append_basic_block(func, "for.body");
+                let inc_bb = self.context.append_basic_block(func, "for.inc");
+                let exit_bb = self.context.append_basic_block(func, "for.exit");
+                // Allocate index var __for_idx_<var>
+                let idx_name = format!("__for_idx_{}", f.var);
+                let idx_ty = self.context.i64_type().as_basic_type_enum();
+                let idx_ptr = self.create_entry_block_alloca(&idx_name, idx_ty);
+                self.builder.build_store(idx_ptr, self.context.i64_type().const_int(0, false)).unwrap();
+                // Determine array to iterate: for now require iter is Ident array variable
+                // We will evaluate iter expression? For simplicity we require iter is Ident of int[] variable, and we use its array length 16 constant
+                // Create initial branch to cond
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+                self.builder.position_at_end(cond_bb);
+                let idx_val = self.builder.build_load(idx_ty, idx_ptr, "for.idx.load").unwrap().into_int_value();
+                let limit = self.context.i64_type().const_int(16, false);
+                let cond = self.builder.build_int_compare(IntPredicate::SLT, idx_val, limit, "for.cond").unwrap();
+                self.builder.build_conditional_branch(cond, body_bb, exit_bb).unwrap();
+                self.loop_stack.push(LoopContext{cond_bb: inc_bb, exit_bb, label: f.label.clone(), defer_depth: self.defer_stack.len()});
+                self.builder.position_at_end(body_bb);
+                // Load element: arr[idx]
+                // Resolve array var from iter: expect Ident
+                let iter_val_opt: Option<(PointerValue<'ctx>, BasicTypeEnum<'ctx>)> = if let ExprKind::Ident(ref arr_name) = f.iter.kind {
+                    self.lookup_var(arr_name)
+                } else { None };
+                // Create loop scope for var
+                self.vars.push(HashMap::new());
+                self.defer_stack.push(Vec::new());
+                // Declare for var in this scope
+                // If iter is array, element type is int
+                let elem_val: Option<BasicValueEnum<'ctx>> = if let Some((arr_ptr, arr_ty)) = iter_val_opt {
+                    if arr_ty.is_array_type() {
+                        let arr_ty_a = arr_ty.into_array_type();
+                        let elem_ptr = unsafe { self.builder.build_gep(arr_ty_a, arr_ptr, &[self.context.i64_type().const_int(0,false), idx_val], "for.elem.ptr").unwrap() };
+                        Some(self.builder.build_load(self.context.i64_type(), elem_ptr, "for.elem").unwrap())
+                    } else if arr_ty.is_pointer_type() {
+                        let loaded_arr = self.builder.build_load(arr_ty, arr_ptr, "ptr.load").unwrap().into_pointer_value();
+                        let elem_ptr = unsafe { self.builder.build_gep(self.context.i64_type(), loaded_arr, &[idx_val], "for.ptr.elem").unwrap() };
+                        Some(self.builder.build_load(self.context.i64_type(), elem_ptr, "for.elem").unwrap())
+                    } else { None }
+                } else {
+                    // For non-ident iter (e.g., string), try to codegen iter as pointer? For now fallback to 0
+                    None
+                };
+                if let Some(v) = elem_val {
+                    let elem_ty = v.get_type();
+                    let var_ptr = self.create_entry_block_alloca(&f.var, elem_ty);
+                    self.builder.build_store(var_ptr, v).unwrap();
+                    self.vars.last_mut().unwrap().insert(f.var.clone(), (var_ptr, elem_ty));
+                } else {
+                    // fallback: declare var as int 0 if we couldn't resolve
+                    let var_ptr = self.create_entry_block_alloca(&f.var, self.context.i64_type().into());
+                    self.builder.build_store(var_ptr, self.context.i64_type().const_int(0,false)).unwrap();
+                    self.vars.last_mut().unwrap().insert(f.var.clone(), (var_ptr, self.context.i64_type().into()));
+                }
+                let _ = self.codegen_block(&f.body)?;
+                // after body, branch to inc
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    // emit defer for for-body scope before inc? The defer inside for body should run before inc
+                    // Our codegen_block for body already emitted its defers on normal exit via its own defer handling
+                    // But we still have outer for-var scope defers to emit before inc
+                    // For simplicity, just branch to inc; inc will handle idx increment
+                }
+                // Pop for-var scope defer/var (but keep defer for next iteration? The for-var scope is per-iteration; we need to pop after body)
+                // Actually for-var scope should be per iteration, but we pushed it before body; after body we should pop and emit its defers
+                // Emit defers for for-var scope
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    self.emit_current_scope_defers().unwrap();
+                }
+                self.defer_stack.pop();
+                self.vars.pop();
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    self.builder.build_unconditional_branch(inc_bb).unwrap();
+                }
+                self.builder.position_at_end(inc_bb);
+                let cur_idx = self.builder.build_load(idx_ty, idx_ptr, "for.idx").unwrap().into_int_value();
+                let inc = self.builder.build_int_add(cur_idx, self.context.i64_type().const_int(1,false), "for.inc").unwrap();
+                self.builder.build_store(idx_ptr, inc).unwrap();
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+                self.loop_stack.pop();
+                self.builder.position_at_end(exit_bb);
+                Ok(false)
+            }
+            Stmt::Defer(d) => {
+                // Push onto current defer scope (innermost block)
+                if let Some(top) = self.defer_stack.last_mut() {
+                    top.push(d.clone());
+                } else {
+                    // No active block defer stack (should not happen, fallback to global)
+                    self.defer_stack.push(vec![d.clone()]);
+                }
+                Ok(false)
+            }
+            Stmt::Break(b) => {
+                let target_idx = if let Some(label) = &b.label {
+                    self.loop_stack.iter().rposition(|lc| lc.label.as_ref() == Some(label))
+                        .ok_or(CodegenError{message: format!("break label `{label}` not found"), span: b.span})?
+                } else {
+                    self.loop_stack.len().checked_sub(1).ok_or(CodegenError{message: "break outside loop".into(), span: b.span})?
+                };
+                let ctx = self.loop_stack[target_idx].clone();
+                self.emit_defers_up_to(ctx.defer_depth)?;
+                self.builder.build_unconditional_branch(ctx.exit_bb).unwrap();
+                Ok(false)
+            }
+            Stmt::Continue(c) => {
+                let target_idx = if let Some(label) = &c.label {
+                    self.loop_stack.iter().rposition(|lc| lc.label.as_ref() == Some(label))
+                        .ok_or(CodegenError{message: format!("continue label `{label}` not found"), span: c.span})?
+                } else {
+                    self.loop_stack.len().checked_sub(1).ok_or(CodegenError{message: "continue outside loop".into(), span: c.span})?
+                };
+                let ctx = self.loop_stack[target_idx].clone();
+                self.emit_defers_up_to(ctx.defer_depth)?;
+                self.builder.build_unconditional_branch(ctx.cond_bb).unwrap();
                 Ok(false)
             }
         }

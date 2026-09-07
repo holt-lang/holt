@@ -1,0 +1,10 @@
+int main() do
+    int i = 0
+    loop do
+        i = i + 1
+        if (i is 5) do
+            break
+        end
+    end
+    return i
+end

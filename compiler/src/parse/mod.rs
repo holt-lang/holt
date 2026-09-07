@@ -438,6 +438,27 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        // Check for labeled loop/for:  ident ":" (loop|for)
+        if self.peek_token() == Some(&Token::Ident) && self.tokens.get(self.pos+1).map(|t| t.token == Token::Colon).unwrap_or(false) {
+            let label_tok = self.tokens[self.pos].clone();
+            // Look ahead after colon
+            let after_colon = self.tokens.get(self.pos+2).map(|t| &t.token);
+            if matches!(after_colon, Some(Token::Loop)) {
+                let label = self.slice(label_tok.span).to_string();
+                let label_span = label_tok.span;
+                self.advance(); // ident
+                self.advance(); // :
+                let l = self.parse_loop(Some((label, label_span)))?;
+                return Ok(Stmt::Loop(l));
+            } else if matches!(after_colon, Some(Token::For)) {
+                let label = self.slice(label_tok.span).to_string();
+                let label_span = label_tok.span;
+                self.advance(); // ident
+                self.advance(); // :
+                let f = self.parse_for(Some((label, label_span)))?;
+                return Ok(Stmt::For(f));
+            }
+        }
         match self.peek_token() {
             Some(Token::If) => {
                 let s = self.parse_if()?;
@@ -446,6 +467,18 @@ impl Parser {
             Some(Token::While) => {
                 let s = self.parse_while()?;
                 Ok(Stmt::While(s))
+            }
+            Some(Token::Loop) => {
+                let l = self.parse_loop(None)?;
+                Ok(Stmt::Loop(l))
+            }
+            Some(Token::For) => {
+                let f = self.parse_for(None)?;
+                Ok(Stmt::For(f))
+            }
+            Some(Token::Defer) => {
+                let d = self.parse_defer()?;
+                Ok(Stmt::Defer(d))
             }
             Some(Token::Return) => {
                 let s = self.parse_return()?;
@@ -593,30 +626,63 @@ impl Parser {
 
     fn parse_break(&mut self) -> Result<BreakStmt, ParseError> {
         let start = self.expect(Token::Break, "break")?.span.start;
-        // optional label identifier (labeled break not implemented Phase 2 — unlabeled only)
         let mut end = start + 5;
+        let mut label = None;
         if self.peek_token() == Some(&Token::Ident) {
-            let (_, span) = self.parse_ident()?;
+            let (name, span) = self.parse_ident()?;
+            label = Some(name);
             end = span.end;
-            // For now ignore label but consume it so we can diagnose later in sema
         }
         self.expect_terminator("break")?;
-        Ok(BreakStmt {
-            span: Span::new(start, end),
-        })
+        Ok(BreakStmt { label, span: Span::new(start, end) })
     }
 
     fn parse_continue(&mut self) -> Result<ContinueStmt, ParseError> {
         let start = self.expect(Token::Continue, "continue")?.span.start;
         let mut end = start + 8;
+        let mut label = None;
         if self.peek_token() == Some(&Token::Ident) {
-            let (_, span) = self.parse_ident()?;
+            let (name, span) = self.parse_ident()?;
+            label = Some(name);
             end = span.end;
         }
         self.expect_terminator("continue")?;
-        Ok(ContinueStmt {
-            span: Span::new(start, end),
-        })
+        Ok(ContinueStmt { label, span: Span::new(start, end) })
+    }
+
+    fn parse_loop(&mut self, label_opt: Option<(String, Span)>) -> Result<LoopStmt, ParseError> {
+        let start = if let Some((_, ls)) = &label_opt { ls.start } else { self.peek_span().start };
+        self.expect(Token::Loop, "loop")?;
+        let body = self.parse_block()?;
+        let end = body.span.end;
+        let (label, label_span) = match label_opt { Some((n,s)) => (Some(n), Some(s)), None => (None, None) };
+        let span = Span::new(start, end);
+        Ok(LoopStmt { label, label_span, body, span })
+    }
+
+    fn parse_for(&mut self, label_opt: Option<(String, Span)>) -> Result<ForStmt, ParseError> {
+        let start = if let Some((_, ls)) = &label_opt { ls.start } else { self.peek_span().start };
+        self.expect(Token::For, "for")?;
+        let (var, var_span) = self.parse_ident()?;
+        self.expect(Token::In, "expected `in` after for variable")?;
+        let iter = self.parse_expr()?;
+        let body = self.parse_block()?;
+        let end = body.span.end;
+        let (label, label_span) = match label_opt { Some((n,s)) => (Some(n), Some(s)), None => (None, None) };
+        Ok(ForStmt { label, label_span, var, var_span, iter, body, span: Span::new(start, end) })
+    }
+
+    fn parse_defer(&mut self) -> Result<DeferStmt, ParseError> {
+        let start = self.expect(Token::Defer, "defer")?.span.start;
+        if self.peek_token() == Some(&Token::Do) {
+            let blk = self.parse_block()?;
+            let end = blk.span.end;
+            return Ok(DeferStmt { inner: DeferInner::Block(blk), span: Span::new(start, end) });
+        }
+        let expr = self.parse_expr()?;
+        let end = expr.span.end;
+        self.expect_terminator("defer")?;
+        Ok(DeferStmt { inner: DeferInner::Expr(Box::new(expr)), span: Span::new(start, end) })
     }
 
     fn parse_expr_stmt(&mut self) -> Result<ExprStmt, ParseError> {

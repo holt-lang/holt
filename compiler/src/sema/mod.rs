@@ -80,7 +80,7 @@ pub struct Checker {
     scopes: Vec<HashMap<String, Ty>>,
     errors: Vec<SemError>,
     cur_ret: Option<Ty>,
-    loop_depth: usize,
+    loop_stack: Vec<Option<String>>, // stack of labels (None for unlabeled)
 }
 
 impl Checker {
@@ -91,9 +91,11 @@ impl Checker {
             scopes: Vec::new(),
             errors: Vec::new(),
             cur_ret: None,
-            loop_depth: 0,
+            loop_stack: Vec::new(),
         }
     }
+
+    fn loop_depth(&self) -> usize { self.loop_stack.len() }
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
@@ -376,26 +378,59 @@ impl Checker {
                 if cond_ty != Ty::Bool {
                     self.errors.push(SemError{message: format!("`while` condition must be `bool`, found `{cond_ty}`"), span: s.cond.span});
                 }
-                self.loop_depth += 1;
+                self.loop_stack.push(None);
                 let _ = self.check_block(&s.body, ret_ty);
-                self.loop_depth -= 1;
+                self.loop_stack.pop();
+                false
+            }
+            Stmt::Loop(l) => {
+                self.loop_stack.push(l.label.clone());
+                let _ = self.check_block(&l.body, ret_ty);
+                self.loop_stack.pop();
+                false
+            }
+            Stmt::For(f) => {
+                let iter_ty = self.check_expr(&f.iter);
+                let elem_ty = match &iter_ty {
+                    Ty::Array(el) => (**el).clone(),
+                    Ty::String => Ty::Char,
+                    _ => {
+                        self.errors.push(SemError{message: format!("`for` iterable must be array or string, found `{iter_ty}`"), span: f.iter.span});
+                        Ty::Int
+                    }
+                };
+                self.loop_stack.push(f.label.clone());
+                self.push_scope();
+                self.declare_var(&f.var, elem_ty, f.var_span);
+                let _ = self.check_block(&f.body, ret_ty);
+                self.pop_scope();
+                self.loop_stack.pop();
+                false
+            }
+            Stmt::Defer(d) => {
+                match &d.inner {
+                    DeferInner::Expr(e) => { let _ = self.check_expr(e); },
+                    DeferInner::Block(b) => { let _ = self.check_block(b, ret_ty); },
+                }
                 false
             }
             Stmt::Break(b) => {
-                if self.loop_depth == 0 {
-                    self.errors.push(SemError {
-                        message: "break outside loop".into(),
-                        span: b.span,
-                    });
+                if let Some(label) = &b.label {
+                    if !self.loop_stack.iter().any(|l| l.as_ref() == Some(label)) {
+                        self.errors.push(SemError{message: format!("break label `{label}` not found"), span: b.span});
+                    }
+                } else if self.loop_depth() == 0 {
+                    self.errors.push(SemError{message: "break outside loop".into(), span: b.span});
                 }
                 false
             }
             Stmt::Continue(c) => {
-                if self.loop_depth == 0 {
-                    self.errors.push(SemError {
-                        message: "continue outside loop".into(),
-                        span: c.span,
-                    });
+                if let Some(label) = &c.label {
+                    if !self.loop_stack.iter().any(|l| l.as_ref() == Some(label)) {
+                        self.errors.push(SemError{message: format!("continue label `{label}` not found"), span: c.span});
+                    }
+                } else if self.loop_depth() == 0 {
+                    self.errors.push(SemError{message: "continue outside loop".into(), span: c.span});
                 }
                 false
             }

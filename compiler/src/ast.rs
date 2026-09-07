@@ -106,11 +106,14 @@ pub enum Stmt {
     VarDecl(VarDecl),
     If(IfStmt),
     While(WhileStmt),
+    Loop(LoopStmt),
+    For(ForStmt),
     Return(ReturnStmt),
     Expr(ExprStmt),
     Block(Block),
     Break(BreakStmt),
     Continue(ContinueStmt),
+    Defer(DeferStmt),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,12 +154,45 @@ pub struct ExprStmt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BreakStmt {
+    pub label: Option<String>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinueStmt {
+    pub label: Option<String>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopStmt {
+    pub label: Option<String>,
+    pub label_span: Option<Span>,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForStmt {
+    pub label: Option<String>,
+    pub label_span: Option<Span>,
+    pub var: String,
+    pub var_span: Span,
+    pub iter: Expr,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferStmt {
+    pub inner: DeferInner,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferInner {
+    Expr(Box<Expr>),
+    Block(Block),
 }
 
 // ── Expressions (§8) ─────────────────────────────────────────────────

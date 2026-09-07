@@ -1,0 +1,14 @@
+int main() do
+    int[] arr
+    arr[0] = 1
+    arr[1] = 2
+    arr[2] = 3
+    int sum = 0
+    for x in arr do
+        sum = sum + x
+        if (sum is 3) do
+            continue
+        end
+    end
+    return sum
+end
