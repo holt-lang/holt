@@ -62,3 +62,37 @@ impl MultiLexError {
         }
     }
 }
+
+/// Generic single diagnostic for parse/sema/codegen.
+#[derive(Debug, Error, Diagnostic)]
+#[error("{message}")]
+pub struct SingleDiagnostic {
+    #[source_code]
+    pub src: NamedSource<String>,
+    #[label("{message}")]
+    pub span: SourceSpan,
+    pub message: String,
+}
+
+impl SingleDiagnostic {
+    pub fn new(filename: String, source: String, span: Span, message: String) -> Self {
+        Self { src: NamedSource::new(filename, source), span: span.to_source_span(), message }
+    }
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("{message}")]
+pub struct MultiDiagnostic {
+    #[source_code]
+    pub src: NamedSource<String>,
+    #[related]
+    pub errors: Vec<SingleDiagnostic>,
+    pub message: String,
+}
+
+impl MultiDiagnostic {
+    pub fn from_errors(filename: String, source: String, errs: Vec<(Span, String)>, message: String) -> Self {
+        let errors = errs.into_iter().map(|(span, msg)| SingleDiagnostic::new(filename.clone(), source.clone(), span, msg)).collect();
+        Self { src: NamedSource::new(filename, source), errors, message }
+    }
+}
