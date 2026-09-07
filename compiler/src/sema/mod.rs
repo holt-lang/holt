@@ -1,7 +1,6 @@
-//! Phase 1 semantic checks: scopes, name resolution, type checking,
-//! non-void return guarantee. Mirrors `references/phases.md:23`.
+//! Phase 2 semantic checks: structs, field access, literals.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::token::Span;
@@ -17,6 +16,7 @@ pub enum Ty {
     Int,
     Bool,
     Void,
+    Struct(String),
 }
 
 impl From<&Type> for Ty {
@@ -25,6 +25,7 @@ impl From<&Type> for Ty {
             Type::Int(_) => Ty::Int,
             Type::Bool(_) => Ty::Bool,
             Type::Void(_) => Ty::Void,
+            Type::Named(n, _) => Ty::Struct(n.clone()),
         }
     }
 }
@@ -34,6 +35,7 @@ impl std::fmt::Display for Ty {
             Ty::Int => write!(f, "int"),
             Ty::Bool => write!(f, "bool"),
             Ty::Void => write!(f, "void"),
+            Ty::Struct(n) => write!(f, "{}", n),
         }
     }
 }
@@ -45,16 +47,25 @@ struct FuncSig {
     span: Span,
 }
 
+#[derive(Clone, Debug)]
+struct StructInfo {
+    name: String,
+    fields: Vec<(String, Ty)>, // ordered
+    field_map: HashMap<String, (usize, Ty)>,
+    span: Span,
+}
+
 pub struct Checker {
     funcs: HashMap<String, FuncSig>,
-    scopes: Vec<HashMap<String, Ty>>, // stack; 0 is global (unused for locals), function scope pushed
+    structs: HashMap<String, StructInfo>,
+    scopes: Vec<HashMap<String, Ty>>,
     errors: Vec<SemError>,
     cur_ret: Option<Ty>,
 }
 
 impl Checker {
     pub fn new() -> Self {
-        Self { funcs: HashMap::new(), scopes: Vec::new(), errors: Vec::new(), cur_ret: None }
+        Self { funcs: HashMap::new(), structs: HashMap::new(), scopes: Vec::new(), errors: Vec::new(), cur_ret: None }
     }
 
     fn push_scope(&mut self) { self.scopes.push(HashMap::new()); }
@@ -77,56 +88,93 @@ impl Checker {
         None
     }
 
+    fn resolve_type(&mut self, ty: &Type) -> Ty {
+        let t = Ty::from(ty);
+        if let Ty::Struct(ref n) = t {
+            if !self.structs.contains_key(n) {
+                self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+            }
+        }
+        // void check for variable usage handled elsewhere
+        t
+    }
+
     pub fn check_program(&mut self, prog: &Program) -> Vec<SemError> {
-        // First pass: collect function signatures, detect duplicate definitions, check main
+        // First pass: collect struct definitions
+        for item in &prog.items {
+            if let Item::Struct(s) = item {
+                if self.structs.contains_key(&s.name) {
+                    self.errors.push(SemError{message: format!("duplicate struct `{}`", s.name), span: s.name_span});
+                } else if self.funcs.contains_key(&s.name) {
+                    self.errors.push(SemError{message: format!("struct name `{}` conflicts with function", s.name), span: s.name_span});
+                } else {
+                    let mut seen = HashSet::new();
+                    let mut fields = Vec::new();
+                    let mut fmap = HashMap::new();
+                    for (idx, f) in s.fields.iter().enumerate() {
+                        if !seen.insert(&f.name) {
+                            self.errors.push(SemError{message: format!("duplicate field `{}` in struct `{}`", f.name, s.name), span: f.name_span});
+                        }
+                        let fty = self.resolve_type(&f.ty);
+                        if fty == Ty::Void {
+                            self.errors.push(SemError{message: format!("field `{}` cannot be `void`", f.name), span: f.span});
+                        }
+                        fmap.insert(f.name.clone(), (idx, fty.clone()));
+                        fields.push((f.name.clone(), fty));
+                    }
+                    self.structs.insert(s.name.clone(), StructInfo{name: s.name.clone(), fields, field_map: fmap, span: s.span});
+                }
+            }
+        }
+        // Second pass: collect function signatures
         for item in &prog.items {
             if let Item::Function(f) = item {
                 if self.funcs.contains_key(&f.name) {
                     self.errors.push(SemError{message: format!("duplicate function `{}`", f.name), span: f.name_span});
+                } else if self.structs.contains_key(&f.name) {
+                    self.errors.push(SemError{message: format!("function name `{}` conflicts with struct", f.name), span: f.name_span});
                 } else {
-                    let param_tys: Vec<Ty> = f.params.iter().map(|p| Ty::from(&p.ty)).collect();
-                    // duplicate param names?
-                    let mut seen = std::collections::HashSet::new();
+                    let param_tys: Vec<Ty> = f.params.iter().map(|p| {
+                        let t = self.resolve_type(&p.ty);
+                        if t == Ty::Void { self.errors.push(SemError{message: format!("parameter `{}` cannot be `void`", p.name), span: p.span}); }
+                        t
+                    }).collect();
+                    let ret_ty = self.resolve_type(&f.ret_ty);
+                    let mut seen = HashSet::new();
                     for p in &f.params {
                         if !seen.insert(&p.name) {
                             self.errors.push(SemError{message: format!("duplicate parameter `{}`", p.name), span: p.name_span});
                         }
                     }
-                    self.funcs.insert(f.name.clone(), FuncSig{ret: Ty::from(&f.ret_ty), params: param_tys, span: f.name_span});
+                    self.funcs.insert(f.name.clone(), FuncSig{ret: ret_ty, params: param_tys, span: f.name_span});
                 }
             }
         }
-        // Validate main exists and signature (§37)
-        if let Some(main) = self.funcs.get("main") {
-            // allowed: void main() or int main()
-            // spec says second is int main(string[] args) but Phase 1 restricts to int main()
-            // We'll allow void main() and int main() and int main() with zero params for simplicity
-            // If int main has params, forbid for now? Keep simple: allow 0 params only.
+        // Validate main
+        if let Some(main) = self.funcs.get("main").cloned() {
             if !( (main.ret == Ty::Void && main.params.is_empty()) || (main.ret == Ty::Int && main.params.is_empty()) ) {
-                // also allow int main() as per phase 1
                 self.errors.push(SemError{message: format!("invalid `main` signature: expected `void main()` or `int main()`, found `{} main({})`", main.ret, main.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")), span: main.span});
             }
         } else {
             self.errors.push(SemError{message: "missing `main` function".into(), span: prog.span});
         }
 
-        // Second pass: check bodies
+        // Third pass: check function bodies
         for item in &prog.items {
             if let Item::Function(f) = item {
                 self.check_function(f);
             }
         }
-        // Return errors (drain)
         std::mem::take(&mut self.errors)
     }
 
     fn check_function(&mut self, f: &Function) {
-        let ret_ty = Ty::from(&f.ret_ty);
+        let ret_ty = self.resolve_type(&f.ret_ty);
         self.cur_ret = Some(ret_ty.clone());
         self.push_scope();
-        // declare params in scope
         for p in &f.params {
-            self.declare_var(&p.name, Ty::from(&p.ty), p.name_span);
+            let ty = self.resolve_type(&p.ty);
+            self.declare_var(&p.name, ty, p.name_span);
         }
         let always_returns = self.check_block(&f.body, &ret_ty);
         if ret_ty != Ty::Void && !always_returns {
@@ -136,15 +184,12 @@ impl Checker {
         self.cur_ret = None;
     }
 
-    // returns true if block always returns (last stmt returns or if both branches return etc)
     fn check_block(&mut self, block: &Block, ret_ty: &Ty) -> bool {
         self.push_scope();
         let mut always_returns = false;
         for stmt in &block.stmts {
-            // unreachable after return? warn but not error
             let stmt_returns = self.check_stmt(stmt, ret_ty);
             if stmt_returns { always_returns = true; }
-            // if this stmt always returns, remaining stmts are unreachable — but continue checking for errors
         }
         self.pop_scope();
         always_returns
@@ -153,8 +198,7 @@ impl Checker {
     fn check_stmt(&mut self, stmt: &Stmt, ret_ty: &Ty) -> bool {
         match stmt {
             Stmt::VarDecl(d) => {
-                // type is already validated in parse (only int/bool/void) — but void variables illegal
-                let decl_ty: Ty = Ty::from(&d.ty);
+                let decl_ty = self.resolve_type(&d.ty);
                 if decl_ty == Ty::Void {
                     self.errors.push(SemError{message: "variable cannot have `void` type".into(), span: d.span});
                 }
@@ -190,9 +234,7 @@ impl Checker {
                     self.errors.push(SemError{message: format!("`if` condition must be `bool`, found `{cond_ty}`"), span: s.cond.span});
                 }
                 let then_ret = self.check_block(&s.then_block, ret_ty);
-                let else_ret = if let Some(else_b) = &s.else_block {
-                    self.check_block(else_b, ret_ty)
-                } else { false };
+                let else_ret = if let Some(else_b) = &s.else_block { self.check_block(else_b, ret_ty) } else { false };
                 then_ret && else_ret
             }
             Stmt::While(s) => {
@@ -200,7 +242,6 @@ impl Checker {
                 if cond_ty != Ty::Bool {
                     self.errors.push(SemError{message: format!("`while` condition must be `bool`, found `{cond_ty}`"), span: s.cond.span});
                 }
-                // body checked, but while never guarantees return (even if body returns)
                 let _ = self.check_block(&s.body, ret_ty);
                 false
             }
@@ -212,24 +253,17 @@ impl Checker {
             ExprKind::IntLit(_) => Ty::Int,
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::Ident(name) => {
-                if let Some(ty) = self.lookup_var(name) { ty }
-                else {
+                if let Some(ty) = self.lookup_var(name) { ty } else {
                     self.errors.push(SemError{message: format!("undefined variable `{name}`"), span: expr.span});
-                    Ty::Int // poison to continue
+                    Ty::Int
                 }
             }
             ExprKind::Paren(inner) => self.check_expr(inner),
             ExprKind::Unary{op, expr: inner} => {
                 let t = self.check_expr(inner);
                 match op {
-                    UnaryOp::Not => {
-                        if t != Ty::Bool { self.errors.push(SemError{message: format!("`not` requires `bool`, found `{t}`"), span: expr.span}); }
-                        Ty::Bool
-                    }
-                    UnaryOp::Neg | UnaryOp::Pos => {
-                        if t != Ty::Int { self.errors.push(SemError{message: format!("unary `{op:?}` requires `int`, found `{t}`"), span: expr.span}); }
-                        Ty::Int
-                    }
+                    UnaryOp::Not => { if t != Ty::Bool { self.errors.push(SemError{message: format!("`not` requires `bool`, found `{t}`"), span: expr.span}); } Ty::Bool }
+                    UnaryOp::Neg | UnaryOp::Pos => { if t != Ty::Int { self.errors.push(SemError{message: format!("unary `{op:?}` requires `int`, found `{t}`"), span: expr.span}); } Ty::Int }
                 }
             }
             ExprKind::Binary{op, lhs, rhs} => {
@@ -249,7 +283,6 @@ impl Checker {
                         Ty::Bool
                     }
                     BinOp::Is|BinOp::IsNot => {
-                        // Phase 1: allow int equality via `is`; require same type
                         if lt != rt {
                             self.errors.push(SemError{message: format!("`is` requires matching types, found `{lt}` and `{rt}`"), span: expr.span});
                         }
@@ -263,18 +296,13 @@ impl Checker {
                     }
                 }
             }
-            ExprKind::Assign{target, target_span, value} => {
-                let var_ty = self.lookup_var(target);
-                let val_ty = self.check_expr(value);
-                if let Some(ty) = var_ty {
-                    if ty != val_ty {
-                        self.errors.push(SemError{message: format!("assignment type mismatch: `{target}` is `{ty}`, found `{val_ty}`"), span: expr.span});
-                    }
-                    ty
-                } else {
-                    self.errors.push(SemError{message: format!("undefined variable `{target}`"), span: *target_span});
-                    val_ty
+            ExprKind::Assign{lhs, value} => {
+                let lhs_ty = self.check_lvalue(lhs);
+                let rhs_ty = self.check_expr(value);
+                if lhs_ty != rhs_ty {
+                    self.errors.push(SemError{message: format!("assignment type mismatch: expected `{lhs_ty}`, found `{rhs_ty}`"), span: expr.span});
                 }
+                lhs_ty
             }
             ExprKind::Call{callee, callee_span, args} => {
                 let sig = self.funcs.get(callee).cloned();
@@ -296,6 +324,99 @@ impl Checker {
                     for arg in args { let _ = self.check_expr(arg); }
                     Ty::Int
                 }
+            }
+            ExprKind::MemberAccess{object, field, field_span} => {
+                let obj_ty = self.check_expr(object);
+                if let Ty::Struct(ref sname) = obj_ty {
+                    if let Some(sinfo) = self.structs.get(sname) {
+                        if let Some((_, fty)) = sinfo.field_map.get(field) {
+                            fty.clone()
+                        } else {
+                            self.errors.push(SemError{message: format!("struct `{sname}` has no field `{field}`"), span: *field_span});
+                            Ty::Int
+                        }
+                    } else {
+                        self.errors.push(SemError{message: format!("unknown struct `{sname}`"), span: object.span});
+                        Ty::Int
+                    }
+                } else {
+                    self.errors.push(SemError{message: format!("field access on non-struct `{}`, field `{}`", obj_ty, field), span: *field_span});
+                    Ty::Int
+                }
+            }
+            ExprKind::StructLit{ty, fields} => {
+                let lit_ty = self.resolve_type(ty);
+                let sname = match lit_ty {
+                    Ty::Struct(ref n) => n.clone(),
+                    _ => {
+                        self.errors.push(SemError{message: format!("struct literal requires struct type, found `{lit_ty}`"), span: expr.span});
+                        return lit_ty;
+                    }
+                };
+                let sinfo = match self.structs.get(&sname).cloned() {
+                    Some(s) => s,
+                    None => {
+                        self.errors.push(SemError{message: format!("unknown struct `{sname}`"), span: expr.span});
+                        return Ty::Struct(sname);
+                    }
+                };
+                let mut seen = HashSet::new();
+                for (fname, fspan, fexpr) in fields {
+                    if !seen.insert(fname) {
+                        self.errors.push(SemError{message: format!("duplicate field `{fname}` in struct literal"), span: *fspan});
+                    }
+                    if let Some((_, expected_ty)) = sinfo.field_map.get(fname) {
+                        let got = self.check_expr(fexpr);
+                        if &got != expected_ty {
+                            self.errors.push(SemError{message: format!("field `{fname}`: expected `{expected_ty}`, found `{got}`"), span: fexpr.span});
+                        }
+                    } else {
+                        self.errors.push(SemError{message: format!("unknown field `{fname}` for struct `{sname}`"), span: *fspan});
+                        let _ = self.check_expr(fexpr);
+                    }
+                }
+                // Check missing fields
+                for (fname, _) in &sinfo.fields {
+                    if !seen.contains(fname) {
+                        self.errors.push(SemError{message: format!("missing field `{fname}` in `{sname}` literal"), span: expr.span});
+                    }
+                }
+                Ty::Struct(sname)
+            }
+        }
+    }
+
+    fn check_lvalue(&mut self, expr: &Expr) -> Ty {
+        match &expr.kind {
+            ExprKind::Ident(name) => {
+                if let Some(ty) = self.lookup_var(name) { ty } else {
+                    self.errors.push(SemError{message: format!("undefined variable `{name}`"), span: expr.span});
+                    Ty::Int
+                }
+            }
+            ExprKind::MemberAccess{object, field, field_span} => {
+                // reuse field check but treat as lvalue
+                let obj_ty = self.check_expr(object);
+                if let Ty::Struct(ref sname) = obj_ty {
+                    if let Some(sinfo) = self.structs.get(sname) {
+                        if let Some((_, fty)) = sinfo.field_map.get(field) {
+                            fty.clone()
+                        } else {
+                            self.errors.push(SemError{message: format!("struct `{sname}` has no field `{field}`"), span: *field_span});
+                            Ty::Int
+                        }
+                    } else {
+                        self.errors.push(SemError{message: format!("unknown struct `{sname}`"), span: expr.span});
+                        Ty::Int
+                    }
+                } else {
+                    self.errors.push(SemError{message: format!("assignment to non-struct field `{field}`"), span: *field_span});
+                    Ty::Int
+                }
+            }
+            _ => {
+                self.errors.push(SemError{message: "invalid assignment target".into(), span: expr.span});
+                Ty::Int
             }
         }
     }

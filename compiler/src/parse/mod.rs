@@ -93,14 +93,44 @@ impl Parser {
         self.consume_newlines();
         let mut items = Vec::new();
         while !self.is_eof() {
-            // skip stray terminators between top-level decls
             self.consume_newlines();
             if self.is_eof() { break; }
-            let func = self.parse_function()?;
-            items.push(Item::Function(func));
+            // Top-level: struct decl vs function decl
+            // struct-declaration starts with `struct`
+            if self.peek_token() == Some(&Token::Struct) {
+                let decl = self.parse_struct_decl()?;
+                items.push(Item::Struct(decl));
+            } else {
+                let func = self.parse_function()?;
+                items.push(Item::Function(func));
+            }
             self.consume_newlines();
         }
         Ok(Program { items, span: Span::new(start, self.source.len()) })
+    }
+
+    fn parse_struct_decl(&mut self) -> Result<StructDecl, ParseError> {
+        let start = self.expect(Token::Struct, "expected `struct`")?.span.start;
+        let (name, name_span) = self.parse_ident()?;
+        self.expect(Token::Has, "expected `has` after struct name")?;
+        self.consume_newlines();
+        let mut fields = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            let ty = self.parse_type()?;
+            let (fname, fspan) = self.parse_ident()?;
+            let fend = fspan.end;
+            // optional initializer ignored for Phase 2 (not stored) — but consume if present
+            if self.consume_if(Token::Eq) {
+                let _ = self.parse_expr()?; // ignore default value for now
+            }
+            self.expect_terminator("struct field")?;
+            let span = Span::new(ty.span().start, fend);
+            fields.push(StructField{ty, name: fname, name_span: fspan, span});
+            self.consume_newlines();
+        }
+        let end = self.expect(Token::End, "expected `end` to close struct")?.span.end;
+        Ok(StructDecl{name, name_span, fields, span: Span::new(start, end)})
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -109,7 +139,12 @@ impl Parser {
             Token::Int => { self.advance(); Ok(Type::Int(st.span)) }
             Token::Bool => { self.advance(); Ok(Type::Bool(st.span)) }
             Token::Void => { self.advance(); Ok(Type::Void(st.span)) }
-            _ => Err(ParseError{message: format!("expected type `int`/`bool`/`void`, found `{}`", st.token), span: st.span}),
+            Token::Ident => {
+                // Named type (struct) — EBNF named-type
+                self.advance();
+                Ok(Type::Named(self.slice(st.span).to_string(), st.span))
+            }
+            _ => Err(ParseError{message: format!("expected type `int`/`bool`/`void` or struct name, found `{}`", st.token), span: st.span}),
         }
     }
 
@@ -169,11 +204,9 @@ impl Parser {
             Some(Token::While) => { let s = self.parse_while()?; Ok(Stmt::While(s)) }
             Some(Token::Return) => { let s = self.parse_return()?; Ok(Stmt::Return(s)) }
             Some(Token::Do) => { let b = self.parse_block()?; Ok(Stmt::Block(b)) }
-            Some(Token::Int) | Some(Token::Bool) | Some(Token::Void) => {
-                // Lookahead: if type ident -> var decl, else expr stmt starting with type? but type as expr not valid, so decl
-                // Peek next non-type token is ident => var decl
-                let is_decl = self.tokens.get(self.pos+1).map(|st| st.token == Token::Ident).unwrap_or(false);
-                if is_decl {
+            _ => {
+                // Try var-decl detection: type (int/bool/void or Named Ident) + Ident + (= or terminator)
+                if self.is_var_decl_start() {
                     let d = self.parse_var_decl()?;
                     Ok(Stmt::VarDecl(d))
                 } else {
@@ -181,12 +214,32 @@ impl Parser {
                     Ok(Stmt::Expr(e))
                 }
             }
-            _ => {
-                // expression statement
-                let e = self.parse_expr_stmt()?;
-                Ok(Stmt::Expr(e))
+        }
+    }
+
+    fn is_var_decl_start(&self) -> bool {
+        let cur = match self.peek_token() { Some(t) => t, None => return false };
+        let next = self.tokens.get(self.pos+1).map(|st| &st.token);
+        let next2 = self.tokens.get(self.pos+2).map(|st| &st.token);
+        // primitive type + ident
+        if matches!(cur, Token::Int | Token::Bool | Token::Void) {
+            return matches!(next, Some(Token::Ident));
+        }
+        // Named type (Ident) + Ident
+        if matches!(cur, Token::Ident) && matches!(next, Some(Token::Ident)) {
+            // third token should be terminator-ish or = to be a decl; otherwise it's like `Point has ...` expr?
+            // For safety, treat any Ident Ident as decl unless third is '(' or '.' etc
+            if matches!(next2, Some(Token::Eq) | Some(Token::Newline) | Some(Token::Semicolon) | Some(Token::End) | None) {
+                return true;
+            }
+            // also `Point p = Point has ...` → third is Eq
+            if matches!(next2, Some(Token::Eq)) { return true; }
+            // If we see Ident Ident followed by anything but Dot/LParen, likely decl
+            if !matches!(next2, Some(Token::Dot) | Some(Token::LParen) | Some(Token::LBracket)) {
+                return true;
             }
         }
+        false
     }
 
     fn parse_var_decl(&mut self) -> Result<VarDecl, ParseError> {
@@ -267,16 +320,20 @@ impl Parser {
     fn parse_assignment(&mut self) -> Result<Expr, ParseError> {
         let lhs = self.parse_or()?;
         if self.peek_token() == Some(&Token::Eq) {
-            // Only allow ident as assignment target for Phase 1
-            let target_ident = match lhs.kind {
-                ExprKind::Ident(ref s) => s.clone(),
-                _ => return Err(ParseError{message:"assignment target must be identifier".into(), span: lhs.span}),
-            };
-            let target_span = lhs.span;
+            // Allow Ident or MemberAccess as lvalue (Phase 2)
+            let is_lvalue = matches!(lhs.kind, ExprKind::Ident(_) | ExprKind::MemberAccess{..} | ExprKind::Paren(_));
+            if !is_lvalue {
+                return Err(ParseError{message:"assignment target must be identifier or field access".into(), span: lhs.span});
+            }
+            // Normalize paren lvalue? unwrap paren for `(x) = 1` not supported
+            if let ExprKind::Paren(_) = lhs.kind {
+                return Err(ParseError{message:"cannot assign to parenthesized expression".into(), span: lhs.span});
+            }
+            let lhs_span = lhs.span;
             self.advance(); // consume =
             let rhs = self.parse_assignment()?; // right-assoc
-            let span = Span::new(target_span.start, rhs.span.end);
-            return Ok(Expr{kind: ExprKind::Assign{target: target_ident, target_span, value: Box::new(rhs)}, span});
+            let span = Span::new(lhs_span.start, rhs.span.end);
+            return Ok(Expr{kind: ExprKind::Assign{lhs: Box::new(lhs), value: Box::new(rhs)}, span});
         }
         Ok(lhs)
     }
@@ -413,10 +470,10 @@ impl Parser {
         loop {
             // call: '(' [args] ')'
             if self.peek_token() == Some(&Token::LParen) {
-                // only Ident callee for Phase 1
+                // callee must be Ident or MemberAccess? For Phase 2 keep Ident only for simplicity
                 let callee_name = match &expr.kind {
                     ExprKind::Ident(s) => s.clone(),
-                    _ => break, // non-ident call not handled Phase 1
+                    _ => break,
                 };
                 let callee_span = expr.span;
                 self.advance(); // (
@@ -432,12 +489,24 @@ impl Parser {
                 expr = Expr{kind: ExprKind::Call{callee: callee_name, callee_span, args}, span};
                 continue;
             }
+            // member access: '.' ident (EBNF §8 postfix member-access)
+            if self.peek_token() == Some(&Token::Dot) {
+                self.advance(); // consume .
+                let (field, fspan) = self.parse_ident()?;
+                let span = Span::new(expr.span.start, fspan.end);
+                expr = Expr{kind: ExprKind::MemberAccess{object: Box::new(expr), field, field_span: fspan}, span};
+                continue;
+            }
             break;
         }
         Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        // Attempt struct literal first: Type has ... end
+        if let Some(lit) = self.try_parse_struct_literal()? {
+            return Ok(lit);
+        }
         let st = self.peek().cloned().ok_or(ParseError{message:"expected expression".into(), span: Span::new(self.source.len(), self.source.len())})?;
         match st.token {
             Token::IntLit | Token::HexInt | Token::BinInt => {
@@ -457,6 +526,41 @@ impl Parser {
             }
             _ => Err(ParseError{message: format!("expected expression, found `{}`", st.token), span: st.span}),
         }
+    }
+
+    fn try_parse_struct_literal(&mut self) -> Result<Option<Expr>, ParseError> {
+        // Save position to backtrack if not a struct literal
+        let save = self.pos;
+        // Try parse Type (int/bool/void/named) — but struct literal expects struct Named type
+        // We'll peek: Int/Bool/Ident could be start of Type
+        let is_type_start = matches!(self.peek_token(), Some(Token::Int) | Some(Token::Bool) | Some(Token::Void) | Some(Token::Ident));
+        if !is_type_start { return Ok(None); }
+        // Lookahead: need Type then `has`
+        // We attempt to parse type, then check for Has; if not Has, revert
+        let ty = match self.parse_type() {
+            Ok(t) => t,
+            Err(_) => { self.pos = save; return Ok(None); }
+        };
+        if self.peek_token() != Some(&Token::Has) {
+            self.pos = save;
+            return Ok(None);
+        }
+        // It is a struct literal
+        let has_tok = self.advance().unwrap(); // consume has
+        self.consume_newlines();
+        let mut fields = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            let (fname, fspan) = self.parse_ident()?;
+            self.expect(Token::Eq, "expected `=` in struct literal")?;
+            let expr = self.parse_expr()?;
+            self.expect_terminator("struct field initializer")?;
+            fields.push((fname, fspan, expr));
+            self.consume_newlines();
+        }
+        let end = self.expect(Token::End, "expected `end` to close struct literal")?.span.end;
+        let span = Span::new(ty.span().start, end);
+        Ok(Some(Expr{kind: ExprKind::StructLit{ty, fields}, span}))
     }
 }
 
