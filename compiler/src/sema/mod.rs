@@ -74,12 +74,23 @@ struct StructInfo {
     span: Span,
 }
 
+#[derive(Clone, Debug)]
+struct ClassInfo {
+    name: String,
+    fields: Vec<(String, Ty)>,
+    field_map: HashMap<String, (usize, Ty)>,
+    methods: HashMap<String, FuncSig>,
+    span: Span,
+}
+
 pub struct Checker {
     funcs: HashMap<String, FuncSig>,
     structs: HashMap<String, StructInfo>,
+    classes: HashMap<String, ClassInfo>,
     scopes: Vec<HashMap<String, Ty>>,
     errors: Vec<SemError>,
     cur_ret: Option<Ty>,
+    cur_class: Option<String>,
     loop_stack: Vec<Option<String>>, // stack of labels (None for unlabeled)
 }
 
@@ -88,9 +99,11 @@ impl Checker {
         Self {
             funcs: HashMap::new(),
             structs: HashMap::new(),
+            classes: HashMap::new(),
             scopes: Vec::new(),
             errors: Vec::new(),
             cur_ret: None,
+            cur_class: None,
             loop_stack: Vec::new(),
         }
     }
@@ -198,6 +211,49 @@ impl Checker {
                 }
             }
         }
+        // First pass (continued): collect class definitions
+        for item in &prog.items {
+            if let Item::Class(c) = item {
+                if self.structs.contains_key(&c.name) || self.classes.contains_key(&c.name) {
+                    self.errors.push(SemError{message: format!("duplicate class/struct `{}`", c.name), span: c.name_span});
+                } else if self.funcs.contains_key(&c.name) {
+                    self.errors.push(SemError{message: format!("class name `{}` conflicts with function", c.name), span: c.name_span});
+                } else {
+                    let mut seen = HashSet::new();
+                    let mut fields = Vec::new();
+                    let mut fmap = HashMap::new();
+                    for (idx, f) in c.fields.iter().enumerate() {
+                        if !seen.insert(&f.name) {
+                            self.errors.push(SemError{message: format!("duplicate field `{}` in class `{}`", f.name, c.name), span: f.name_span});
+                        }
+                        let fty = self.resolve_type(&f.ty);
+                        if fty == Ty::Void { self.errors.push(SemError{message: format!("field `{}` cannot be `void`", f.name), span: f.span}); }
+                        fmap.insert(f.name.clone(), (idx, fty.clone()));
+                        fields.push((f.name.clone(), fty));
+                    }
+                    // Also insert class layout into structs map for field access / instantiation
+                    self.structs.insert(c.name.clone(), StructInfo{name: c.name.clone(), fields: fields.clone(), field_map: fmap.clone(), span: c.span});
+                    // Collect methods
+                    let mut methods = HashMap::new();
+                    for m in &c.methods {
+                        if methods.contains_key(&m.name) {
+                            self.errors.push(SemError{message: format!("duplicate method `{}` in class `{}`", m.name, c.name), span: m.name_span});
+                        } else {
+                            let param_tys: Vec<Ty> = m.params.iter().map(|p| {
+                                let t = self.resolve_type(&p.ty);
+                                if t == Ty::Void { self.errors.push(SemError{message: format!("parameter `{}` cannot be `void`", p.name), span: p.span}); }
+                                t
+                            }).collect();
+                            let ret_ty = self.resolve_type(&m.ret_ty);
+                            let mut pseen = HashSet::new();
+                            for p in &m.params { if !pseen.insert(&p.name) { self.errors.push(SemError{message: format!("duplicate param `{}`", p.name), span: p.name_span}); } }
+                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, span: m.name_span});
+                        }
+                    }
+                    self.classes.insert(c.name.clone(), ClassInfo{name: c.name.clone(), fields, field_map: fmap, methods, span: c.span});
+                }
+            }
+        }
         // Second pass: collect function signatures
         for item in &prog.items {
             if let Item::Function(f) = item {
@@ -276,6 +332,13 @@ impl Checker {
                 self.check_function(f);
             }
         }
+        // Check class methods
+        let class_items: Vec<ClassDecl> = prog.items.iter().filter_map(|it| if let Item::Class(c) = it { Some(c.clone()) } else { None }).collect();
+        for cls in class_items {
+            for meth in &cls.methods {
+                self.check_method(&cls.name, meth);
+            }
+        }
         std::mem::take(&mut self.errors)
     }
 
@@ -293,6 +356,26 @@ impl Checker {
         }
         self.pop_scope();
         self.cur_ret = None;
+    }
+
+    fn check_method(&mut self, class_name: &str, f: &Function) {
+        let ret_ty = self.resolve_type(&f.ret_ty);
+        self.cur_ret = Some(ret_ty.clone());
+        self.cur_class = Some(class_name.to_string());
+        self.push_scope();
+        // implicit `this`
+        self.declare_var("this", Ty::Struct(class_name.to_string()), f.name_span);
+        for p in &f.params {
+            let ty = self.resolve_type(&p.ty);
+            self.declare_var(&p.name, ty, p.name_span);
+        }
+        let always_returns = self.check_block(&f.body, &ret_ty);
+        if ret_ty != Ty::Void && !always_returns {
+            self.errors.push(SemError{message: format!("method `{}` in class `{}` missing return (returns `{ret_ty}`)", f.name, class_name), span: f.span});
+        }
+        self.pop_scope();
+        self.cur_ret = None;
+        self.cur_class = None;
     }
 
     fn check_block(&mut self, block: &Block, ret_ty: &Ty) -> bool {
@@ -678,6 +761,50 @@ impl Checker {
                         });
                         Ty::Int
                     }
+                }
+            }
+            ExprKind::This => {
+                if let Some(cls) = &self.cur_class {
+                    Ty::Struct(cls.clone())
+                } else {
+                    self.errors.push(SemError{message: "`this` outside class method".into(), span: expr.span});
+                    Ty::Int
+                }
+            }
+            ExprKind::MethodCall{object, method, method_span, args} => {
+                let obj_ty = self.check_expr(object);
+                let sname = match obj_ty {
+                    Ty::Struct(ref n) => n.clone(),
+                    _ => {
+                        self.errors.push(SemError{message: format!("method call on non-class type `{obj_ty}`"), span: object.span});
+                        for a in args { let _ = self.check_expr(a); }
+                        return Ty::Int;
+                    }
+                };
+                if let Some(cls) = self.classes.get(&sname).cloned() {
+                    // try class map first, fallback to structs? But methods only in classes
+                    if let Some(meth) = cls.methods.get(method) {
+                        if meth.params.len() != args.len() {
+                            self.errors.push(SemError{message: format!("method `{}` expects {} args, found {}", method, meth.params.len(), args.len()), span: *method_span});
+                        }
+                        for (i, a) in args.iter().enumerate() {
+                            let aty = self.check_expr(a);
+                            if let Some(pt) = meth.params.get(i) {
+                                if &aty != pt { self.errors.push(SemError{message: format!("arg {} of `{}`: expected `{}`, found `{}`", i+1, method, pt, aty), span: a.span}); }
+                            }
+                        }
+                        meth.ret.clone()
+                    } else {
+                        // Also check if class was actually struct with no methods? Then try struct field? but method not found
+                        self.errors.push(SemError{message: format!("class `{sname}` has no method `{method}`"), span: *method_span});
+                        for a in args { let _ = self.check_expr(a); }
+                        Ty::Int
+                    }
+                } else {
+                    // Try structs map for method? For now treat as class not found, check if struct has method? struct has no methods
+                    self.errors.push(SemError{message: format!("unknown class `{sname}`"), span: object.span});
+                    for a in args { let _ = self.check_expr(a); }
+                    Ty::Int
                 }
             }
             ExprKind::Match(m) => {

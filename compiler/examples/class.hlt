@@ -1,0 +1,21 @@
+class Point has
+    int x
+    int y
+    int getX() do
+        return this.x
+    end
+    void setX(int v) do
+        this.x = v
+    end
+end
+
+int main() do
+    Point p = Point has
+        x = 10
+        y = 20
+    end
+    int a = p.getX()
+    p.setX(42)
+    int b = p.getX()
+    return a + b
+end

@@ -220,11 +220,13 @@ impl Parser {
             if self.is_eof() {
                 break;
             }
-            // Top-level: struct decl vs function decl
-            // struct-declaration starts with `struct`
+            // Top-level: struct/class decl vs function decl
             if self.peek_token() == Some(&Token::Struct) {
                 let decl = self.parse_struct_decl()?;
                 items.push(Item::Struct(decl));
+            } else if self.peek_token() == Some(&Token::Class) {
+                let decl = self.parse_class_decl()?;
+                items.push(Item::Class(decl));
             } else {
                 let func = self.parse_function()?;
                 items.push(Item::Function(func));
@@ -278,6 +280,71 @@ impl Parser {
             fields,
             span: Span::new(start, end),
         })
+    }
+
+    fn parse_class_decl(&mut self) -> Result<ClassDecl, ParseError> {
+        let start = self.expect(Token::Class, "expected `class`")?.span.start;
+        // optional `open` before class already handled at top-level? For Phase 4 minimal ignore `open`
+        let (name, name_span) = self.parse_ident()?;
+        // ignore generics/extends/implements for minimal
+        self.expect(Token::Has, "expected `has` after class name")?;
+        self.consume_newlines();
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            // Consume optional visibility
+            if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
+            // Lookahead: function if type ident '('
+            let is_func = {
+                let save = self.pos;
+                let ty_ok = self.parse_type().is_ok();
+                let after_ty = self.peek_token().cloned();
+                let is_ident = after_ty == Some(Token::Ident);
+                // need '(' after ident
+                let mut is_func2 = false;
+                if is_ident {
+                    // peek after ident
+                    if let Some(tok) = self.tokens.get(self.pos+1) {
+                        if tok.token == Token::LParen { is_func2 = true; }
+                    }
+                }
+                self.pos = save;
+                ty_ok && is_func2
+            };
+            if is_func {
+                // function/method
+                let ret_ty = self.parse_type()?;
+                let (mname, mspan) = self.parse_ident()?;
+                self.expect(Token::LParen, "expected `(` for method params")?;
+                let mut params = Vec::new();
+                if self.peek_token() != Some(&Token::RParen) {
+                    loop {
+                        let pty = self.parse_type()?;
+                        let (pn, pn_span) = self.parse_ident()?;
+                        let pspan = Span::new(pty.span().start, pn_span.end);
+                        params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                        if self.consume_if(Token::Comma) { continue; } else { break; }
+                    }
+                }
+                self.expect(Token::RParen, "expected `)` after params")?;
+                let body = self.parse_block()?;
+                let span = Span::new(ret_ty.span().start, body.span.end);
+                methods.push(Function{ret_ty, name: mname, name_span: mspan, params, body, span});
+            } else {
+                // field
+                let ty = self.parse_type()?;
+                let (fname, fspan) = self.parse_ident()?;
+                let fend = fspan.end;
+                if self.consume_if(Token::Eq) { let _ = self.parse_expr()?; }
+                self.expect_terminator("class field")?;
+                let span = Span::new(ty.span().start, fend);
+                fields.push(StructField{ty, name: fname, name_span: fspan, span});
+            }
+            self.consume_newlines();
+        }
+        let end = self.expect(Token::End, "expected `end` to close class")?.span.end;
+        Ok(ClassDecl{name, name_span, fields, methods, span: Span::new(start, end)})
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -934,40 +1001,46 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
         loop {
-            // call: '(' [args] ')'
+            // call: '(' [args] ')' — handles both free fn `foo()` and method `obj.meth()`
             if self.peek_token() == Some(&Token::LParen) {
-                // callee must be Ident or MemberAccess? For Phase 2 keep Ident only for simplicity
-                let callee_name = match &expr.kind {
-                    ExprKind::Ident(s) => s.clone(),
-                    _ => break,
-                };
-                let callee_span = expr.span;
-                self.advance(); // (
-                let mut args = Vec::new();
-                if self.peek_token() != Some(&Token::RParen) {
-                    loop {
-                        args.push(self.parse_expr()?);
-                        if self.consume_if(Token::Comma) {
-                            continue;
-                        } else {
-                            break;
+                match &expr.kind {
+                    ExprKind::Ident(s) => {
+                        let callee_name = s.clone();
+                        let callee_span = expr.span;
+                        self.advance(); // (
+                        let mut args = Vec::new();
+                        if self.peek_token() != Some(&Token::RParen) {
+                            loop {
+                                args.push(self.parse_expr()?);
+                                if self.consume_if(Token::Comma) { continue; } else { break; }
+                            }
                         }
+                        let end = self.expect(Token::RParen, "expected `)` after call args")?.span.end;
+                        let span = Span::new(callee_span.start, end);
+                        expr = Expr{kind: ExprKind::Call{callee: callee_name, callee_span, args}, span};
+                        continue;
                     }
+                    ExprKind::MemberAccess{object, field, field_span} => {
+                        // method call `obj.method(args)` -> MethodCall
+                        let obj = object.clone();
+                        let meth = field.clone();
+                        let meth_span = *field_span;
+                        let outer_span_start = expr.span.start;
+                        self.advance(); // (
+                        let mut args = Vec::new();
+                        if self.peek_token() != Some(&Token::RParen) {
+                            loop {
+                                args.push(self.parse_expr()?);
+                                if self.consume_if(Token::Comma) { continue; } else { break; }
+                            }
+                        }
+                        let end = self.expect(Token::RParen, "expected `)` after call args")?.span.end;
+                        let span = Span::new(outer_span_start, end);
+                        expr = Expr{kind: ExprKind::MethodCall{object: obj, method: meth, method_span: meth_span, args}, span};
+                        continue;
+                    }
+                    _ => break,
                 }
-                let end = self
-                    .expect(Token::RParen, "expected `)` after call args")?
-                    .span
-                    .end;
-                let span = Span::new(callee_span.start, end);
-                expr = Expr {
-                    kind: ExprKind::Call {
-                        callee: callee_name,
-                        callee_span,
-                        args,
-                    },
-                    span,
-                };
-                continue;
             }
             // member access: '.' ident (EBNF §8 postfix member-access)
             if self.peek_token() == Some(&Token::Dot) {
@@ -986,32 +1059,14 @@ impl Parser {
             }
             // index: '[' expr ']' (EBNF §8 index-expression, Phase 2 simple single expr)
             if self.peek_token() == Some(&Token::LBracket) {
-                let lb_span = self.peek().unwrap().span;
                 self.advance(); // [
-                // For Phase 2 we ignore range operators, just single expr
                 let index = self.parse_expr()?;
-                // If we see `..` or `..=` we treat as error for now (range not Phase 2)
-                if matches!(
-                    self.peek_token(),
-                    Some(Token::DotDot) | Some(Token::DotDotEq)
-                ) {
-                    return Err(ParseError {
-                        message: "range indexing not supported in Phase 2"
-                            .into(),
-                        span: self.peek_span(),
-                    });
+                if matches!(self.peek_token(), Some(Token::DotDot) | Some(Token::DotDotEq)) {
+                    return Err(ParseError{message: "range indexing not supported in Phase 2".into(), span: self.peek_span()});
                 }
-                let rb =
-                    self.expect(Token::RBracket, "expected `]` after index")?;
+                let rb = self.expect(Token::RBracket, "expected `]` after index")?;
                 let span = Span::new(expr.span.start, rb.span.end);
-                expr = Expr {
-                    kind: ExprKind::Index {
-                        object: Box::new(expr),
-                        index: Box::new(index),
-                    },
-                    span,
-                };
-                let _ = lb_span; // keep for span if needed
+                expr = Expr{kind: ExprKind::Index{object: Box::new(expr), index: Box::new(index)}, span};
                 continue;
             }
             break;
@@ -1097,6 +1152,10 @@ impl Parser {
                     kind: ExprKind::CharLit(ch),
                     span: st.span,
                 })
+            }
+            Token::This => {
+                self.advance();
+                Ok(Expr{kind: ExprKind::This, span: st.span})
             }
             Token::Ident => {
                 self.advance();

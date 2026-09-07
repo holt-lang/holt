@@ -49,7 +49,7 @@ Always advance one phase at a time. Each phase must produce runnable code (JIT o
 - `for name in expr`
 - Nested defers and interaction with `return`/`break`
 
-## Phase 4 — Abstraction
+## Phase 4 — Abstraction - DONE
 
 - Classes, fields, methods, `this`
 - Constructors (`initialize`)

@@ -36,10 +36,12 @@ pub struct Codegen<'ctx> {
     funcs: HashMap<String, (FunctionValue<'ctx>, TyInfo)>,
     struct_types: HashMap<String, StructType<'ctx>>,
     struct_fields: HashMap<String, HashMap<String, u32>>, // struct -> field -> index
+    class_methods: HashMap<String, HashMap<String, (FunctionValue<'ctx>, TyInfo)>>,
     loop_stack: Vec<LoopContext<'ctx>>,
     defer_stack: Vec<Vec<DeferStmt>>,
     cur_fn: Option<FunctionValue<'ctx>>,
     cur_is_main: bool,
+    cur_class: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,10 +62,12 @@ impl<'ctx> Codegen<'ctx> {
             funcs: HashMap::new(),
             struct_types: HashMap::new(),
             struct_fields: HashMap::new(),
+            class_methods: HashMap::new(),
             loop_stack: Vec::new(),
             defer_stack: Vec::new(),
             cur_fn: None,
             cur_is_main: false,
+            cur_class: None,
         }
     }
 
@@ -75,22 +79,23 @@ impl<'ctx> Codegen<'ctx> {
         &mut self,
         prog: &Program,
     ) -> Result<(), CodegenError> {
-        // 1) Declare structs (opaque + body) so forward refs work
         for item in &prog.items {
-            if let Item::Struct(s) = item {
-                self.declare_struct(s)?;
+            match item {
+                Item::Struct(s) => self.declare_struct(s)?,
+                Item::Class(c) => self.declare_class(c)?,
+                _ => {}
             }
         }
-        // 2) Declare functions
         for item in &prog.items {
-            if let Item::Function(f) = item {
-                self.declare_function(f)?;
-            }
+            if let Item::Function(f) = item { self.declare_function(f)?; }
         }
-        // 3) Define function bodies
         for item in &prog.items {
-            if let Item::Function(f) = item {
-                self.codegen_function(f)?;
+            match item {
+                Item::Function(f) => self.codegen_function(f)?,
+                Item::Class(c) => {
+                    for m in &c.methods { self.codegen_class_method(c, m)?; }
+                }
+                _ => {}
             }
         }
         if let Err(e) = self.module.verify() {
@@ -122,6 +127,62 @@ impl<'ctx> Codegen<'ctx> {
         }
         opaque.set_body(&field_tys, false);
         self.struct_fields.insert(s.name.clone(), field_map);
+        Ok(())
+    }
+
+    fn declare_class(&mut self, c: &ClassDecl) -> Result<(), CodegenError> {
+        if self.struct_types.contains_key(&c.name) {
+            return Err(CodegenError{message: format!("duplicate class/struct `{}`", c.name), span: c.name_span});
+        }
+        let opaque = self.context.opaque_struct_type(&c.name);
+        self.struct_types.insert(c.name.clone(), opaque);
+        let mut field_map = HashMap::new();
+        let mut field_tys = Vec::new();
+        for (idx, f) in c.fields.iter().enumerate() {
+            let lty = self.llvm_ty_for(&f.ty);
+            field_map.insert(f.name.clone(), idx as u32);
+            field_tys.push(lty);
+        }
+        opaque.set_body(&field_tys, false);
+        self.struct_fields.insert(c.name.clone(), field_map);
+        // Declare methods
+        let mut methods = HashMap::new();
+        for m in &c.methods {
+            let ret_ty: crate::sema::Ty = (&m.ret_ty).into();
+            let mut param_semas: Vec<crate::sema::Ty> = Vec::new();
+            param_semas.push(crate::sema::Ty::Struct(c.name.clone()));
+            for p in &m.params {
+                param_semas.push((&p.ty).into());
+            }
+            let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+            let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
+            for p in &m.params {
+                let t: crate::sema::Ty = (&p.ty).into();
+                if let Some(bt) = self.llvm_ty_for_sema(&t) { param_llvm.push(bt.into()); }
+            }
+            let fn_ty = match ret_ty {
+                crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                crate::sema::Ty::Struct(ref n) => {
+                    let st = self.struct_types.get(n).unwrap();
+                    st.fn_type(&param_llvm, false)
+                }
+                crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).fn_type(&param_llvm, false),
+                crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                crate::sema::Ty::Optional(ref el) => {
+                    let inner = self.llvm_ty_for_sema(el).unwrap();
+                    self.context.struct_type(&[inner.into(), self.context.bool_type().into()], false).fn_type(&param_llvm, false)
+                }
+            };
+            let mangled = format!("{}__{}", c.name, m.name);
+            let func = self.module.add_function(&mangled, fn_ty, None);
+            let tyinfo = TyInfo{ret: ret_ty.clone(), params: param_semas.clone()};
+            methods.insert(m.name.clone(), (func, tyinfo));
+        }
+        self.class_methods.insert(c.name.clone(), methods);
         Ok(())
     }
 
@@ -374,6 +435,58 @@ impl<'ctx> Codegen<'ctx> {
                 message: format!("function {} failed verification", f.name),
                 span: f.span,
             });
+        }
+        Ok(())
+    }
+
+    fn codegen_class_method(&mut self, class: &ClassDecl, method: &Function) -> Result<(), CodegenError> {
+        let methods = self.class_methods.get(&class.name).ok_or(CodegenError{message: format!("unknown class {}", class.name), span: class.name_span})?;
+        let (func, info) = methods.get(&method.name).cloned().ok_or(CodegenError{message: format!("unknown method {}", method.name), span: method.name_span})?;
+        self.cur_fn = Some(func);
+        self.cur_class = Some(class.name.clone());
+        self.cur_is_main = false;
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        self.vars.push(HashMap::new());
+        let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+        let this_param = func.get_nth_param(0).unwrap();
+        let this_alloca = self.create_entry_block_alloca("this", this_ty);
+        self.builder.build_store(this_alloca, this_param).unwrap();
+        self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
+        for (i, param) in method.params.iter().enumerate() {
+            let llvm_ty = self.llvm_ty_for(&param.ty);
+            let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
+            let param_val = func.get_nth_param((i+1) as u32).unwrap();
+            self.builder.build_store(alloca, param_val).unwrap();
+            self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+        }
+        let always_returns = self.codegen_block(&method.body)?;
+        if !always_returns && self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+            if info.ret == crate::sema::Ty::Void {
+                self.builder.build_return(None).unwrap();
+            } else {
+                let zero: BasicValueEnum = match info.ret {
+                    crate::sema::Ty::Int => self.context.i64_type().const_int(0, false).into(),
+                    crate::sema::Ty::Bool => self.context.bool_type().const_int(0, false).into(),
+                    crate::sema::Ty::Char => self.context.i32_type().const_int(0, false).into(),
+                    crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
+                    crate::sema::Ty::Struct(ref n) => self.struct_types.get(n).unwrap().const_zero().into(),
+                    crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).const_zero().into(),
+                    crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
+                    crate::sema::Ty::Optional(ref el) => {
+                        let inner = self.llvm_ty_for_sema(el).unwrap();
+                        self.context.struct_type(&[inner.into(), self.context.bool_type().into()], false).const_zero().into()
+                    }
+                    crate::sema::Ty::Void => unreachable!(),
+                };
+                self.builder.build_return(Some(&zero)).unwrap();
+            }
+        }
+        self.vars.pop();
+        self.cur_fn = None;
+        self.cur_class = None;
+        if !func.verify(true) {
+            return Err(CodegenError{message: format!("method {}::{} failed verification", class.name, method.name), span: method.span});
         }
         Ok(())
     }
@@ -860,6 +973,55 @@ impl<'ctx> Codegen<'ctx> {
                     span: expr.span,
                 })?;
                 Ok(self.builder.build_load(ty, ptr, name).unwrap())
+            }
+            ExprKind::This => {
+                let (ptr, ty) = self.lookup_var("this").ok_or(CodegenError{message: "`this` outside method".into(), span: expr.span})?;
+                Ok(self.builder.build_load(ty, ptr, "this").unwrap())
+            }
+            ExprKind::MethodCall{object, method, method_span: _, args} => {
+                // Determine this pointer for method call
+                let this_ptr: PointerValue<'ctx> = match &object.kind {
+                    ExprKind::Ident(name) => {
+                        if let Some((ptr, ty)) = self.lookup_var(name) {
+                            if ty.is_struct_type() {
+                                // p is struct value instance, its alloca is the instance pointer
+                                ptr
+                            } else if ty.is_pointer_type() {
+                                self.builder.build_load(ty, ptr, "this.load").unwrap().into_pointer_value()
+                            } else {
+                                return Err(CodegenError{message: format!("method call on non-class variable `{name}`"), span: expr.span});
+                            }
+                        } else { return Err(CodegenError{message: format!("undefined var {name}"), span: expr.span}); }
+                    }
+                    ExprKind::This => {
+                        let (ptr, ty) = self.lookup_var("this").ok_or(CodegenError{message: "`this` outside method".into(), span: expr.span})?;
+                        self.builder.build_load(ty, ptr, "this.load").unwrap().into_pointer_value()
+                    }
+                    ExprKind::MemberAccess{object: inner, field, ..} => {
+                        // a.b.method() where a.b is struct field that is class instance
+                        let field_ptr = self.codegen_field_ptr(inner, field)?;
+                        field_ptr
+                    }
+                    _ => {
+                        // Fallback: try codegen object as value and allocate temp? For now error
+                        return Err(CodegenError{message: "method call object must be variable or field access".into(), span: expr.span});
+                    }
+                };
+                let obj_ty = self.infer_expr_ty(object)?;
+                let cls_name = match obj_ty {
+                    crate::sema::Ty::Struct(ref n) => n.clone(),
+                    _ => return Err(CodegenError{message: format!("method call on non-class"), span: expr.span}),
+                };
+                let methods = self.class_methods.get(&cls_name).ok_or(CodegenError{message: format!("unknown class {cls_name}"), span: expr.span})?;
+                let (func, _info) = methods.get(method).cloned().ok_or(CodegenError{message: format!("unknown method {method} for class {cls_name}"), span: expr.span})?;
+                let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = vec![this_ptr.into()];
+                for a in args {
+                    let v = self.codegen_expr(a)?;
+                    arg_vals.push(v.into());
+                }
+                let call = self.builder.build_call(func, &arg_vals, "call").unwrap();
+                let vk = call.try_as_basic_value();
+                if vk.is_basic() { Ok(vk.basic().unwrap()) } else { Ok(self.context.i64_type().const_int(0,false).into()) }
             }
             ExprKind::Paren(inner) => self.codegen_expr(inner),
             ExprKind::Unary { op, expr: inner } => {
@@ -1487,13 +1649,15 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<(PointerValue<'ctx>, String), CodegenError> {
         match &object.kind {
             ExprKind::Ident(name) => {
-                let (ptr, ty) = self.lookup_var(name).ok_or(CodegenError {
-                    message: format!("undefined var {name}"),
-                    span: object.span,
-                })?;
-                // ty must be struct
+                let (ptr, ty) = self.lookup_var(name).ok_or(CodegenError{message: format!("undefined var {name}"), span: object.span})?;
                 let sname = self.ty_to_struct_name(&ty)?;
                 Ok((ptr, sname))
+            }
+            ExprKind::This => {
+                let (ptr, ty) = self.lookup_var("this").ok_or(CodegenError{message: "`this` outside method".into(), span: object.span})?;
+                let sname = self.cur_class.clone().ok_or(CodegenError{message: "`this` outside method".into(), span: object.span})?;
+                let instance_ptr = self.builder.build_load(ty, ptr, "this.load").unwrap().into_pointer_value();
+                Ok((instance_ptr, sname))
             }
             ExprKind::MemberAccess {
                 object: inner,
@@ -1551,64 +1715,48 @@ impl<'ctx> Codegen<'ctx> {
         &self,
         expr: &Expr,
     ) -> Result<crate::sema::Ty, CodegenError> {
-        // Minimal inference for field paths: only needed for struct field chain type resolution
-        // We can look up via vars for ident, and via struct_fields for member access
         match &expr.kind {
             ExprKind::Ident(name) => {
                 for scope in self.vars.iter().rev() {
                     if let Some((_, ty)) = scope.get(name) {
-                        // Convert BasicTypeEnum to sema Ty via struct_types reverse lookup
                         if ty.is_struct_type() {
                             let sname = self.ty_to_struct_name(ty).unwrap();
                             return Ok(crate::sema::Ty::Struct(sname));
                         } else if ty.is_int_type() {
                             let bw = ty.into_int_type().get_bit_width();
-                            if bw == 1 {
-                                return Ok(crate::sema::Ty::Bool);
-                            } else {
-                                return Ok(crate::sema::Ty::Int);
-                            }
+                            if bw == 1 { return Ok(crate::sema::Ty::Bool); } else { return Ok(crate::sema::Ty::Int); }
+                        } else if ty.is_pointer_type() {
+                            return Ok(crate::sema::Ty::Pointer(Box::new(crate::sema::Ty::Int)));
+                        } else if ty.is_array_type() {
+                            return Ok(crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)));
                         }
                     }
                 }
-                Err(CodegenError {
-                    message: format!("cannot infer type of {name}"),
-                    span: expr.span,
-                })
+                Err(CodegenError{message: format!("cannot infer type of {name}"), span: expr.span})
+            }
+            ExprKind::This => {
+                if let Some(cls) = &self.cur_class { return Ok(crate::sema::Ty::Struct(cls.clone())); }
+                Err(CodegenError{message: "`this` outside method".into(), span: expr.span})
             }
             ExprKind::MemberAccess { object, field, .. } => {
                 let obj_ty = self.infer_expr_ty(object)?;
                 if let crate::sema::Ty::Struct(ref sname) = obj_ty {
                     let fields = self.struct_fields.get(sname).unwrap();
                     let idx = fields.get(field).unwrap();
-                    // Need field type: look at struct's field type at idx. We can map via struct's LLVM field type → sema
                     let st = self.struct_types.get(sname).unwrap();
                     let fty = st.get_field_type_at_index(*idx).unwrap();
                     if fty.is_int_type() {
                         let bw = fty.into_int_type().get_bit_width();
-                        if bw == 1 {
-                            return Ok(crate::sema::Ty::Bool);
-                        } else {
-                            return Ok(crate::sema::Ty::Int);
-                        }
+                        if bw == 1 { return Ok(crate::sema::Ty::Bool); } else { return Ok(crate::sema::Ty::Int); }
                     } else if fty.is_struct_type() {
                         let sname2 = self.ty_to_struct_name(&fty).unwrap();
                         return Ok(crate::sema::Ty::Struct(sname2));
                     }
-                    return Err(CodegenError {
-                        message: "unsupported field type inference".into(),
-                        span: expr.span,
-                    });
+                    return Err(CodegenError{message: "unsupported field type inference".into(), span: expr.span});
                 }
-                Err(CodegenError {
-                    message: "member access inference on non-struct".into(),
-                    span: expr.span,
-                })
+                Err(CodegenError{message: "member access inference on non-struct".into(), span: expr.span})
             }
-            _ => Err(CodegenError {
-                message: "cannot infer type of this expr for struct GEP".into(),
-                span: expr.span,
-            }),
+            _ => Err(CodegenError{message: "cannot infer type of this expr for struct GEP".into(), span: expr.span}),
         }
     }
 

@@ -13,6 +13,7 @@ pub struct Program {
 pub enum Item {
     Function(Function),
     Struct(StructDecl),
+    Class(ClassDecl),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +93,16 @@ pub struct StructField {
     pub ty: Type,
     pub name: String,
     pub name_span: Span,
+    pub span: Span,
+}
+
+// Phase 4: class
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: Vec<StructField>,
+    pub methods: Vec<Function>,
     pub span: Span,
 }
 
@@ -210,6 +221,7 @@ pub enum ExprKind {
     StringLit(String),
     CharLit(char),
     Ident(String),
+    This,
     Paren(Box<Expr>),
     Unary {
         op: UnaryOp,
@@ -227,6 +239,12 @@ pub enum ExprKind {
     Call {
         callee: String,
         callee_span: Span,
+        args: Vec<Expr>,
+    },
+    MethodCall {
+        object: Box<Expr>,
+        method: String,
+        method_span: Span,
         args: Vec<Expr>,
     },
     MemberAccess {
