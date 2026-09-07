@@ -18,6 +18,20 @@ pub struct ImportDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute {
+    pub name: String,
+    pub name_span: Span,
+    pub args: Vec<AttributeArg>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeArg {
+    Expr(Expr),
+    Named(String, Span, Expr),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     Import(ImportDecl),
     Function(Function),
@@ -25,6 +39,12 @@ pub enum Item {
     Class(ClassDecl),
     Enum(EnumDecl),
     Trait(TraitDecl),
+    Typedef(TypedefDecl),
+    Distinct(DistinctDecl),
+    Extension(ExtensionDecl),
+    Extern(ExternDecl),
+    Init(Block),
+    Attributed { attrs: Vec<Attribute>, item: Box<Item> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
@@ -46,6 +66,8 @@ pub struct Function {
     pub is_sealed: bool,
     pub is_override: bool,
     pub is_open: bool,
+    pub generic_params: Vec<GenericParam>,
+    pub where_clause: Option<WhereClause>,
     pub span: Span,
 }
 
@@ -58,13 +80,40 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericParam {
+    pub name: String,
+    pub name_span: Span,
+    pub bounds: Vec<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhereClause {
+    pub constraints: Vec<WhereConstraint>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhereConstraint {
+    pub ty: Type,
+    pub bounds: Vec<Type>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     Int(Span),
     Bool(Span),
     Void(Span),
     String(Span),
     Char(Span),
+    Float(Span),
+    Double(Span),
     Named(String, Span),       // Phase 2: struct name
+    Generic(String, Vec<Type>, Span), // Phase 5: Box<int>
+    FunctionType(Box<Type>, Vec<Type>, Span), // function<Ret(Args)>
+    Tuple(Vec<Type>, Span),
+    Any(Span),
     Array(Box<Type>, Span),    // T[]  (Phase 2)
     Pointer(Box<Type>, Span),  // T*  (Phase 2)
     Optional(Box<Type>, Span), // T? (Phase 2 future)
@@ -78,7 +127,13 @@ impl Type {
             | Type::Void(s)
             | Type::String(s)
             | Type::Char(s)
+            | Type::Float(s)
+            | Type::Double(s)
             | Type::Named(_, s)
+            | Type::Generic(_, _, s)
+            | Type::FunctionType(_, _, s)
+            | Type::Tuple(_, s)
+            | Type::Any(s)
             | Type::Array(_, s)
             | Type::Pointer(_, s)
             | Type::Optional(_, s) => *s,
@@ -91,7 +146,13 @@ impl Type {
             Type::Void(_) => "void".into(),
             Type::String(_) => "string".into(),
             Type::Char(_) => "char".into(),
+            Type::Float(_) => "float".into(),
+            Type::Double(_) => "double".into(),
             Type::Named(n, _) => n.clone(),
+            Type::Generic(n, args, _) => format!("{}<{}>", n, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")),
+            Type::FunctionType(ret, args, _) => format!("function<{}({})>", ret.name(), args.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ")),
+            Type::Tuple(tys, _) => format!("({})", tys.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")),
+            Type::Any(_) => "any".into(),
             Type::Array(el, _) => format!("{}[]", el.name()),
             Type::Pointer(el, _) => format!("{}*", el.name()),
             Type::Optional(el, _) => format!("{}?", el.name()),
@@ -108,6 +169,8 @@ pub struct StructDecl {
     pub name: String,
     pub name_span: Span,
     pub fields: Vec<StructField>,
+    pub generic_params: Vec<GenericParam>,
+    pub where_clause: Option<WhereClause>,
     pub span: Span,
 }
 
@@ -127,6 +190,8 @@ pub struct ClassDecl {
     pub name_span: Span,
     pub is_open: bool,
     pub is_sealed: bool,
+    pub generic_params: Vec<GenericParam>,
+    pub where_clause: Option<WhereClause>,
     pub extends: Option<Type>,
     pub implements: Vec<Type>,
     pub fields: Vec<StructField>,
@@ -134,6 +199,8 @@ pub struct ClassDecl {
     pub constructors: Vec<ConstructorDecl>,
     pub destructors: Vec<DestructorDecl>,
     pub properties: Vec<PropertyDecl>,
+    pub operators: Vec<OperatorDecl>,
+    pub conversions: Vec<ConversionDecl>,
     pub span: Span,
 }
 
@@ -171,6 +238,8 @@ pub struct PropertyDecl {
 pub struct TraitDecl {
     pub name: String,
     pub name_span: Span,
+    pub generic_params: Vec<GenericParam>,
+    pub where_clause: Option<WhereClause>,
     pub methods: Vec<TraitMethod>,
     pub span: Span,
 }
@@ -190,6 +259,8 @@ pub struct TraitMethod {
 pub struct EnumDecl {
     pub name: String,
     pub name_span: Span,
+    pub generic_params: Vec<GenericParam>,
+    pub where_clause: Option<WhereClause>,
     pub variants: Vec<EnumVariant>,
     pub span: Span,
 }
@@ -200,6 +271,100 @@ pub struct EnumVariant {
     pub name_span: Span,
     pub discriminant: Option<i64>,
     pub payload_ty: Option<Type>, // minimal single payload type e.g. Some(int)
+    pub span: Span,
+}
+
+// Phase 5: type aliases and distinct
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedefDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Type,
+    pub visibility: Visibility,
+    pub generic_params: Vec<GenericParam>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistinctDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: Type,
+    pub visibility: Visibility,
+    pub generic_params: Vec<GenericParam>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionDecl {
+    pub ty: Type,
+    pub members: Vec<ExtensionMember>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionMember {
+    Field(StructField),
+    Function(Function),
+    Operator(OperatorDecl),
+    Property(PropertyDecl),
+    Conversion(ConversionDecl),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorDecl {
+    pub visibility: Visibility,
+    pub is_static: bool,
+    pub op: String,
+    pub op_span: Span,
+    pub params: Vec<Param>,
+    pub body: Block,
+    pub where_clause: Option<WhereClause>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversionDecl {
+    pub visibility: Visibility,
+    pub is_explicit: bool,
+    pub from_ty: Type,
+    pub to_ty: Type,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternDecl {
+    pub lib: String,
+    pub lib_span: Span,
+    pub file: String,
+    pub file_span: Span,
+    pub members: Vec<ExternMember>,
+    pub visibility: Visibility,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternMember {
+    Function { ty: Type, name: String, name_span: Span, params: Vec<ExternParam>, span: Span },
+    Struct { name: String, name_span: Span, fields: Vec<ExternField>, span: Span },
+    Enum { name: String, name_span: Span, variants: Vec<EnumVariant>, span: Span },
+    Const { ty: Type, name: String, name_span: Span, span: Span },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternParam {
+    pub ty: Type,
+    pub name: String,
+    pub name_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternField {
+    pub ty: Type,
+    pub name: String,
+    pub name_span: Span,
     pub span: Span,
 }
 
@@ -312,14 +477,31 @@ pub struct Expr {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterpolatedPart {
+    Literal(String),
+    Expr(Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosureBody {
+    Expr(Box<Expr>),
+    Block(Block),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExprKind {
     IntLit(i64),
+    FloatLit(String),
     BoolLit(bool),
     StringLit(String),
+    InterpolatedString(Vec<InterpolatedPart>, Span),
     CharLit(char),
     Ident(String),
     This,
+    Super,
+    Null,
     Paren(Box<Expr>),
+    Tuple(Vec<Expr>),
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,
@@ -337,6 +519,7 @@ pub enum ExprKind {
         callee: String,
         callee_span: Span,
         args: Vec<Expr>,
+        type_args: Vec<Type>, // Phase 5: generic args like foo<int>(x)
     },
     MethodCall {
         object: Box<Expr>,
@@ -364,6 +547,11 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     Match(MatchExpr),
+    Closure {
+        params: Vec<Param>,
+        body: Box<ClosureBody>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

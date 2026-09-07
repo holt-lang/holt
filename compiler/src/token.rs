@@ -86,6 +86,8 @@ pub enum Token {
     Enum,
     #[token("extends")]
     Extends,
+    #[token("extend")]
+    Extend,
     #[token("explicit")]
     Explicit,
     #[token("extern")]
@@ -102,6 +104,8 @@ pub enum Token {
     Implements,
     #[token("import")]
     Import,
+    #[token("from")]
+    From,
     #[token("in")]
     In,
     #[token("init")]
@@ -158,6 +162,10 @@ pub enum Token {
     While,
     #[token("where")]
     Where,
+    #[token("convert")]
+    Convert,
+    #[token("to")]
+    To,
     #[token("char")]
     CharKw,
     // structural delimiters (EBNF §13/22-25) — not listed in §2 but reserved
@@ -330,6 +338,7 @@ impl std::fmt::Display for Token {
             Self::Else => "else",
             Self::Enum => "enum",
             Self::Extends => "extends",
+            Self::Extend => "extend",
             Self::Explicit => "explicit",
             Self::Extern => "extern",
             Self::Float => "float",
@@ -338,6 +347,7 @@ impl std::fmt::Display for Token {
             Self::If => "if",
             Self::Implements => "implements",
             Self::Import => "import",
+            Self::From => "from",
             Self::In => "in",
             Self::Init => "init",
             Self::Int => "int",
@@ -366,6 +376,8 @@ impl std::fmt::Display for Token {
             Self::Void => "void",
             Self::While => "while",
             Self::Where => "where",
+            Self::Convert => "convert",
+            Self::To => "to",
             Self::CharKw => "char",
             Self::Has => "has",
             Self::End => "end",

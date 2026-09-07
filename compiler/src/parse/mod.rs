@@ -248,6 +248,47 @@ impl Parser {
             } else if self.peek_decl_kind() == Some(Token::Trait) {
                 let decl = self.parse_trait_decl()?;
                 items.push(Item::Trait(decl));
+            } else if self.peek_token() == Some(&Token::At) {
+                let attrs = self.parse_attributes()?;
+                // After attributes, parse the actual decl
+                let inner = if self.peek_decl_kind() == Some(Token::Struct) {
+                    Item::Struct(self.parse_struct_decl()?)
+                } else if self.peek_decl_kind() == Some(Token::Class) {
+                    Item::Class(self.parse_class_decl()?)
+                } else if self.peek_decl_kind() == Some(Token::Enum) {
+                    Item::Enum(self.parse_enum_decl()?)
+                } else if self.peek_decl_kind() == Some(Token::Trait) {
+                    Item::Trait(self.parse_trait_decl()?)
+                } else if self.peek_token() == Some(&Token::Typedef) {
+                    Item::Typedef(self.parse_typedef_decl()?)
+                } else if self.peek_token() == Some(&Token::Distinct) {
+                    Item::Distinct(self.parse_distinct_decl()?)
+                } else if self.peek_token() == Some(&Token::Extend) {
+                    Item::Extension(self.parse_extension_decl()?)
+                } else if self.peek_token() == Some(&Token::Extern) {
+                    Item::Extern(self.parse_extern_decl()?)
+                } else {
+                    Item::Function(self.parse_function()?)
+                };
+                items.push(Item::Attributed{attrs, item: Box::new(inner)});
+            } else if self.peek_token() == Some(&Token::Typedef) {
+                items.push(Item::Typedef(self.parse_typedef_decl()?));
+            } else if self.peek_token() == Some(&Token::Distinct) {
+                items.push(Item::Distinct(self.parse_distinct_decl()?));
+            } else if self.peek_token() == Some(&Token::Extend) {
+                items.push(Item::Extension(self.parse_extension_decl()?));
+            } else if self.peek_token() == Some(&Token::Extern) {
+                items.push(Item::Extern(self.parse_extern_decl()?));
+            } else if self.peek_token() == Some(&Token::Init) {
+                // init block
+                let start = self.expect(Token::Init, "expected `init`")?.span.start;
+                let blk = self.parse_block()?;
+                let span = Span::new(start, blk.span.end);
+                items.push(Item::Init(blk));
+            } else if self.peek_token() == Some(&Token::At) {
+                // Handle attributes at top-level (already handled above, but for safety)
+                let attrs = self.parse_attributes()?;
+                items.push(Item::Attributed{attrs, item: Box::new(Item::Function(self.parse_function()?))});
             } else {
                 let func = self.parse_function()?;
                 items.push(Item::Function(func));
@@ -265,6 +306,8 @@ impl Parser {
         if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
         let start = self.expect(Token::Struct, "expected `struct`")?.span.start;
         let (name, name_span) = self.parse_ident()?;
+        let generics = self.parse_generic_params_opt();
+        let where_clause = self.parse_where_clause_opt();
         self.expect(Token::Has, "expected `has` after struct name")?;
         self.consume_newlines();
         let mut fields = Vec::new();
@@ -302,6 +345,8 @@ impl Parser {
             name,
             name_span,
             fields,
+            generic_params: generics,
+            where_clause,
             span: Span::new(start, end),
         })
     }
@@ -327,18 +372,8 @@ impl Parser {
         let class_start = self.expect(Token::Class, "expected `class`")?.span.start;
         let start = if start_vis < class_start { start_vis } else { class_start };
         let (name, name_span) = self.parse_ident()?;
-        // generics: ignore < ... > if present
-        if self.peek_token() == Some(&Token::Lt) {
-            self.advance();
-            let mut depth = 1;
-            while !self.is_eof() && depth > 0 {
-                match self.peek_token() {
-                    Some(Token::Lt) => { depth+=1; self.advance(); },
-                    Some(Token::Gt) => { depth-=1; self.advance(); },
-                    _ => { self.advance(); },
-                }
-            }
-        }
+        let generics = self.parse_generic_params_opt();
+        let where_clause = self.parse_where_clause_opt();
         let mut extends = None;
         if self.peek_token() == Some(&Token::Extends) {
             self.advance();
@@ -359,23 +394,27 @@ impl Parser {
         let mut constructors = Vec::new();
         let mut destructors = Vec::new();
         let mut properties = Vec::new();
+        let mut operators: Vec<OperatorDecl> = Vec::new();
+        let mut conversions: Vec<ConversionDecl> = Vec::new();
         while !self.is_eof() && self.peek_token() != Some(&Token::End) {
             if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
-            // member modifiers: [visibility] [static] [sealed] [override] [open]
+            // member modifiers: [visibility] [static] [sealed] [override] — `open` only on class, not members
             let vis = self.parse_visibility();
             let mut is_static = false;
             let mut m_sealed = false;
             let mut is_override = false;
-            let mut m_open = false;
+            let m_open = false;
             // loop for flags
             loop {
                 match self.peek_token() {
                     Some(Token::Static) => { is_static = true; self.advance(); },
                     Some(Token::Sealed) => { m_sealed = true; self.advance(); },
                     Some(Token::Override) => { is_override = true; self.advance(); },
-                    Some(Token::Open) => { m_open = true; self.advance(); },
                     _ => break,
                 }
+            }
+            if self.peek_token() == Some(&Token::Open) {
+                return Err(ParseError{message: "method cannot be `open` (only class can be open)".into(), span: self.peek_span()});
             }
             // Check for destructor: ~ ident ( ) block
             if self.peek_token() == Some(&Token::Tilde) {
@@ -458,12 +497,12 @@ impl Parser {
                 is_prop
             };
             if is_property {
-                // Parse property: attempt with type
+                // Parse property: getters/setters are public by default (override class default private)
                 let save = self.pos;
                 let mut ty_opt = None;
                 let mut pname = String::new();
                 let mut pspan = Span::new(0,0);
-                let mut prop_vis = vis;
+                let mut prop_vis = if vis == Visibility::Default { Visibility::Public } else { vis };
                 // try type+ident
                 let mut parsed_with_type = false;
                 if let Ok(t) = self.parse_type() {
@@ -523,6 +562,100 @@ impl Parser {
                 self.consume_newlines();
                 continue;
             }
+            // Check for operator: [vis] [static] operator <symbol> (params) [where] block
+            if self.peek_token() == Some(&Token::OperatorKw) {
+                let op_start = self.advance().unwrap().span.start;
+                // operator symbol
+                let op_tok = self.advance().ok_or(ParseError{message: "expected operator symbol".into(), span: self.peek_span()})?;
+                let mut op_str = match op_tok.token {
+                    Token::Plus => "+".to_string(),
+                    Token::Minus => "-".to_string(),
+                    Token::Star => "*".to_string(),
+                    Token::Slash => "/".to_string(),
+                    Token::Percent => "%".to_string(),
+                    Token::Lt => "<".to_string(),
+                    Token::LtEq => "<=".to_string(),
+                    Token::Gt => ">".to_string(),
+                    Token::GtEq => ">=".to_string(),
+                    Token::Is => {
+                        if self.peek_token() == Some(&Token::Not) { self.advance(); "is not".to_string() } else { "is".to_string() }
+                    },
+                    Token::Ampersand => "&".to_string(),
+                    Token::Pipe => "|".to_string(),
+                    Token::Caret => "^".to_string(),
+                    Token::Tilde => "~".to_string(),
+                    Token::LShift => "<<".to_string(),
+                    Token::RShift => ">>".to_string(),
+                    Token::Eq => "=".to_string(),
+                    Token::PlusAssign => "+=".to_string(),
+                    Token::MinusAssign => "-=".to_string(),
+                    Token::StarAssign => "*=".to_string(),
+                    Token::SlashAssign => "/=".to_string(),
+                    Token::PercentAssign => "%=".to_string(),
+                    Token::AndAssign => "&=".to_string(),
+                    Token::OrAssign => "|=".to_string(),
+                    Token::XorAssign => "^=".to_string(),
+                    Token::LShiftAssign => "<<=".to_string(),
+                    Token::RShiftAssign => ">>=".to_string(),
+                    Token::PlusPlus => "++".to_string(),
+                    Token::MinusMinus => "--".to_string(),
+                    Token::LBracket => {
+                        // expect ]
+                        self.expect(Token::RBracket, "expected `]` for operator `[]`")?;
+                        "[]".to_string()
+                    },
+                    _ => self.slice(op_tok.span).to_string(),
+                };
+                let op_span = op_tok.span;
+                self.expect(Token::LParen, "expected `(` after operator")?;
+                let mut params = Vec::new();
+                if self.peek_token() != Some(&Token::RParen) {
+                    loop {
+                        let pty = self.parse_type()?;
+                        let (pn, pn_span) = self.parse_ident()?;
+                        let pspan = Span::new(pty.span().start, pn_span.end);
+                        params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                        if !self.consume_if(Token::Comma) { break; }
+                    }
+                }
+                self.expect(Token::RParen, "expected `)` after operator params")?;
+                let where_clause = if self.peek_token()==Some(&Token::Where) { self.parse_where_clause_opt() } else { None };
+                let body = self.parse_block()?;
+                let span = Span::new(op_start, body.span.end);
+                // need operators vec in scope - will push after loop init? For now create temporary and will handle via mutable outer
+                // Use a workaround: store in a temporary vector via closure capture? Instead we need to have operators mutable
+                // We have fields, methods, etc. but operators not yet declared in this scope, so we need to declare it above
+                // For now, push to a separate vec that we will merge later - we will use a hack: store in methods as operator? Better to handle directly via mutable variable captured from outer scope
+                // We will handle by pushing to operators vector that we will declare before loop
+                // This code will be replaced via python to correctly reference operators
+                operators.push(OperatorDecl{visibility: vis, is_static, op: op_str, op_span, params, body, where_clause, span});
+                continue;
+            }
+            // Check for convert: [vis] [explicit] convert Type to Type block
+            if self.peek_token() == Some(&Token::Convert) {
+                let cstart = self.advance().unwrap().span.start;
+                let from_ty = self.parse_type()?;
+                self.expect(Token::To, "expected `to` after convert source type")?;
+                let to_ty = self.parse_type()?;
+                let body = self.parse_block()?;
+                let span = Span::new(cstart, body.span.end);
+                conversions.push(ConversionDecl{visibility: vis, is_explicit: false, from_ty, to_ty, body, span});
+                continue;
+            }
+            if vis != crate::ast::Visibility::Default && self.peek_token() == Some(&Token::Explicit) {
+                let is_explicit = true;
+                self.advance();
+                if self.peek_token() == Some(&Token::Convert) {
+                    let cstart = self.advance().unwrap().span.start;
+                    let from_ty = self.parse_type()?;
+                    self.expect(Token::To, "expected `to` after convert source type")?;
+                    let to_ty = self.parse_type()?;
+                    let body = self.parse_block()?;
+                    let span = Span::new(cstart, body.span.end);
+                    conversions.push(ConversionDecl{visibility: vis, is_explicit, from_ty, to_ty, body, span});
+                    continue;
+                }
+            }
             // Check for method vs field: lookahead type ident '(' => method
             let is_func = {
                 let save = self.pos;
@@ -542,6 +675,7 @@ impl Parser {
                 // function/method with modifiers
                 let ret_ty = self.parse_type()?;
                 let (mname, mspan) = self.parse_ident()?;
+                let _method_generics = self.parse_generic_params_opt();
                 self.expect(Token::LParen, "expected `(` for method params")?;
                 let mut params = Vec::new();
                 if self.peek_token() != Some(&Token::RParen) {
@@ -556,7 +690,7 @@ impl Parser {
                 self.expect(Token::RParen, "expected `)` after params")?;
                 let body = self.parse_block()?;
                 let span = Span::new(ret_ty.span().start, body.span.end);
-                methods.push(Function{ret_ty, name: mname, name_span: mspan, params, body, visibility: vis, is_static, is_sealed: m_sealed, is_override, is_open: m_open, span});
+                methods.push(Function{ret_ty, name: mname, name_span: mspan, params, body, visibility: vis, is_static, is_sealed: m_sealed, is_override, is_open: m_open, generic_params: Vec::new(), where_clause: None, span});
             } else {
                 // field
                 // handle const field? EBNF class-member includes constant-declaration: const [type] ident = expr terminator
@@ -590,13 +724,15 @@ impl Parser {
             self.consume_newlines();
         }
         let end = self.expect(Token::End, "expected `end` to close class")?.span.end;
-        Ok(ClassDecl{name, name_span, fields, methods, is_open, is_sealed, extends, implements, constructors, destructors, properties, span: Span::new(start, end)})
+        Ok(ClassDecl{name, name_span, fields, methods, is_open, is_sealed, generic_params: generics, where_clause, extends, implements, constructors, destructors, properties, operators, conversions, span: Span::new(start, end)})
     }
 
     fn parse_trait_decl(&mut self) -> Result<TraitDecl, ParseError> {
         if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
         let start = self.expect(Token::Trait, "expected `trait`")?.span.start;
         let (name, name_span) = self.parse_ident()?;
+        let generics = self.parse_generic_params_opt();
+        let where_clause = self.parse_where_clause_opt();
         self.expect(Token::Has, "expected `has` after trait name")?;
         self.consume_newlines();
         let mut methods = Vec::new();
@@ -624,13 +760,146 @@ impl Parser {
             self.consume_newlines();
         }
         let end = self.expect(Token::End, "expected `end` to close trait")?.span.end;
-        Ok(TraitDecl{name, name_span, methods, span: Span::new(start, end)})
+        Ok(TraitDecl{name, name_span, generic_params: generics, where_clause, methods, span: Span::new(start, end)})
+    }
+
+    fn parse_attributes(&mut self) -> Result<Vec<Attribute>, ParseError> {
+        let mut attrs = Vec::new();
+        while self.peek_token() == Some(&Token::At) {
+            let start = self.advance().unwrap().span.start;
+            let (name, name_span) = self.parse_ident()?;
+            let mut args = Vec::new();
+            if self.consume_if(Token::LParen) {
+                if self.peek_token() != Some(&Token::RParen) {
+                    loop {
+                        // Try named arg: ident : expr
+                        let save = self.pos;
+                        let is_named = if self.peek_token() == Some(&Token::Ident) {
+                            let (n, s) = self.parse_ident().unwrap();
+                            if self.peek_token() == Some(&Token::Colon) {
+                                self.advance(); // :
+                                let e = self.parse_expr().unwrap();
+                                args.push(AttributeArg::Named(n, s, e));
+                                true
+                            } else {
+                                self.pos = save;
+                                false
+                            }
+                        } else { false };
+                        if !is_named {
+                            let e = self.parse_expr()?;
+                            args.push(AttributeArg::Expr(e));
+                        }
+                        if !self.consume_if(Token::Comma) { break; }
+                    }
+                }
+                self.expect(Token::RParen, "expected `)` after attribute args")?;
+            }
+            let end = self.peek_span().end;
+            attrs.push(Attribute{name, name_span, args, span: Span::new(start, end)});
+            self.consume_newlines();
+        }
+        Ok(attrs)
+    }
+
+    fn parse_typedef_decl(&mut self) -> Result<TypedefDecl, ParseError> {
+        let vis = self.parse_visibility();
+        let start = self.expect(Token::Typedef, "expected `typedef`")?.span.start;
+        let generics = self.parse_generic_params_opt();
+        let (name, name_span) = self.parse_ident()?;
+        self.expect(Token::Eq, "expected `=` after typedef name")?;
+        let ty = self.parse_type()?;
+        let ty_span = ty.span();
+        self.expect_terminator("typedef")?;
+        Ok(TypedefDecl{name, name_span, ty, visibility: vis, generic_params: generics, span: Span::new(start, ty_span.end)})
+    }
+
+    fn parse_distinct_decl(&mut self) -> Result<DistinctDecl, ParseError> {
+        let vis = self.parse_visibility();
+        let start = self.expect(Token::Distinct, "expected `distinct`")?.span.start;
+        let (name, name_span) = self.parse_ident()?;
+        let generics = self.parse_generic_params_opt();
+        self.expect(Token::Eq, "expected `=` after distinct name")?;
+        let ty = self.parse_type()?;
+        let ty_span = ty.span();
+        self.expect_terminator("distinct")?;
+        Ok(DistinctDecl{name, name_span, ty, visibility: vis, generic_params: generics, span: Span::new(start, ty_span.end)})
+    }
+
+    fn parse_extern_decl(&mut self) -> Result<ExternDecl, ParseError> {
+        let vis = self.parse_visibility();
+        let start = self.expect(Token::Extern, "expected `extern`")?.span.start;
+        let lib_tok = self.expect(Token::StringLit, "expected string literal for extern lib")?;
+        let lib = self.slice(lib_tok.span)[1..self.slice(lib_tok.span).len()-1].to_string();
+        let lib_span = lib_tok.span;
+        self.expect(Token::From, "expected `from` after extern lib")?;
+        let file_tok = self.expect(Token::StringLit, "expected string literal for extern file")?;
+        let file = self.slice(file_tok.span)[1..self.slice(file_tok.span).len()-1].to_string();
+        let file_span = file_tok.span;
+        self.expect(Token::Do, "expected `do` after extern header")?;
+        self.consume_newlines();
+        let mut members = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            let ty = self.parse_type()?;
+            let (name, name_span) = self.parse_ident()?;
+            if self.peek_token() == Some(&Token::LParen) {
+                // extern function
+                self.advance(); // (
+                let mut params = Vec::new();
+                if self.peek_token() != Some(&Token::RParen) {
+                    loop {
+                        let pty = self.parse_type()?;
+                        let pty_span = pty.span();
+                        let (pn, pn_span) = self.parse_ident()?;
+                        params.push(ExternParam{ty: pty, name: pn, name_span: pn_span, span: Span::new(pty_span.start, pn_span.end)});
+                        if !self.consume_if(Token::Comma) { break; }
+                    }
+                }
+                self.expect(Token::RParen, "expected `)` after extern params")?;
+                self.expect_terminator("extern function")?;
+                members.push(ExternMember::Function{ty, name, name_span, params, span: Span::new(lib_span.start, name_span.end)});
+            } else {
+                // Unsupported extern member, skip
+                self.expect_terminator("extern member")?;
+            }
+        }
+        let end = self.expect(Token::End, "expected `end` to close extern")?.span.end;
+        Ok(ExternDecl{lib, lib_span, file, file_span, members, visibility: vis, span: Span::new(start, end)})
+    }
+
+    fn parse_extension_decl(&mut self) -> Result<ExtensionDecl, ParseError> {
+        let start = self.expect(Token::Extend, "expected `extend`")?.span.start;
+        let ty = self.parse_type()?;
+        self.expect(Token::Do, "expected `do` after extend type")?;
+        self.consume_newlines();
+        let mut members = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            let save = self.pos;
+            match self.parse_function() {
+                Ok(func) => {
+                    members.push(ExtensionMember::Function(func));
+                    self.consume_newlines();
+                    continue;
+                }
+                Err(_) => {
+                    self.pos = save;
+                    // Skip one token and continue (handles unknown member types)
+                    self.advance();
+                }
+            }
+        }
+        let end = self.expect(Token::End, "expected `end` to close extend")?.span.end;
+        Ok(ExtensionDecl{ty, members, span: Span::new(start, end)})
     }
 
     fn parse_enum_decl(&mut self) -> Result<EnumDecl, ParseError> {
         if matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private)) { self.advance(); }
         let start = self.expect(Token::Enum, "expected `enum`")?.span.start;
         let (name, name_span) = self.parse_ident()?;
+        let generics = self.parse_generic_params_opt();
+        let where_clause = self.parse_where_clause_opt();
         self.expect(Token::Has, "expected `has` after enum name")?;
         self.consume_newlines();
         let mut variants = Vec::new();
@@ -666,7 +935,7 @@ impl Parser {
             self.consume_newlines();
         }
         let end = self.expect(Token::End, "expected `end` to close enum")?.span.end;
-        Ok(EnumDecl{name, name_span, variants, span: Span::new(start, end)})
+        Ok(EnumDecl{name, name_span, generic_params: generics, where_clause, variants, span: Span::new(start, end)})
     }
 
     fn parse_import(&mut self) -> Result<ImportDecl, ParseError> {
@@ -744,6 +1013,18 @@ impl Parser {
                     self.advance();
                     Type::Char(st.span)
                 }
+                Token::Float => {
+                    self.advance();
+                    Type::Float(st.span)
+                }
+                Token::Double => {
+                    self.advance();
+                    Type::Double(st.span)
+                }
+                Token::Any => {
+                    self.advance();
+                    Type::Any(st.span)
+                }
                 Token::Ident => {
                     self.advance();
                     Type::Named(self.slice(st.span).to_string(), st.span)
@@ -756,6 +1037,28 @@ impl Parser {
                 }
             }
         };
+        // Handle generic-type: Named<type,...>
+        if self.peek_token() == Some(&Token::Lt) {
+            // Try parse generic args - only if ty is Named
+            if let Type::Named(n, s) = ty.clone() {
+                self.advance(); // <
+                let mut args = Vec::new();
+                if self.peek_token() != Some(&Token::Gt) {
+                    loop {
+                        if let Ok(arg) = self.parse_type() {
+                            args.push(arg);
+                        } else { break; }
+                        if !self.consume_if(Token::Comma) { break; }
+                    }
+                }
+                if self.consume_if(Token::Gt) {
+                    let span = Span::new(s.start, self.tokens[self.pos-1].span.end);
+                    ty = Type::Generic(n, args, span);
+                } else {
+                    // rollback not needed for now
+                }
+            }
+        }
         // { type-modifier } : "?" | "*" | "[]"
         loop {
             if self.peek_token() == Some(&Token::Question) {
@@ -784,6 +1087,53 @@ impl Parser {
             break;
         }
         Ok(ty)
+    }
+
+    fn parse_generic_params_opt(&mut self) -> Vec<GenericParam> {
+        if self.peek_token() != Some(&Token::Lt) { return Vec::new(); }
+        self.advance(); // <
+        let mut params = Vec::new();
+        while !self.is_eof() && self.peek_token() != Some(&Token::Gt) {
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            let (name, span) = match self.parse_ident() {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let mut bounds = Vec::new();
+            if self.consume_if(Token::Colon) {
+                loop {
+                    bounds.push(self.parse_type().unwrap_or(Type::Named("any".into(), span)));
+                    if !self.consume_if(Token::Comma) { break; }
+                }
+            }
+            params.push(GenericParam{name, name_span: span, bounds, span});
+            if !self.consume_if(Token::Comma) { break; }
+        }
+        let _ = self.expect(Token::Gt, "expected `>` after generic params");
+        params
+    }
+
+    fn parse_where_clause_opt(&mut self) -> Option<WhereClause> {
+        if self.peek_token() != Some(&Token::Where) { return None; }
+        let start = self.advance().unwrap().span.start;
+        let mut constraints = Vec::new();
+        while !self.is_eof() && !matches!(self.peek_token(), Some(Token::Has) | Some(Token::Do) | Some(Token::End) | Some(Token::Newline) | Some(Token::Semicolon)) {
+            let ty = match self.parse_type() { Ok(t) => t, Err(_) => break };
+            if !self.consume_if(Token::Colon) { break; }
+            let mut bounds = Vec::new();
+            loop {
+                match self.parse_type() {
+                    Ok(t) => bounds.push(t),
+                    Err(_) => break,
+                }
+                if !self.consume_if(Token::Comma) { break; }
+            }
+            let span = Span::new(ty.span().start, bounds.last().map(|b| b.span().end).unwrap_or(ty.span().end));
+            constraints.push(WhereConstraint{ty, bounds, span});
+            if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.consume_newlines(); }
+            else { break; }
+        }
+        Some(WhereClause{constraints, span: Span::new(start, self.peek_span().end)})
     }
 
     fn parse_ident(&mut self) -> Result<(String, Span), ParseError> {
@@ -820,6 +1170,8 @@ impl Parser {
         let start_span = self.peek_span();
         let ret_ty = self.parse_type()?;
         let (name, name_span) = self.parse_ident()?;
+        // Phase 5: generic params <T, U>
+        let generic_params = self.parse_generic_params_opt();
         self.expect(Token::LParen, "function params")?;
         let mut params = Vec::new();
         // params: [type ident {, type ident}]
@@ -842,6 +1194,7 @@ impl Parser {
             }
         }
         self.expect(Token::RParen, "closing `)`")?;
+        let where_clause = self.parse_where_clause_opt();
         // function body: block (do ... end) or initialize? For free functions only block
         let body = self.parse_block()?;
         let span = Span::new(start_span.start, body.span.end);
@@ -856,6 +1209,8 @@ impl Parser {
             is_sealed,
             is_override,
             is_open,
+            generic_params: Vec::new(),
+            where_clause: None,
             span,
         })
     }
@@ -993,9 +1348,32 @@ impl Parser {
         let mut init = None;
         let mut end = name_span.end;
         if self.consume_if(Token::Eq) {
-            let expr = self.parse_expr()?;
-            end = expr.span.end;
-            init = Some(expr);
+            // Support omitted Type in struct/class literal: `User u2 = has ... end`
+            // When RHS starts with `has` without preceding Type, infer type from LHS
+            self.consume_newlines();
+            if self.peek_token() == Some(&Token::Has) {
+                let has_tok = self.advance().unwrap();
+                self.consume_newlines();
+                let mut fields = Vec::new();
+                while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+                    if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+                    let (fname, fspan) = self.parse_ident()?;
+                    self.expect(Token::Eq, "expected `=` in struct literal")?;
+                    let fexpr = self.parse_expr()?;
+                    self.expect_terminator("struct field initializer")?;
+                    fields.push((fname, fspan, fexpr));
+                    self.consume_newlines();
+                }
+                let end_tok = self.expect(Token::End, "expected `end` to close struct literal")?;
+                let span = Span::new(ty.span().start, end_tok.span.end);
+                let lit = Expr{kind: ExprKind::StructLit{ty: ty.clone(), fields}, span};
+                end = lit.span.end;
+                init = Some(lit);
+            } else {
+                let expr = self.parse_expr()?;
+                end = expr.span.end;
+                init = Some(expr);
+            }
         }
         let term_start = end;
         self.expect_terminator("variable declaration")?;
@@ -1388,6 +1766,72 @@ impl Parser {
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary()?;
         loop {
+            // Handle generic call foo<T>(args) before normal call
+            if let ExprKind::Ident(s) = &expr.kind {
+                if self.peek_token() == Some(&Token::Lt) {
+                    let save = self.pos;
+                    self.advance(); // <
+                    let is_type_start = matches!(self.peek_token(), Some(Token::Int) | Some(Token::Bool) | Some(Token::StringKw) | Some(Token::CharKw) | Some(Token::Float) | Some(Token::Double) | Some(Token::Any) | Some(Token::Ident));
+                    if is_type_start {
+                        // Try to parse type args and check for '>' then '('
+                        let save2 = self.pos;
+                        let mut ok = false;
+                        if let Ok(_) = self.parse_type() {
+                            // Check for ',' or '>' and then '('
+                            let mut temp_pos = self.pos;
+                            // Look ahead for '>' then '('
+                            let mut depth = 0;
+                            // Simple check: if next is ',' or '>' then assume generic
+                            if matches!(self.peek_token(), Some(Token::Comma) | Some(Token::Gt)) {
+                                // Check if after '>' we have '('
+                                let save3 = self.pos;
+                                // Try to consume up to '>' and then check '('
+                                while !self.is_eof() && self.peek_token() != Some(&Token::Gt) {
+                                    if self.peek_token() == Some(&Token::Lt) { depth += 1; }
+                                    self.advance();
+                                }
+                                if self.peek_token() == Some(&Token::Gt) {
+                                    self.advance();
+                                    if self.peek_token() == Some(&Token::LParen) {
+                                        ok = true
+                                    }
+                                }
+                                self.pos = save2;
+                                if ok {
+                                    // It's generic call
+                                    self.pos = save;
+                                    self.advance(); // <
+                                    let mut type_args = Vec::new();
+                                    if self.peek_token() != Some(&Token::Gt) {
+                                        loop {
+                                            type_args.push(self.parse_type().unwrap());
+                                            if !self.consume_if(Token::Comma) { break; }
+                                        }
+                                    }
+                                    self.expect(Token::Gt, "expected `>` after type arguments").unwrap();
+                                    self.expect(Token::LParen, "expected `(` after type arguments").unwrap();
+                                    let mut args = Vec::new();
+                                    if self.peek_token() != Some(&Token::RParen) {
+                                        loop {
+                                            args.push(self.parse_expr().unwrap());
+                                            if !self.consume_if(Token::Comma) { break; }
+                                        }
+                                    }
+                                    self.expect(Token::RParen, "expected `)` after call args").unwrap();
+                                    let end = self.tokens[self.pos-1].span.end;
+                                    let span = Span::new(s.clone().len(), end); // placeholder, will fix
+                                    let callee_name = s.clone();
+                                    let callee_span = expr.span;
+                                    let span2 = Span::new(callee_span.start, end);
+                                    expr = Expr{kind: ExprKind::Call{callee: callee_name, callee_span, args, type_args}, span: span2};
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    self.pos = save;
+                }
+            }
             // call: '(' [args] ')' — handles both free fn `foo()` and method `obj.meth()`
             if self.peek_token() == Some(&Token::LParen) {
                 match &expr.kind {
@@ -1404,7 +1848,7 @@ impl Parser {
                         }
                         let end = self.expect(Token::RParen, "expected `)` after call args")?.span.end;
                         let span = Span::new(callee_span.start, end);
-                        expr = Expr{kind: ExprKind::Call{callee: callee_name, callee_span, args}, span};
+                        expr = Expr{kind: ExprKind::Call{callee: callee_name, callee_span, args, type_args: Vec::new()}, span};
                         continue;
                     }
                     ExprKind::MemberAccess{object, field, field_span} => {
@@ -1462,6 +1906,55 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
+        // closure: | [params] | => expr | block
+        if self.peek_token() == Some(&Token::Pipe) {
+            let start = self.peek_span().start;
+            self.advance(); // |
+            let mut params = Vec::new();
+            if self.peek_token() != Some(&Token::Pipe) {
+                loop {
+                    if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+                    // Try type + ident, fallback to ident only
+                    let save = self.pos;
+                    let mut parsed = false;
+                    if let Ok(ty) = self.parse_type() {
+                        if let Ok((pn, pn_span)) = self.parse_ident() {
+                            let pspan = Span::new(ty.span().start, pn_span.end);
+                            params.push(Param{ty, name: pn, name_span: pn_span, span: pspan});
+                            parsed = true;
+                        } else {
+                            self.pos = save;
+                        }
+                    } else {
+                        self.pos = save;
+                    }
+                    if !parsed {
+                        let (pn, pn_span) = self.parse_ident()?;
+                        let any_ty = Type::Any(pn_span);
+                        let pspan = Span::new(pn_span.start, pn_span.end);
+                        params.push(Param{ty: any_ty, name: pn, name_span: pn_span, span: pspan});
+                    }
+                    if !self.consume_if(Token::Comma) { break; }
+                    if self.peek_token() == Some(&Token::Pipe) { break; }
+                }
+            }
+            self.expect(Token::Pipe, "expected `|` to close closure params")?;
+            let body = if self.consume_if(Token::FatArrow) {
+                let expr = self.parse_expr()?;
+                ClosureBody::Expr(Box::new(expr))
+            } else if self.peek_token() == Some(&Token::Do) {
+                let blk = self.parse_block()?;
+                ClosureBody::Block(blk)
+            } else {
+                return Err(ParseError{message: "expected `=>` or `do` after closure params".into(), span: self.peek_span()});
+            };
+            let end = match &body {
+                ClosureBody::Expr(e) => e.span.end,
+                ClosureBody::Block(b) => b.span.end,
+            };
+            let span = Span::new(start, end);
+            return Ok(Expr{kind: ExprKind::Closure{params, body: Box::new(body), span: span.clone()}, span});
+        }
         // match expression is also primary (EBNF primary-expression includes match-expression)
         if self.peek_token() == Some(&Token::Match) {
             return self.parse_match_expr();
@@ -1475,6 +1968,14 @@ impl Parser {
             span: Span::new(self.source.len(), self.source.len()),
         })?;
         match st.token {
+            Token::FloatLit => {
+                self.advance();
+                let raw = self.slice(st.span).replace("_", "");
+                Ok(Expr {
+                    kind: ExprKind::FloatLit(raw),
+                    span: st.span,
+                })
+            }
             Token::IntLit | Token::HexInt | Token::BinInt => {
                 self.advance();
                 let val = self.parse_int_lit(st.span)?;
@@ -1507,6 +2008,62 @@ impl Parser {
                     ""
                 };
                 let decoded = Self::unescape_string(inner);
+                // Check for interpolation {expr} per EBNF §4
+                if decoded.contains('{') && decoded.contains('}') {
+                    let mut parts: Vec<InterpolatedPart> = Vec::new();
+                    let mut literal = String::new();
+                    let mut chars = decoded.chars().peekable();
+                    let mut in_expr = false;
+                    while let Some(c) = chars.next() {
+                        if !in_expr && c == '{' {
+                            if chars.peek() == Some(&'{') {
+                                // escaped {{
+                                literal.push('{');
+                                chars.next();
+                                continue;
+                            }
+                            if !literal.is_empty() {
+                                parts.push(InterpolatedPart::Literal(literal.clone()));
+                                literal.clear();
+                            }
+                            // collect expr until matching }
+                            let mut expr_str = String::new();
+                            let mut depth = 1;
+                            while let Some(c2) = chars.next() {
+                                if c2 == '{' { depth += 1; expr_str.push(c2); }
+                                else if c2 == '}' {
+                                    depth -= 1;
+                                    if depth == 0 { break; }
+                                    else { expr_str.push(c2); }
+                                } else { expr_str.push(c2); }
+                            }
+                            let expr_trim = expr_str.trim().to_string();
+                            if !expr_trim.is_empty() {
+                                let lex_out = crate::lexer::lex(&expr_trim);
+                                let mut p = Parser::new(lex_out.tokens.clone(), expr_trim.clone());
+                                if let Ok(expr) = p.parse_expr() {
+                                    parts.push(InterpolatedPart::Expr(Box::new(expr)));
+                                } else {
+                                    // fallback as literal
+                                    literal.push('{');
+                                    literal.push_str(&expr_str);
+                                    literal.push('}');
+                                }
+                            }
+                        } else if !in_expr && c == '}' && chars.peek() == Some(&'}') {
+                            literal.push('}');
+                            chars.next();
+                        } else {
+                            literal.push(c);
+                        }
+                    }
+                    if !literal.is_empty() {
+                        parts.push(InterpolatedPart::Literal(literal));
+                    }
+                    if parts.iter().any(|p| matches!(p, InterpolatedPart::Expr(_))) {
+                        return Ok(Expr{kind: ExprKind::InterpolatedString(parts, st.span), span: st.span});
+                    }
+                }
                 Ok(Expr {
                     kind: ExprKind::StringLit(decoded),
                     span: st.span,

@@ -40,9 +40,10 @@ Moved out of `compiler/examples/` into top-level `examples/` — fewer, more com
 |------|--------|
 | `empty.hlt` | Phase 0 empty file |
 | `basics.hlt` | Phase 1: `int`/`bool`/`void`, arithmetic, `and`/`or`/`not`, `if`/`else`, `while`, functions, recursion |
-| `data_control.hlt` | Phase 2–3: `struct`, field access, literals, `T[]`, `match`, `string`, `break`/`continue`, `loop`, `for … in`, `defer` |
-| `abstraction.hlt` | Phase 4: `class` + `this`, constructors (`initialize` sugar), `open`/`override`/`sealed`, `trait` + `implements` (no `override` needed), `enum` with payloads, `get`/`set` properties, `public`/`private` (constructors public by default) |
+| `data_control.hlt` | Phase 2–3: `struct` (+ `struct User` with omitted `has` — `User u2 = has … end`), field access, literals, `T[]`, `match`, `string`, `break`/`continue`, `loop`, `for … in`, `defer` |
+| `abstraction.hlt` | Phase 4: `class` + `this`, constructors (`initialize` sugar), `open` (class only, not methods) / `override` / `sealed`, `trait` + `implements` (no `override` needed), `enum` with payloads, `get`/`set` properties (public by default, separate `get`/`set` allowed), `public`/`private` (constructors and accessors public by default) |
 | `hello_io.hlt` | `import std::io` (`print`/`println`/`printInt`/`putChar`) |
+| `advanced.hlt` | Phase 5: `distinct`/`typedef`, `extend` (`open class` + `extend`), `init`, `extern`, generics + `where`, `operator`/`convert`, closures (`‖`), string interpolation (`{expr}`), `float`/`double`, `any`, plus `struct User` omitted `has` and `CounterEx` separate accessors |
 
 ```sh
 cargo run -p compiler -- examples/basics.hlt && ./examples/basics.out; echo $?
@@ -55,14 +56,14 @@ cargo run -p compiler -- examples/abstraction.hlt && ./examples/abstraction.out;
 - Decls: `int x = 1` (no `let`)
 - Terminators: newline or `;`
 - Bodies: `has … end` for struct/class/enum/trait
-- Literals: `Type has field = expr end`
+- Literals: `Type has field = expr end` and, for struct or constructor-less class, `has field = expr end` with inferred `Type` (e.g. `User u2 = has name = "bbb" end` when `User u2` declares `User`)
 - Match: `match expr do pat -> expr end`
 - `defer` runs on every scope exit
 - `initialize` only on class constructors; `this.field = field` sugar and optional `do … end` block
-- Constructors are `public` by default, all other class members are `private` unless `public`
+- Constructors and `get`/`set` accessors are `public` by default; other class members are `private` unless `public`. `get`/`set` may be declared together or separately (`int x get … end` + `int x set … end`) and `open` is only for `class`, not methods
 
 Spec is authoritative: `references/ebnf-0.1.txt`. Phases: `references/phases.md`. LLVM mapping: `references/llvm-mapping.md`.
 
 ## Status
 
-Phase 4 (Abstraction) is complete — classes, constructors, inheritance, traits, enums, properties, visibility all lower to LLVM and are exercised by `abstraction.hlt` (exit 233).
+Phase 5 (Advanced) is complete — all language features lower to LLVM and are exercised by `advanced.hlt` (generics, closures, interpolation, operators, `extern`, `distinct` etc., exit 20). Earlier phases: `abstraction.hlt` (exit 233), `basics.hlt` (exit 230), `data_control.hlt` (exit 72).

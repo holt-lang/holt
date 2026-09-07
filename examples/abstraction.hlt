@@ -14,12 +14,12 @@ open class Shape has
     // Block is optional when only field assignment is needed
     Shape(int x, int y) initialize
 
-    public open int area() do
+    public int area() do
         return 0
     end
 
-    // Property with getter and setter
-    public int idVal get do
+    // Property with getter and setter — public by default, can be declared together
+    int idVal get do
         return this.id
     end
     set(int v) do
@@ -45,10 +45,12 @@ end
 
 class Counter has
     private int _count
-    public int count get do
+    // Separate getter/setter — both public by default
+    int count get do
         return this._count
     end
-    set(int v) do
+
+    int count set(int v) do
         this._count = v
     end
 

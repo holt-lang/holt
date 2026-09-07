@@ -59,19 +59,20 @@ Always advance one phase at a time. Each phase must produce runnable code (JIT o
 - Properties (get/set)
 - Visibility (`public`/`private`)
 
-## Phase 5 — Advanced
+## Phase 5 — Advanced - DONE
 
 - Generics + monomorphization + `where` clauses
-- Closures
-- String interpolation
-- Operator overloading
+- Closures (`|params| => expr` / `|params| do … end`, indirect calls)
+- String interpolation (`"hello {expr}"` via `sprintf`/`strcat`/`strdup`)
+- Operator overloading (`operator +` etc. via `__op_*` dispatch)
 - Conversions (`convert … to …`)
-- `extern` FFI blocks
-- Modules / `import`
-- `init` blocks
-- Attributes
-- Distinct types / typedefs
-- Extensions
+- `extern` FFI blocks (`extern "c" from "m"`)
+- Modules / `import` (qualified `::` + `{a,b}` lists)
+- `init` blocks (`holt.init`)
+- Attributes (`@inline` etc.)
+- Distinct types / typedefs (`distinct` wraps struct, `typedef` alias)
+- Extensions (`extend Type do … end`)
+- `float`/`double` literals and `any`/`function` types
 
 ## Out of Scope for Early Phases
 

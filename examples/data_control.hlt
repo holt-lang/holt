@@ -6,6 +6,11 @@ struct Point has
     int y
 end
 
+struct User has
+    string name
+    int age
+end
+
 int dist2(Point p) do
     return p.x * p.x + p.y * p.y
 end
@@ -66,6 +71,17 @@ int main() do
     // --- strings (no interpolation yet) ---
     string s = "hello"
     char c = 'A'
+
+    // --- omitted Type for struct literal (constructor-less) ---
+    User u1 = User has
+        name = "hsn"
+        age = 20
+    end
+    User u2 = has
+        name = "bbb"
+        age = 25
+    end
+    int ages = u1.age + u2.age // 45, not affecting return to keep exit stable
 
     return sum + i + j + m // 60 + 8 + 3 + 1 = 72 (+ defer effect if counted)
 end

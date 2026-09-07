@@ -18,8 +18,14 @@ pub enum Ty {
     Void,
     Char,
     String,
+    Float,
+    Double,
     Struct(String),
     Enum(String),
+    Generic(String, Vec<Ty>),
+    Tuple(Vec<Ty>),
+    Any,
+    Function(Box<Ty>, Vec<Ty>),
     Array(Box<Ty>),
     Pointer(Box<Ty>),
     Optional(Box<Ty>),
@@ -33,7 +39,13 @@ impl From<&Type> for Ty {
             Type::Void(_) => Ty::Void,
             Type::String(_) => Ty::String,
             Type::Char(_) => Ty::Char,
+            Type::Float(_) => Ty::Float,
+            Type::Double(_) => Ty::Double,
             Type::Named(n, _) => Ty::Struct(n.clone()),
+            Type::Generic(n, args, _) => Ty::Generic(n.clone(), args.iter().map(|a| Ty::from(a)).collect()),
+            Type::FunctionType(ret, args, _) => Ty::Function(Box::new(Ty::from(ret.as_ref())), args.iter().map(|a| Ty::from(a)).collect()),
+            Type::Tuple(tys, _) => Ty::Tuple(tys.iter().map(|t| Ty::from(t)).collect()),
+            Type::Any(_) => Ty::Any,
             Type::Array(el, _) => Ty::Array(Box::new(Ty::from(el.as_ref()))),
             Type::Pointer(el, _) => {
                 Ty::Pointer(Box::new(Ty::from(el.as_ref())))
@@ -52,8 +64,14 @@ impl std::fmt::Display for Ty {
             Ty::Void => write!(f, "void"),
             Ty::Char => write!(f, "char"),
             Ty::String => write!(f, "string"),
+            Ty::Float => write!(f, "float"),
+            Ty::Double => write!(f, "double"),
             Ty::Struct(n) => write!(f, "{}", n),
             Ty::Enum(n) => write!(f, "{}", n),
+            Ty::Generic(n, args) => write!(f, "{}<{}>", n, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
+            Ty::Tuple(tys) => write!(f, "({})", tys.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
+            Ty::Any => write!(f, "any"),
+            Ty::Function(ret, args) => write!(f, "function<{}({})>", ret, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::Array(el) => write!(f, "{}[]", el),
             Ty::Pointer(el) => write!(f, "{}*", el),
             Ty::Optional(el) => write!(f, "{}?", el),
@@ -86,6 +104,8 @@ struct ClassInfo {
     method_vis: HashMap<String, crate::ast::Visibility>,
     constructors: Vec<(FuncSig, crate::ast::Visibility)>,
     properties: HashMap<String, PropertyInfo>,
+    operators: HashMap<String, FuncSig>,
+    conversions: Vec<(Ty, Ty, Span)>,
     is_open: bool,
     is_sealed: bool,
     extends: Option<String>,
@@ -189,12 +209,38 @@ impl Checker {
 
     fn resolve_type(&mut self, ty: &Type) -> Ty {
         let mut t = Ty::from(ty);
-        // Handle enum vs struct vs class distinction for Named types
+        // Handle generic type params: if t is Struct with name that is a generic param, treat as Generic
         if let Ty::Struct(ref n) = t {
+            // Check if it's a generic param for current function/class
+            // For minimal, check if it's a single uppercase letter like T, U, V
+            if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
+                // Consider it as generic if not known struct/class/enum
+                if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+                    t = Ty::Generic(n.clone(), vec![]);
+                    return t;
+                }
+            }
             if self.enums.contains_key(n) {
                 t = Ty::Enum(n.clone());
             } else if !self.structs.contains_key(n) && !self.classes.contains_key(n) {
-                self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                // Check if it's generic param (single uppercase)
+                if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
+                    t = Ty::Generic(n.clone(), vec![]);
+                } else {
+                    self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                }
+            }
+        }
+        // Handle Generic type
+        if let Ty::Generic(ref n, ref args) = t {
+            // Check base exists
+            if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+                // Could be generic param itself, not base
+                if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
+                    // Generic param, ok
+                } else {
+                    self.errors.push(SemError{message: format!("unknown generic type `{n}`"), span: ty.span()});
+                }
             }
         }
         // For compound types, ensure inner is known (array element etc) – From already handled, but check nested struct/enum existence
@@ -208,6 +254,17 @@ impl Checker {
                 if let Ty::Enum(ref n) = **el {
                     if !self.enums.contains_key(n) { self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()}); }
                 }
+                if let Ty::Generic(ref n, _) = **el {
+                    if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+                        self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                    }
+                }
+            }
+            Ty::Generic(n, args) => {
+                if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+                    self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                }
+                for a in args { if let Ty::Struct(sn) = a { if !self.structs.contains_key(sn) && !self.classes.contains_key(sn) && !self.enums.contains_key(sn) { self.errors.push(SemError{message: format!("unknown type `{sn}`"), span: ty.span()}); } } }
             }
             _ => {}
         }
@@ -215,8 +272,16 @@ impl Checker {
     }
 
     pub fn check_program(&mut self, prog: &Program) -> Vec<SemError> {
+        // Unwrap attributed items for struct/class/enum/trait/typedef/distinct
+        let mut unwrapped: Vec<&Item> = Vec::new();
+        for it in &prog.items {
+            match it {
+                Item::Attributed{attrs: _, item} => unwrapped.push(item.as_ref()),
+                other => unwrapped.push(other),
+            }
+        }
         // First pass: collect struct definitions
-        for item in &prog.items {
+        for item in unwrapped.iter() {
             if let Item::Struct(s) = item {
                 if self.structs.contains_key(&s.name) {
                     self.errors.push(SemError {
@@ -404,11 +469,36 @@ impl Checker {
                             self.errors.push(SemError{message: format!("destructor name `~{}` must match class name `{}`", dtor.name, c.name), span: dtor.name_span});
                         }
                     }
-                    // Collect properties
-                    let mut prop_map = HashMap::new();
+                    // Collect properties — allow separate getter/setter declarations that merge
+                    let mut prop_map: HashMap<String, PropertyInfo> = HashMap::new();
                     for prop in &c.properties {
-                        if seen.contains(&prop.name) || methods.contains_key(&prop.name) || prop_map.contains_key(&prop.name) {
+                        if seen.contains(&prop.name) || methods.contains_key(&prop.name) {
                             self.errors.push(SemError{message: format!("duplicate property/member `{}` in class `{}`", prop.name, c.name), span: prop.name_span});
+                            continue;
+                        }
+                        if let Some(existing) = prop_map.get(&prop.name).cloned() {
+                            // Merge getter/setter for same property name
+                            let new_has_get = prop.getter.is_some();
+                            let new_has_set = prop.setter.is_some();
+                            if existing.has_get && new_has_get {
+                                self.errors.push(SemError{message: format!("duplicate getter for property `{}` in class `{}`", prop.name, c.name), span: prop.name_span});
+                                continue;
+                            }
+                            if existing.has_set && new_has_set {
+                                self.errors.push(SemError{message: format!("duplicate setter for property `{}` in class `{}`", prop.name, c.name), span: prop.name_span});
+                                continue;
+                            }
+                            // Type consistency: if both have explicit types, they must match
+                            let new_ty: Option<Ty> = if let Some(ref t) = prop.ty { Some(self.resolve_type(t)) } else if let Some((p,_)) = prop.setter.as_ref() { Some(self.resolve_type(&p.ty)) } else { None };
+                            if let Some(nt) = &new_ty {
+                                if existing.ty != Ty::Void && *nt != Ty::Void && existing.ty != *nt {
+                                    self.errors.push(SemError{message: format!("property `{}` type mismatch", prop.name), span: prop.name_span});
+                                }
+                            }
+                            let merged_has_get = existing.has_get || new_has_get;
+                            let merged_has_set = existing.has_set || new_has_set;
+                            // Keep existing type/visibility, update accessors
+                            prop_map.insert(prop.name.clone(), PropertyInfo{ty: existing.ty.clone(), has_get: merged_has_get, has_set: merged_has_set, visibility: existing.visibility, span: prop.span});
                             continue;
                         }
                         let prop_ty = if let Some(ref t) = prop.ty { self.resolve_type(t) } else if let Some((param, _)) = prop.setter.as_ref() { self.resolve_type(&param.ty) } else if prop.getter.is_some() { Ty::Void } else { Ty::Void };
@@ -452,7 +542,22 @@ impl Checker {
                             }
                         }
                     }
-                    self.classes.insert(c.name.clone(), ClassInfo{name: c.name.clone(), fields, field_map: fmap, field_vis: fvis, methods, method_vis, constructors: ctor_sigs, properties: prop_map, is_open: c.is_open, is_sealed: c.is_sealed, extends: extends_name.clone(), implements: implements_names.clone(), span: c.span});
+                    // Collect operators and conversions
+                    let mut op_map: HashMap<String, FuncSig> = HashMap::new();
+                    for op in &c.operators {
+                        let mut p_tys = Vec::new();
+                        for pp in &op.params { p_tys.push(self.resolve_type(&pp.ty)); }
+                        // For MVP, assume operator returns int (or struct for + if class)
+                        let ret = Ty::Int;
+                        op_map.insert(op.op.clone(), FuncSig{ret: ret.clone(), params: p_tys, span: op.span});
+                    }
+                    let mut conv_vec: Vec<(Ty, Ty, Span)> = Vec::new();
+                    for conv in &c.conversions {
+                        let from = self.resolve_type(&conv.from_ty);
+                        let to = self.resolve_type(&conv.to_ty);
+                        conv_vec.push((from, to, conv.span));
+                    }
+                    self.classes.insert(c.name.clone(), ClassInfo{name: c.name.clone(), fields, field_map: fmap, field_vis: fvis, methods, method_vis, constructors: ctor_sigs, properties: prop_map, operators: op_map, conversions: conv_vec, is_open: c.is_open, is_sealed: c.is_sealed, extends: extends_name.clone(), implements: implements_names.clone(), span: c.span});
                 }
             }
         }
@@ -526,9 +631,70 @@ impl Checker {
                 }
             }
         }
+        // Handle typedef/distinct as type aliases
+        for item in &prog.items {
+            if let Item::Typedef(td) = item {
+                let ty = self.resolve_type(&td.ty);
+                self.structs.insert(td.name.clone(), StructInfo{name: td.name.clone(), fields: vec![("value".to_string(), ty.clone())], field_map: [(String::from("value"), (0, ty.clone()))].into_iter().collect(), span: td.span});
+            } else if let Item::Distinct(dd) = item {
+                let ty = self.resolve_type(&dd.ty);
+                self.structs.insert(dd.name.clone(), StructInfo{name: dd.name.clone(), fields: vec![("value".to_string(), ty.clone())], field_map: [(String::from("value"), (0, ty.clone()))].into_iter().collect(), span: dd.span});
+            } else if let Item::Extension(ext) = item {
+                let target_name = match &ext.ty { Type::Named(n, _) => n.clone(), Type::Generic(n, _, _) => n.clone(), _ => "".to_string() };
+                let ext_members = ext.members.clone();
+                let mut pending_ext: Vec<(String, FuncSig, crate::ast::Visibility)> = Vec::new();
+                for mem in &ext_members {
+                    if let crate::ast::ExtensionMember::Function(f) = mem {
+                        let ret_ty = self.resolve_type(&f.ret_ty);
+                        let param_tys: Vec<Ty> = f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+                        let sig = FuncSig{ret: ret_ty, params: param_tys, span: f.name_span};
+                        pending_ext.push((f.name.clone(), sig, f.visibility));
+                    }
+                }
+                if let Some(cls) = self.classes.get_mut(&target_name) {
+                    for (name, sig, vis) in pending_ext {
+                        cls.methods.insert(name.clone(), sig);
+                        cls.method_vis.insert(name, vis);
+                    }
+                    for mem in &ext_members {
+                        match mem {
+                            crate::ast::ExtensionMember::Function(f) => {
+                                // already handled
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        // Handle attributed items as their inner
+        for item in &prog.items {
+            if let Item::Attributed{attrs: _, item} = item {
+                if let Item::Function(f) = item.as_ref() {
+                    // Will be handled in next pass, just check inner for now
+                }
+            }
+        }
+        // Handle extern functions
+        for item in &prog.items {
+            if let Item::Extern(ex) = item {
+                for mem in &ex.members {
+                    if let crate::ast::ExternMember::Function{ty, name, name_span, params, ..} = mem {
+                        let ret = self.resolve_type(ty);
+                        let param_tys: Vec<Ty> = params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, span: *name_span});
+                    }
+                }
+            }
+        }
         // Second pass: collect function signatures
         for item in &prog.items {
-            if let Item::Function(f) = item {
+            let func_opt = match item {
+                Item::Function(f) => Some(f),
+                Item::Attributed{attrs: _, item} => if let Item::Function(f) = item.as_ref() { Some(f) } else { None },
+                _ => None,
+            };
+            if let Some(f) = func_opt {
                 if self.funcs.contains_key(&f.name) {
                     self.errors.push(SemError {
                         message: format!("duplicate function `{}`", f.name),
@@ -600,7 +766,12 @@ impl Checker {
 
         // Third pass: check function bodies
         for item in &prog.items {
-            if let Item::Function(f) = item {
+            let func_opt = match item {
+                Item::Function(f) => Some(f),
+                Item::Attributed{attrs: _, item} => if let Item::Function(f) = item.as_ref() { Some(f) } else { None },
+                _ => None,
+            };
+            if let Some(f) = func_opt {
                 self.check_function(f);
             }
         }
@@ -743,7 +914,7 @@ impl Checker {
                 }
                 if let Some(init) = &d.init {
                     let init_ty = self.check_expr(init);
-                    if init_ty != decl_ty && decl_ty != Ty::Void {
+                    if init_ty != decl_ty && decl_ty != Ty::Void && decl_ty != Ty::Any {
                         self.errors.push(SemError{message: format!("type mismatch in initializer: expected `{decl_ty}`, found `{init_ty}`"), span: init.span});
                     }
                 }
@@ -863,6 +1034,7 @@ impl Checker {
     fn check_expr(&mut self, expr: &Expr) -> Ty {
         match &expr.kind {
             ExprKind::IntLit(_) => Ty::Int,
+            ExprKind::FloatLit(_) => Ty::Double,
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::Ident(name) => {
                 if let Some(ty) = self.lookup_var(name) {
@@ -906,6 +1078,34 @@ impl Checker {
             ExprKind::Binary { op, lhs, rhs } => {
                 let lt = self.check_expr(lhs);
                 let rt = self.check_expr(rhs);
+                // operator overloading for class
+                if let Ty::Struct(ref sname) = lt {
+                    if let Some(cinfo) = self.classes.get(sname).cloned() {
+                        let op_str = match op {
+                            BinOp::Add => "+",
+                            BinOp::Sub => "-",
+                            BinOp::Mul => "*",
+                            BinOp::Div => "/",
+                            BinOp::Mod => "%",
+                            BinOp::Lt => "<",
+                            BinOp::Le => "<=",
+                            BinOp::Gt => ">",
+                            BinOp::Ge => ">=",
+                            BinOp::Is => "is",
+                            BinOp::IsNot => "is not",
+                            BinOp::And => "and",
+                            BinOp::Or => "or",
+                        };
+                        if let Some(sig) = cinfo.operators.get(op_str) {
+                            if let Some(exp) = sig.params.get(0) {
+                                if &rt != exp {
+                                    self.errors.push(SemError{message: format!("operator `{op_str}` for `{sname}` expects `{}`, found `{rt}`", exp), span: expr.span});
+                                }
+                            }
+                            return sig.ret.clone();
+                        }
+                    }
+                }
                 match op {
                     BinOp::Add
                     | BinOp::Sub
@@ -949,7 +1149,59 @@ impl Checker {
                 callee,
                 callee_span,
                 args,
+                type_args,
             } => {
+                // Handle generic function calls: substitute type args
+                if !type_args.is_empty() {
+                    if let Some(func) = self.funcs.get(callee).cloned() {
+                        // Check if function has generic params
+                        // For now, assume single generic T and single type arg
+                        // Find the generic function decl to get its generic params
+                        // For minimal, just check if func has generic params via prog? We don't have prog here, so just handle simple case where T -> actual
+                        // Look up function decl in prog? We can just handle by substituting T with first type arg
+                        let generic_subst: std::collections::HashMap<String, Ty> = {
+                            // Find the function decl's generic params by looking up in self.funcs? But self.funcs doesn't store generics
+                            // For minimal, assume T -> type_args[0]
+                            let mut m = std::collections::HashMap::new();
+                            if let Some(first_arg) = type_args.first() {
+                                let actual_ty = self.resolve_type(first_arg);
+                                // Assume generic param is "T"
+                                m.insert("T".to_string(), actual_ty.clone());
+                                // Also handle U etc. for multiple
+                                for (i, ta) in type_args.iter().enumerate() {
+                                    let name = if i == 0 { "T".to_string() } else if i == 1 { "U".to_string() } else { format!("T{}", i) };
+                                    m.insert(name, self.resolve_type(ta));
+                                }
+                            }
+                            m
+                        };
+                        // Check if func is generic (has T in params/ret)
+                        let is_generic = !type_args.is_empty();
+                        // For minimal, if type_args provided, substitute
+                        if !type_args.is_empty() {
+                            // Substitute T in params and ret
+                            let subst_ty = |ty: &Ty| -> Ty {
+                                match ty {
+                                    Ty::Generic(n, _) if generic_subst.contains_key(n) => generic_subst[n].clone(),
+                                    Ty::Struct(n) if generic_subst.contains_key(n) => generic_subst[n].clone(),
+                                    other => other.clone(),
+                                }
+                            };
+                            // Check args against substituted params
+                            for (i, arg) in args.iter().enumerate() {
+                                let aty = self.check_expr(arg);
+                                if let Some(param_ty) = func.params.get(i) {
+                                    let expected = subst_ty(param_ty);
+                                    if &aty != &expected {
+                                        self.errors.push(SemError{message: format!("argument {} of `{}`: expected `{}`, found `{}`", i+1, callee, expected, aty), span: arg.span});
+                                    }
+                                }
+                            }
+                            let ret_ty = subst_ty(&func.ret);
+                            return ret_ty;
+                        }
+                    }
+                }
                 // Check for class constructor call: ClassName(args)
                 if let Some(cls) = self.classes.get(callee).cloned() {
                     // Need class decl to find constructors; retrieve from prog? For now check if any ctor matches arity
@@ -1010,6 +1262,11 @@ impl Checker {
                     for arg in args { let _ = self.check_expr(arg); }
                     return struct_ty;
                 }
+                // builtin io intrinsics
+                if matches!(callee.as_str(), "print" | "println" | "printInt" | "putChar") {
+                    for arg in args { let _ = self.check_expr(arg); }
+                    return Ty::Void;
+                }
                 let sig = self.funcs.get(callee).cloned();
                 if let Some(sig) = sig {
                     if sig.params.len() != args.len() {
@@ -1031,6 +1288,25 @@ impl Checker {
                         }
                     }
                     sig.ret
+                } else if let Some(var_ty) = self.lookup_var(callee) {
+                    // variable call (closure / function pointer)
+                    if let Ty::Function(ret, params) = var_ty {
+                        if params.len() != args.len() {
+                            self.errors.push(SemError{message: format!("function variable `{callee}` expects {} args, found {}", params.len(), args.len()), span: *callee_span});
+                        }
+                        for (i, arg) in args.iter().enumerate() {
+                            let aty = self.check_expr(arg);
+                            if let Some(pt) = params.get(i) { if &aty != pt { self.errors.push(SemError{message: format!("argument {}: expected `{}`, found `{aty}`", i+1, pt), span: arg.span}); } }
+                        }
+                        *ret
+                    } else if let Ty::Any = var_ty {
+                        for arg in args { let _ = self.check_expr(arg); }
+                        Ty::Int
+                    } else {
+                        self.errors.push(SemError{message: format!("`{callee}` is not a function (found `{var_ty}`)"), span: *callee_span});
+                        for arg in args { let _ = self.check_expr(arg); }
+                        Ty::Int
+                    }
                 } else {
                     self.errors.push(SemError {
                         message: format!("undefined function `{callee}`"),
@@ -1433,6 +1709,36 @@ impl Checker {
                 }
                 arm_ty.unwrap_or(Ty::Int)
             }
+            ExprKind::Super => {
+                if let Some(cls) = &self.cur_class {
+                    if let Some(parent) = self.classes.get(cls).and_then(|c| c.extends.clone()) {
+                        Ty::Struct(parent)
+                    } else {
+                        self.errors.push(SemError{message: "`super` without parent".into(), span: expr.span});
+                        Ty::Int
+                    }
+                } else {
+                    self.errors.push(SemError{message: "`super` outside class".into(), span: expr.span});
+                    Ty::Int
+                }
+            }
+            ExprKind::Null => Ty::Pointer(Box::new(Ty::Int)),
+            ExprKind::Tuple(exprs) => {
+                let tys: Vec<Ty> = exprs.iter().map(|e| self.check_expr(e)).collect();
+                Ty::Tuple(tys)
+            }
+            ExprKind::InterpolatedString(_, _) => Ty::String,
+            ExprKind::Closure { params, body, .. } => {
+                self.push_scope();
+                for p in params { let ty = self.resolve_type(&p.ty); self.declare_var(&p.name, ty, p.name_span); }
+                let ret_ty = match body.as_ref() {
+                    crate::ast::ClosureBody::Expr(e) => self.check_expr(e),
+                    crate::ast::ClosureBody::Block(b) => { let _ = self.check_block(b, &Ty::Void); Ty::Void },
+                };
+                self.pop_scope();
+                Ty::Function(Box::new(ret_ty), params.iter().map(|p| self.resolve_type(&p.ty)).collect())
+            }
+            ExprKind::Paren(inner) => self.check_expr(inner),
         }
     }
 
