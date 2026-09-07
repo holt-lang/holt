@@ -5,13 +5,14 @@ Holt is a small, statically-typed language (draft 0.1 EBNF in `references/ebnf-0
 ## Layout
 
 ```
-holt-rs/
-├── compiler/          # `holtc` crate (lexer, parser, sema, codegen)
-│   └── src/           # token.rs, lexer.rs, ast.rs, parse/, sema/, codegen/
+holt/
+├── holt/              # `holt` main binary — `holt build` entry point (progress like cargo)
+│   └── src/main.rs    # clap `build` subcommand, indicatif spinner, delegates to `compiler` lib
+├── compiler/          # `compiler` library + legacy `holtc` bin (lexer, parser, sema, codegen)
+│   └── src/           # token.rs, lexer.rs, ast.rs, parse/, sema/, codegen/, lib.rs
 ├── examples/          # .hlt programs (see below)
 ├── stdlib/std/io.hlt  # pure-Holt standard library (import std::io)
-├── references/        # EBNF, phases, llvm-mapping, toolchain
-└── holt-syntax.nvim/  # Neovim syntax
+└── references/        # EBNF, phases, llvm-mapping, toolchain
 ```
 
 ## Prerequisites
@@ -24,11 +25,15 @@ holt-rs/
 
 ```sh
 cargo build
-cargo run -p compiler -- examples/hello_io.hlt
-cargo run -p compiler -- examples/abstraction.hlt --emit-llvm
-cargo run -p compiler -- examples/empty.hlt --lex
+cargo run -p holt -- build examples/hello_io.hlt        # progress like cargo
+cargo run -p holt -- build examples/abstraction.hlt --emit-llvm
+cargo run -p holt -- build examples/empty.hlt --help    # build subcommand
+cargo run -p compiler -- examples/hello_io.hlt         # legacy direct driver
 cargo test
 ```
+
+`holt build <file>` is the main entry point (workspace member `holt`). It shows cargo-like progress
+`Compiling`/`Lexing`/`Parsing`/`Checking`/`Codegen`/`Linking`/`Finished` via `indicatif` spinner + `console` styling, timing each phase.
 
 The driver lexes → parses → resolves imports → type-checks → emits LLVM IR → writes a `.o` via `TargetMachine` → links with `clang` to produce `*.out`.
 
@@ -46,8 +51,10 @@ Moved out of `compiler/examples/` into top-level `examples/` — fewer, more com
 | `advanced.hlt` | Phase 5: `distinct`/`typedef`, `extend` (`open class` + `extend`), `init`, `extern`, generics + `where`, `operator`/`convert`, closures (`‖`), string interpolation (`{expr}`), `float`/`double`, `any`, plus `struct User` omitted `has` and `CounterEx` separate accessors |
 
 ```sh
+cargo run -p holt -- build examples/basics.hlt && ./examples/basics.out; echo $?
+cargo run -p holt -- build examples/abstraction.hlt && ./examples/abstraction.out; echo $?
+# legacy:
 cargo run -p compiler -- examples/basics.hlt && ./examples/basics.out; echo $?
-cargo run -p compiler -- examples/abstraction.hlt && ./examples/abstraction.out; echo $?
 ```
 
 ## Language Notes (do not ignore)

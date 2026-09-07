@@ -1,6 +1,8 @@
 (* ================================================================ *)
 (* Holt Language Specification                                      *)
-(* Draft 0.1                                                       *)
+(* Draft 0.2 — updated for Phase 5 fixes: accessors public by       *)
+(* default, separate get/set merging, `open` class-only, omitted    *)
+(* `Type` in `has` literals                                        *)
 (* ================================================================ *)
 
 (* ---------------------------------------------------------------- *)
@@ -630,8 +632,12 @@ tuple-pattern =
 (* 11. Struct Construction                                          *)
 (* ---------------------------------------------------------------- *)
 
+(* `type` may be omitted when `struct-expression` appears as the    *)
+(* initializer of a variable-declaration whose declared type is a    *)
+(* struct or constructor-less class (not `any`). In `User u2 = has   *)
+(* name = "bbb" end` the second `has` infers `User`.                *)
 struct-expression =
-    type , "has" ,
+    [ type ] , "has" ,
     { struct-field-initializer } ,
     "end" ;
 
@@ -857,6 +863,11 @@ parameter-mode =
 (* 22. Classes                                                       *)
 (* ---------------------------------------------------------------- *)
 
+(* `open` is only for `class` (enables `extend`); methods use   *)
+(* `static`/`sealed`/`override` but never `open`: `open int bar()`  *)
+(* is rejected ( `method cannot be open` ).  Constructors and       *)
+(* `get`/`set` accessors are `public` by default; other members are *)
+(* `private` unless `public`.                                      *)
 class-declaration =
     [ visibility-modifier ] ,
     [ "open" ] ,
@@ -911,14 +922,18 @@ destructor-declaration =
 (* 23. Properties                                                    *)
 (* ---------------------------------------------------------------- *)
 
+(* `get`/`set` are `public` by default (override class `private`   *)
+(* default). Two `property-declaration`s with the same `identifier`   *)
+(* in one class merge if they supply complementary accessors: `int   *)
+(* x get … end` + `int x set(int v) … end` becomes one property.   *)
 property-declaration =
     [ visibility-modifier ] ,
-    type , identifier ,
+    [ type ] , identifier ,
     property-getter ,
     [ property-setter ]
 
   | [ visibility-modifier ] ,
-    identifier ,
+    [ type ] , identifier ,
     property-setter ,
     [ property-getter ] ;
 

@@ -1,1 +1,0 @@
-/Users/rivethorn/Dev/Holt/holt-rs/SKILL.md

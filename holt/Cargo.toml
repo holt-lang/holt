@@ -1,0 +1,12 @@
+[package]
+name = "holt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+compiler = { path = "../compiler" }
+clap = { version = "4", features = ["derive"] }
+miette = { version = "7", features = ["fancy"] }
+indicatif = "0.17"
+console = "0.15"
+inkwell = { version = "0.10", features = ["llvm21-1"] }
