@@ -1,0 +1,1270 @@
+(* ================================================================ *)
+(* Holt Language Specification                                      *)
+(* Draft 0.1                                                       *)
+(* ================================================================ *)
+
+(* ---------------------------------------------------------------- *)
+(* 1. Source Files                                                  *)
+(* ---------------------------------------------------------------- *)
+
+source-file =
+    { top-level-declaration | init-block } ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 2. Lexical Grammar                                               *)
+(* ---------------------------------------------------------------- *)
+
+identifier =
+    identifier-start , { identifier-continue } ;
+
+identifier-start =
+    letter | "_" ;
+
+identifier-continue =
+    letter | digit | "_" ;
+
+
+letter =
+    "A"…"Z"
+  | "a"…"z" ;
+
+digit =
+    "0"…"9" ;
+
+
+(* Keywords are reserved and cannot be used as identifiers. *)
+
+keyword =
+      "and"
+    | "any"
+    | "assert"
+    | "bool"
+    | "break"
+    | "class"
+    | "const"
+    | "continue"
+    | "debug_assert"
+    | "defer"
+    | "distinct"
+    | "do"
+    | "double"
+    | "else"
+    | "enum"
+    | "extends"
+    | "explicit"
+    | "extern"
+    | "float"
+    | "for"
+    | "function"
+    | "if"
+    | "implements"
+    | "import"
+    | "in"
+    | "init"
+    | "int"
+    | "is"
+    | "loop"
+    | "match"
+    | "not"
+    | "null"
+    | "open"
+    | "operator"
+    | "or"
+    | "out"
+    | "override"
+    | "private"
+    | "public"
+    | "ref"
+    | "return"
+    | "sealed"
+    | "static"
+    | "string"
+    | "struct"
+    | "super"
+    | "this"
+    | "trait"
+    | "typedef"
+    | "void"
+    | "while"
+    | "where" ;
+
+
+(* ---------------------------------------------------------------- *)
+(* 3. Comments and Whitespace                                       *)
+(* ---------------------------------------------------------------- *)
+
+line-comment =
+    "//" , { any-character-except-newline } ;
+
+block-comment =
+    "/*" , { any-character } , "*/" ;
+
+comment =
+    line-comment | block-comment ;
+
+newline =
+    LF | CRLF | CR ;
+
+whitespace =
+    " " | "\t" | comment ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 4. Literals                                                      *)
+(* ---------------------------------------------------------------- *)
+
+integer-literal =
+      decimal-literal
+    | hexadecimal-literal
+    | binary-literal ;
+
+decimal-literal =
+    digit , { digit | "_" } ;
+
+hexadecimal-literal =
+    "0x" , hex-digit , { hex-digit | "_" } ;
+
+binary-literal =
+    "0b" , binary-digit , { binary-digit | "_" } ;
+
+hex-digit =
+      digit
+    | "A"…"F"
+    | "a"…"f" ;
+
+binary-digit =
+    "0" | "1" ;
+
+
+floating-literal =
+      decimal-literal , "." , decimal-literal , [ exponent ]
+    | decimal-literal , "." , [ exponent ]
+    | "." , decimal-literal , [ exponent ]
+    | decimal-literal , exponent ;
+
+exponent =
+    ("e" | "E") , [ "+" | "-" ] , decimal-literal ;
+
+
+character-literal =
+    "'" , character-content , "'" ;
+
+character-content =
+    character
+  | escape-sequence ;
+
+
+string-literal =
+      normal-string
+    | multiline-string
+    | raw-string ;
+
+normal-string =
+    '"' , { string-character | escape-sequence | interpolation } , '"' ;
+
+multiline-string =
+    '"""' , { multiline-character | escape-sequence | interpolation } , '"""' ;
+
+raw-string =
+    'r"' , { raw-string-character } , '"' ;
+
+
+escape-sequence =
+      "\n"
+    | "\r"
+    | "\t"
+    | "\b"
+    | "\f"
+    | "\0"
+    | "\\"
+    | "\""
+    | "'"
+    | "\x" , hex-digit , hex-digit
+    | "\u" , hex-digit , hex-digit , hex-digit , hex-digit ;
+
+
+interpolation =
+    "{" , expression , "}" ;
+
+escaped-brace =
+    "{{" | "}}" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 5. Operators                                                     *)
+(* ---------------------------------------------------------------- *)
+
+operator =
+      "+"
+    | "-"
+    | "*"
+    | "/"
+    | "%"
+    | "<"
+    | "<="
+    | ">"
+    | ">="
+    | "is"
+    | "is not"
+    | "and"
+    | "or"
+    | "not"
+    | "&"
+    | "|"
+    | "^"
+    | "~"
+    | "<<"
+    | ">>"
+    | "="
+    | "+="
+    | "-="
+    | "*="
+    | "/="
+    | "%="
+    | "&="
+    | "|="
+    | "^="
+    | "<<="
+    | ">>="
+    | "++"
+    | "--"
+    | "?"
+    | ":"
+    | "??"
+    | "?."
+    | ".."
+    | "..=" ;
+
+
+(* ---------------------------------------------------------------- *)
+(* 6. Types                                                         *)
+(* ---------------------------------------------------------------- *)
+
+type =
+    primary-type , { type-modifier } ;
+
+primary-type =
+      primitive-type
+    | named-type
+    | generic-type
+    | function-type
+    | tuple-type
+    | any-type
+    | parenthesized-type ;
+
+
+primitive-type =
+      "int"
+    | "bool"
+    | "float"
+    | "double"
+    | "char"
+    | "string"
+    | "void" ;
+
+any-type =
+    "any" ;
+
+
+named-type =
+    qualified-name ;
+
+
+qualified-name =
+    identifier , { "::" , identifier } ;
+
+
+generic-type =
+    qualified-name , "<" , type-arguments , ">" ;
+
+type-arguments =
+    type , { "," , type } ;
+
+
+function-type =
+    "function" , "<" , [ type ] , "(" , [ type-list ] , ")" , ">" ;
+
+type-list =
+    type , { "," , type } ;
+
+
+tuple-type =
+    "(" , [ type , { "," , type } , [ "," ] ] , ")" ;
+
+
+parenthesized-type =
+    "(" , type , ")" ;
+
+
+type-modifier =
+      "?"
+    | "*"
+    | "[]" ;
+
+
+(* ---------------------------------------------------------------- *)
+(* 7. Generic Parameters and Constraints                            *)
+(* ---------------------------------------------------------------- *)
+
+generic-parameters =
+    "<" , generic-parameter , { "," , generic-parameter } , ">" ;
+
+generic-parameter =
+    identifier , [ ":" , constraint-list ] ;
+
+constraint-list =
+    type , { "," , type } ;
+
+
+where-clause =
+    "where" , where-constraint , { where-constraint } ;
+
+where-constraint =
+    type , ":" , constraint-list ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 8. Expressions                                                   *)
+(* ---------------------------------------------------------------- *)
+
+expression =
+    assignment-expression ;
+
+
+assignment-expression =
+    conditional-expression
+    | unary-expression , assignment-operator , assignment-expression ;
+
+
+assignment-operator =
+      "="
+    | "+="
+    | "-="
+    | "*="
+    | "/="
+    | "%="
+    | "&="
+    | "|="
+    | "^="
+    | "<<="
+    | ">>=" ;
+
+
+conditional-expression =
+    null-coalescing-expression
+    | null-coalescing-expression , "?" ,
+      expression , ":" , conditional-expression ;
+
+
+null-coalescing-expression =
+    logical-or-expression
+    | logical-or-expression , "??" , null-coalescing-expression ;
+
+
+logical-or-expression =
+    logical-and-expression
+    | logical-or-expression , "or" , logical-and-expression ;
+
+
+logical-and-expression =
+    bitwise-or-expression
+    | logical-and-expression , "and" , bitwise-or-expression ;
+
+
+bitwise-or-expression =
+    bitwise-xor-expression
+    | bitwise-or-expression , "|" , bitwise-xor-expression ;
+
+
+bitwise-xor-expression =
+    bitwise-and-expression
+    | bitwise-xor-expression , "^" , bitwise-and-expression ;
+
+
+bitwise-and-expression =
+    equality-expression
+    | bitwise-and-expression , "&" , equality-expression ;
+
+
+equality-expression =
+    relational-expression
+    | equality-expression , equality-operator , relational-expression ;
+
+
+equality-operator =
+      "is"
+    | "is not" ;
+
+
+relational-expression =
+    shift-expression
+    | relational-expression , relational-operator , shift-expression ;
+
+
+relational-operator =
+      "<"
+    | "<="
+    | ">"
+    | ">=" ;
+
+
+shift-expression =
+    additive-expression
+    | shift-expression , shift-operator , additive-expression ;
+
+
+shift-operator =
+      "<<"
+    | ">>" ;
+
+
+additive-expression =
+    multiplicative-expression
+    | additive-expression , additive-operator , multiplicative-expression ;
+
+
+additive-operator =
+      "+"
+    | "-" ;
+
+
+multiplicative-expression =
+    unary-expression
+    | multiplicative-expression , multiplicative-operator , unary-expression ;
+
+
+multiplicative-operator =
+      "*"
+    | "/"
+    | "%" ;
+
+
+unary-expression =
+      unary-operator , unary-expression
+    | postfix-expression ;
+
+unary-operator =
+      "++"
+    | "--"
+    | "+"
+    | "-"
+    | "~"
+    | "not" ;
+
+
+postfix-expression =
+    primary-expression , { postfix-operation } ;
+
+
+postfix-operation =
+      call-expression
+    | index-expression
+    | member-access
+    | nullable-member-access
+    | postfix-increment
+    | postfix-decrement ;
+
+
+call-expression =
+    "(" , [ argument-list ] , ")" ;
+
+argument-list =
+    argument , { "," , argument } ;
+
+argument =
+      expression
+    | named-argument
+    | "out" , [ type ] , identifier
+    | "ref" , expression ;
+
+named-argument =
+    identifier , ":" , expression ;
+
+
+index-expression =
+    "[" , index-or-range , "]" ;
+
+index-or-range =
+      expression
+    | range-expression
+    | [ expression ] , range-operator , [ expression ] ;
+
+
+range-expression =
+    expression , range-operator , expression ;
+
+range-operator =
+      ".."
+    | "..=" ;
+
+
+member-access =
+    "." , identifier ;
+
+nullable-member-access =
+    "?." , identifier ;
+
+postfix-increment =
+    "++" ;
+
+postfix-decrement =
+    "--" ;
+
+
+primary-expression =
+      literal
+    | identifier-expression
+    | qualified-expression
+    | "this"
+    | "super"
+    | closure-expression
+    | match-expression
+    | struct-expression
+    | enum-variant-expression
+    | tuple-expression
+    | parenthesized-expression ;
+
+
+identifier-expression =
+    identifier ;
+
+
+qualified-expression =
+    qualified-name ;
+
+
+literal =
+      integer-literal
+    | floating-literal
+    | character-literal
+    | string-literal
+    | "true"
+    | "false"
+    | "null" ;
+
+
+parenthesized-expression =
+    "(" , expression , ")" ;
+
+
+tuple-expression =
+    "(" , [ expression , { "," , expression } , [ "," ] ] , ")" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 9. Closures                                                      *)
+(* ---------------------------------------------------------------- *)
+
+closure-expression =
+    "|" , [ closure-parameters ] , "|" ,
+    closure-body ;
+
+closure-parameters =
+    closure-parameter , { "," , closure-parameter } ;
+
+closure-parameter =
+      identifier
+    | type , identifier ;
+
+closure-body =
+      "=>" , expression
+    | block ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 10. Match                                                        *)
+(* ---------------------------------------------------------------- *)
+
+match-expression =
+    "match" , expression , "do" ,
+    { match-arm } ,
+    "end" ;
+
+match-arm =
+    pattern , [ guard ] , "->" , match-arm-body ;
+
+match-arm-body =
+      expression
+    | block ;
+
+guard =
+    "if" , expression ;
+
+
+pattern =
+    pattern-alternative ;
+
+pattern-alternative =
+    pattern-primary , { "|" , pattern-primary } ;
+
+pattern-primary =
+      "_"
+    | literal
+    | identifier
+    | enum-pattern
+    | tuple-pattern ;
+
+enum-pattern =
+      "." , identifier , [ "(" , [ pattern-list ] , ")" ]
+    | qualified-name , "." , identifier ,
+      [ "(" , [ pattern-list ] , ")" ]
+    | identifier , "(" , [ pattern-list ] , ")" ;
+
+pattern-list =
+    pattern , { "," , pattern } ;
+
+
+tuple-pattern =
+    "(" , pattern , { "," , pattern } , [ "," ] , ")" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 11. Struct Construction                                          *)
+(* ---------------------------------------------------------------- *)
+
+struct-expression =
+    type , "has" ,
+    { struct-field-initializer } ,
+    "end" ;
+
+struct-field-initializer =
+    identifier , "=" , expression ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 12. Enum Variant Construction                                    *)
+(* ---------------------------------------------------------------- *)
+
+enum-variant-expression =
+      "." , identifier
+    | "." , identifier , "(" , [ argument-list ] , ")"
+    | qualified-name , "." , identifier
+    | qualified-name , "." , identifier ,
+      "(" , [ argument-list ] , ")" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 13. Statements                                                    *)
+(* ---------------------------------------------------------------- *)
+
+statement =
+      expression-statement
+    | variable-declaration
+    | constant-declaration
+    | destructuring-declaration
+    | destructuring-assignment
+    | if-statement
+    | match-statement
+    | while-statement
+    | loop-statement
+    | for-statement
+    | break-statement
+    | continue-statement
+    | return-statement
+    | defer-statement
+    | assert-statement
+    | block ;
+
+
+expression-statement =
+    expression , statement-terminator ;
+
+
+statement-terminator =
+    newline
+  | ";" ;
+
+
+block =
+    "do" , { statement } , "end" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 14. Variable Declarations                                        *)
+(* ---------------------------------------------------------------- *)
+
+variable-declaration =
+    [ visibility-modifier ] ,
+    type , identifier ,
+    [ "=" , expression ] ,
+    statement-terminator ;
+
+
+constant-declaration =
+    [ visibility-modifier ] ,
+    "const" ,
+    [ type ] ,
+    identifier ,
+    "=" , expression ,
+    statement-terminator ;
+
+
+destructuring-declaration =
+    destructuring-target ,
+    "=" , expression ,
+    statement-terminator ;
+
+destructuring-target =
+    identifier , { "," , identifier | "," , "_" } ;
+
+destructuring-assignment =
+    destructuring-target ,
+    "=" , expression ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 15. Conditionals                                                 *)
+(* ---------------------------------------------------------------- *)
+
+if-statement =
+    "if" , [ "(" ] , expression , [ ")" ] ,
+    block ,
+    { "else" , "if" , [ "(" ] , expression , [ ")" ] , block } ,
+    [ "else" , block ] ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 16. Match Statement                                               *)
+(* ---------------------------------------------------------------- *)
+
+match-statement =
+    "match" , expression , "do" ,
+    { match-arm } ,
+    "end" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 17. Loops                                                         *)
+(* ---------------------------------------------------------------- *)
+
+while-statement =
+    "while" , [ "(" ] , expression , [ ")" ] ,
+    block ;
+
+
+loop-statement =
+    [ loop-label ] ,
+    "loop" ,
+    block ;
+
+
+for-statement =
+    [ loop-label ] ,
+    "for" , identifier , "in" , expression ,
+    block ;
+
+
+loop-label =
+    identifier , ":" ;
+
+
+break-statement =
+    "break" , [ identifier ] ,
+    statement-terminator ;
+
+
+continue-statement =
+    "continue" , [ identifier ] ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 18. Return                                                       *)
+(* ---------------------------------------------------------------- *)
+
+return-statement =
+    "return" , [ expression ] ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 19. Defer                                                        *)
+(* ---------------------------------------------------------------- *)
+
+defer-statement =
+    "defer" ,
+    ( expression , statement-terminator | block ) ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 20. Assertions                                                    *)
+(* ---------------------------------------------------------------- *)
+
+assert-statement =
+      "assert" , expression , [ "," , expression ] ,
+      statement-terminator
+
+    | "debug_assert" , expression , [ "," , expression ] ,
+      statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 21. Functions                                                     *)
+(* ---------------------------------------------------------------- *)
+
+function-declaration =
+    [ visibility-modifier ] ,
+    [ "static" ] ,
+    [ "sealed" ] ,
+    [ "override" ] ,
+    type , identifier ,
+    [ generic-parameters ] ,
+    "(" , [ parameter-list ] , ")" ,
+    [ where-clause ] ,
+    function-body ;
+
+
+function-body =
+      block
+    | "initialize" , statement-terminator ;
+
+
+parameter-list =
+    parameter , { "," , parameter } ;
+
+parameter =
+    [ parameter-mode ] ,
+    type , identifier ,
+    [ "=" , expression ] ;
+
+parameter-mode =
+      "ref"
+    | "out" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 22. Classes                                                       *)
+(* ---------------------------------------------------------------- *)
+
+class-declaration =
+    [ visibility-modifier ] ,
+    [ "open" ] ,
+    "class" , identifier ,
+    [ generic-parameters ] ,
+    [ "extends" , type ] ,
+    [ "implements" , trait-list ] ,
+    "has" ,
+    { class-member } ,
+    "end" ;
+
+
+trait-list =
+    type , { "," , type } ;
+
+
+class-member =
+      field-declaration
+    | function-declaration
+    | constructor-declaration
+    | destructor-declaration
+    | property-declaration
+    | operator-declaration
+    | conversion-declaration
+    | constant-declaration ;
+
+
+field-declaration =
+    [ visibility-modifier ] ,
+    type , identifier ,
+    [ "=" , expression ] ,
+    statement-terminator ;
+
+
+constructor-declaration =
+    [ visibility-modifier ] ,
+    identifier ,
+    "(" , [ parameter-list ] , ")" ,
+    "initialize" ,
+    [ block ] ;
+
+
+destructor-declaration =
+    [ visibility-modifier ] ,
+    "~" , identifier ,
+    "(" , ")" ,
+    block ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 23. Properties                                                    *)
+(* ---------------------------------------------------------------- *)
+
+property-declaration =
+    [ visibility-modifier ] ,
+    type , identifier ,
+    property-getter ,
+    [ property-setter ]
+
+  | [ visibility-modifier ] ,
+    identifier ,
+    property-setter ,
+    [ property-getter ] ;
+
+
+property-getter =
+    "get" , block ;
+
+
+property-setter =
+    "set" , "(" , parameter , ")" , block ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 24. Structs                                                       *)
+(* ---------------------------------------------------------------- *)
+
+struct-declaration =
+    [ visibility-modifier ] ,
+    "struct" , identifier ,
+    [ generic-parameters ] ,
+    "has" ,
+    { struct-member } ,
+    "end" ;
+
+
+struct-member =
+    [ visibility-modifier ] ,
+    type , identifier ,
+    [ "=" , expression ] ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 25. Traits                                                        *)
+(* ---------------------------------------------------------------- *)
+
+trait-declaration =
+    [ visibility-modifier ] ,
+    "trait" , identifier ,
+    [ generic-parameters ] ,
+    "has" ,
+    { trait-member } ,
+    "end" ;
+
+
+trait-member =
+    function-signature ;
+
+
+function-signature =
+    [ "sealed" ] ,
+    type , identifier ,
+    [ generic-parameters ] ,
+    "(" , [ parameter-list ] , ")" ,
+    [ where-clause ] ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 26. Operators                                                     *)
+(* ---------------------------------------------------------------- *)
+
+operator-declaration =
+    [ visibility-modifier ] ,
+    [ "static" ] ,
+    "operator" , operator-symbol ,
+    "(" , [ parameter-list ] , ")" ,
+    [ where-clause ] ,
+    block ;
+
+
+operator-symbol =
+      "+"
+    | "-"
+    | "*"
+    | "/"
+    | "%"
+    | "<"
+    | "<="
+    | ">"
+    | ">="
+    | "is"
+    | "is not"
+    | "&"
+    | "|"
+    | "^"
+    | "~"
+    | "<<"
+    | ">>"
+    | "="
+    | "+="
+    | "-="
+    | "*="
+    | "/="
+    | "%="
+    | "&="
+    | "|="
+    | "^="
+    | "<<="
+    | ">>="
+    | "++"
+    | "--"
+    | "[]" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 27. Conversions                                                   *)
+(* ---------------------------------------------------------------- *)
+
+conversion-declaration =
+    [ visibility-modifier ] ,
+    [ "explicit" ] ,
+    "convert" ,
+    type ,
+    "to" ,
+    type ,
+    block ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 28. Enums                                                         *)
+(* ---------------------------------------------------------------- *)
+
+enum-declaration =
+    [ visibility-modifier ] ,
+    "enum" , identifier ,
+    [ generic-parameters ] ,
+    "has" ,
+    { enum-variant } ,
+    "end" ;
+
+
+enum-variant =
+    identifier ,
+    [ "=" , expression ] ,
+    [ "(" , [ parameter-list ] , ")" ] ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 29. Type Aliases                                                  *)
+(* ---------------------------------------------------------------- *)
+
+typedef-declaration =
+    [ visibility-modifier ] ,
+    "typedef" ,
+    [ generic-parameters ] ,
+    identifier ,
+    "=" ,
+    type ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 30. Distinct Types                                                *)
+(* ---------------------------------------------------------------- *)
+
+distinct-declaration =
+    [ visibility-modifier ] ,
+    "distinct" ,
+    identifier ,
+    [ generic-parameters ] ,
+    "=" ,
+    type ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 31. Extensions                                                    *)
+(* ---------------------------------------------------------------- *)
+
+extension-declaration =
+    "extend" ,
+    type ,
+    "do" ,
+    { extension-member } ,
+    "end" ;
+
+
+extension-member =
+      field-declaration
+    | function-declaration
+    | operator-declaration
+    | property-declaration
+    | conversion-declaration ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 32. Modules                                                       *)
+(* ---------------------------------------------------------------- *)
+
+import-declaration =
+    "import" ,
+    qualified-name ,
+    [ "::" , "{" , import-list , "}" ] ,
+    statement-terminator ;
+
+
+import-list =
+    identifier , { "," , identifier } ;
+
+
+visibility-modifier =
+      "public"
+    | "private" ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 33. Module Initialization                                        *)
+(* ---------------------------------------------------------------- *)
+
+init-block =
+    "init" , block ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 34. Attributes                                                    *)
+(* ---------------------------------------------------------------- *)
+
+attribute =
+    "@" , identifier ,
+    [ "(" , [ attribute-arguments ] , ")" ] ;
+
+attribute-arguments =
+    attribute-argument ,
+    { "," , attribute-argument } ;
+
+attribute-argument =
+      expression
+    | identifier , ":" , expression ;
+
+
+attributed-declaration =
+    { attribute } ,
+    top-level-declaration ;
+
+
+(* ---------------------------------------------------------------- *)
+(* 35. Top-Level Declarations                                       *)
+(* ---------------------------------------------------------------- *)
+
+top-level-declaration =
+      function-declaration
+    | class-declaration
+    | struct-declaration
+    | trait-declaration
+    | enum-declaration
+    | typedef-declaration
+    | distinct-declaration
+    | extension-declaration
+    | import-declaration
+    | constant-declaration
+    | variable-declaration
+    | attributed-declaration ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 36. FFI                                                           *)
+(* ---------------------------------------------------------------- *)
+
+extern-declaration =
+    [ visibility-modifier ] ,
+    "extern" ,
+    string-literal ,
+    "from" ,
+    string-literal ,
+    "do" ,
+    { extern-member } ,
+    "end" ;
+
+
+extern-member =
+      extern-function
+    | extern-struct
+    | extern-enum
+    | extern-constant ;
+
+
+extern-function =
+    type , identifier ,
+    "(" , [ extern-parameter-list ] , ")" ,
+    statement-terminator ;
+
+
+extern-parameter-list =
+    extern-parameter , { "," , extern-parameter } ;
+
+extern-parameter =
+    type , identifier ;
+
+
+extern-struct =
+    "struct" , identifier ,
+    [ "has" , { extern-field } , "end" ] ;
+
+
+extern-field =
+    type , identifier ,
+    statement-terminator ;
+
+
+extern-enum =
+    "enum" , identifier ,
+    "has" ,
+    { enum-variant } ,
+    "end" ;
+
+
+extern-constant =
+    "const" , type , identifier ,
+    statement-terminator ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 37. Program Entry                                                *)
+(* ---------------------------------------------------------------- *)
+
+main-function =
+      "void" , "main" ,
+      "(" , ")" ,
+      block
+
+    | "int" , "main" ,
+      "(" , "string[]" , "args" , ")" ,
+      block ;
+
+
+
+(* ---------------------------------------------------------------- *)
+(* 38. Special Names                                                 *)
+(* ---------------------------------------------------------------- *)
+
+special-name =
+      "this"
+    | "super"
+    | "Self" ;

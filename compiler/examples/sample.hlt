@@ -1,0 +1,15 @@
+int main() do
+    int x = 42
+    int y = 0xFF
+    int z = 0b1010
+    bool b = true
+    // line comment
+    /* block comment */
+    if (x > y) do
+        y = y + 1;
+    end
+    while (x > 0) do
+        x = x - 1
+    end
+    return y
+end
