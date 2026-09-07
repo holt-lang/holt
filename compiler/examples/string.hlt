@@ -1,0 +1,6 @@
+int main() do
+    string s = "hello"
+    char c = 'A'
+    // string indexing not required for Phase 2 demo, just ensure types compile
+    return 0
+end

@@ -21,7 +21,12 @@ pub struct LexDiagnostic {
 }
 
 impl LexDiagnostic {
-    pub fn new(filename: String, source: String, span: Span, slice: String) -> Self {
+    pub fn new(
+        filename: String,
+        source: String,
+        span: Span,
+        slice: String,
+    ) -> Self {
         Self {
             src: NamedSource::new(filename, source),
             span: span.to_source_span(),
@@ -43,7 +48,11 @@ pub struct MultiLexError {
 }
 
 impl MultiLexError {
-    pub fn from_parts(filename: String, source: String, errors: Vec<(Span, String)>) -> Self {
+    pub fn from_parts(
+        filename: String,
+        source: String,
+        errors: Vec<(Span, String)>,
+    ) -> Self {
         let diagnostics = errors
             .into_iter()
             .map(|(span, slice)| LexDiagnostic {
@@ -75,8 +84,17 @@ pub struct SingleDiagnostic {
 }
 
 impl SingleDiagnostic {
-    pub fn new(filename: String, source: String, span: Span, message: String) -> Self {
-        Self { src: NamedSource::new(filename, source), span: span.to_source_span(), message }
+    pub fn new(
+        filename: String,
+        source: String,
+        span: Span,
+        message: String,
+    ) -> Self {
+        Self {
+            src: NamedSource::new(filename, source),
+            span: span.to_source_span(),
+            message,
+        }
     }
 }
 
@@ -91,8 +109,27 @@ pub struct MultiDiagnostic {
 }
 
 impl MultiDiagnostic {
-    pub fn from_errors(filename: String, source: String, errs: Vec<(Span, String)>, message: String) -> Self {
-        let errors = errs.into_iter().map(|(span, msg)| SingleDiagnostic::new(filename.clone(), source.clone(), span, msg)).collect();
-        Self { src: NamedSource::new(filename, source), errors, message }
+    pub fn from_errors(
+        filename: String,
+        source: String,
+        errs: Vec<(Span, String)>,
+        message: String,
+    ) -> Self {
+        let errors = errs
+            .into_iter()
+            .map(|(span, msg)| {
+                SingleDiagnostic::new(
+                    filename.clone(),
+                    source.clone(),
+                    span,
+                    msg,
+                )
+            })
+            .collect();
+        Self {
+            src: NamedSource::new(filename, source),
+            errors,
+            message,
+        }
     }
 }

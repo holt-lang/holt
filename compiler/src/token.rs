@@ -41,7 +41,7 @@ fn newline_callback(lex: &mut logos::Lexer<Token>) -> bool {
 /// All Holt tokens. Keywords are matched before `Ident` via `#[token]` priority.
 #[derive(Logos, Debug, Clone, PartialEq, Eq, Hash)]
 #[logos(skip r"[ \t\f]+")] // whitespace except newline; newlines are significant
-#[logos(skip r"//[^\n]*")]  // line comments
+#[logos(skip r"//[^\n]*")] // line comments
 #[logos(skip r"/\*([^*]|\*[^/])*\*/")] // block comments (non-nested)
 pub enum Token {
     // ── Statement terminator support ──────────────────────────────────
@@ -290,7 +290,8 @@ pub enum Token {
     // Full parser-phase splitting happens in parse/, not the lexer (per SKILL.md).
     #[regex(r#""([^"\\\n]|\\.)*""#)]
     StringLit,
-    #[regex(r#"""""#)] // placeholder — multiline handled as separate below when content present
+    #[regex(r#"""""#)]
+    // placeholder — multiline handled as separate below when content present
     TripleQuote,
     #[regex(r#"'([^'\\\n]|\\.)*'"#)]
     CharLit,
@@ -301,7 +302,6 @@ pub enum Token {
     // ── Identifier (must be last among word-like patterns) ────────────
     #[regex(r"[A-Za-z_][A-Za-z0-9_]*")]
     Ident,
-
     // ── Errors are injected by the lexer wrapper (Logos `Error`) ─────
     // We surface them as a distinct variant via the lexer's Result.
 }

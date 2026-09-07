@@ -1,0 +1,19 @@
+int fizzbuzz(int n) do
+    return match n is 0 do
+        true -> 0
+        false -> match n % 3 is 0 do
+            true -> match n % 5 is 0 do
+                true -> 15
+                false -> 3
+            end
+            false -> match n % 5 is 0 do
+                true -> 5
+                false -> n
+            end
+        end
+    end
+end
+
+int main() do
+    return fizzbuzz(15)
+end

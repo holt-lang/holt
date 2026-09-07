@@ -21,7 +21,11 @@ pub struct LexError {
 
 impl std::fmt::Display for LexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unexpected token `{}` at {}..{}", self.slice, self.span.start, self.span.end)
+        write!(
+            f,
+            "unexpected token `{}` at {}..{}",
+            self.slice, self.span.start, self.span.end
+        )
     }
 }
 
@@ -64,7 +68,8 @@ mod tests {
         let out = lex("int x\nint y;");
         assert!(out.errors.is_empty());
         // int, x, newline, int, y, ;
-        let kinds: Vec<_> = out.tokens.iter().map(|t| format!("{}", t.token)).collect();
+        let kinds: Vec<_> =
+            out.tokens.iter().map(|t| format!("{}", t.token)).collect();
         assert!(kinds.contains(&"<newline>".to_string()));
     }
 
@@ -96,10 +101,9 @@ mod tests {
                 Token::Do,
                 Token::End,
                 Token::Has
-            ]
-            // Note: `Has` is not a reserved keyword in EBNF §2, but `has` is a structural
-            // delimiter. We keep it as a keyword for phase 1+; fallback is ident if not added.
-            // If this fails, you'll need to extend Token with Has.
+            ] // Note: `Has` is not a reserved keyword in EBNF §2, but `has` is a structural
+              // delimiter. We keep it as a keyword for phase 1+; fallback is ident if not added.
+              // If this fails, you'll need to extend Token with Has.
         );
     }
 }

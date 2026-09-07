@@ -1,0 +1,15 @@
+int main() do
+    int i = 0
+    int sum = 0
+    while (i < 10) do
+        i = i + 1
+        if (i is 5) do
+            continue
+        end
+        if (i is 8) do
+            break
+        end
+        sum = sum + i
+    end
+    return sum
+end

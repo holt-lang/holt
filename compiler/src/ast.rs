@@ -38,13 +38,26 @@ pub enum Type {
     Int(Span),
     Bool(Span),
     Void(Span),
-    Named(String, Span), // Phase 2: struct name
+    String(Span),
+    Char(Span),
+    Named(String, Span),       // Phase 2: struct name
+    Array(Box<Type>, Span),    // T[]  (Phase 2)
+    Pointer(Box<Type>, Span),  // T*  (Phase 2)
+    Optional(Box<Type>, Span), // T? (Phase 2 future)
 }
 
 impl Type {
     pub fn span(&self) -> Span {
         match self {
-            Type::Int(s) | Type::Bool(s) | Type::Void(s) | Type::Named(_, s) => *s,
+            Type::Int(s)
+            | Type::Bool(s)
+            | Type::Void(s)
+            | Type::String(s)
+            | Type::Char(s)
+            | Type::Named(_, s)
+            | Type::Array(_, s)
+            | Type::Pointer(_, s)
+            | Type::Optional(_, s) => *s,
         }
     }
     pub fn name(&self) -> String {
@@ -52,7 +65,12 @@ impl Type {
             Type::Int(_) => "int".into(),
             Type::Bool(_) => "bool".into(),
             Type::Void(_) => "void".into(),
+            Type::String(_) => "string".into(),
+            Type::Char(_) => "char".into(),
             Type::Named(n, _) => n.clone(),
+            Type::Array(el, _) => format!("{}[]", el.name()),
+            Type::Pointer(el, _) => format!("{}*", el.name()),
+            Type::Optional(el, _) => format!("{}?", el.name()),
         }
     }
     pub fn is_void(&self) -> bool {
@@ -91,6 +109,8 @@ pub enum Stmt {
     Return(ReturnStmt),
     Expr(ExprStmt),
     Block(Block),
+    Break(BreakStmt),
+    Continue(ContinueStmt),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +149,16 @@ pub struct ExprStmt {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakStmt {
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinueStmt {
+    pub span: Span,
+}
+
 // ── Expressions (§8) ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,27 +171,94 @@ pub struct Expr {
 pub enum ExprKind {
     IntLit(i64),
     BoolLit(bool),
+    StringLit(String),
+    CharLit(char),
     Ident(String),
     Paren(Box<Expr>),
-    Unary { op: UnaryOp, expr: Box<Expr> },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Assign { lhs: Box<Expr>, value: Box<Expr> },
-    Call { callee: String, callee_span: Span, args: Vec<Expr> },
-    MemberAccess { object: Box<Expr>, field: String, field_span: Span },
-    StructLit { ty: Type, fields: Vec<(String, Span, Expr)> }, // Type has field = expr ... end
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Assign {
+        lhs: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Call {
+        callee: String,
+        callee_span: Span,
+        args: Vec<Expr>,
+    },
+    MemberAccess {
+        object: Box<Expr>,
+        field: String,
+        field_span: Span,
+    },
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    }, // a[i] Phase 2
+    StructLit {
+        ty: Type,
+        fields: Vec<(String, Span, Expr)>,
+    }, // Type has field = expr ... end
+    Match(MatchExpr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
-    Neg,      // -
-    Not,      // not
-    Pos,      // + (unary plus, no-op)
+    Neg, // -
+    Not, // not
+    Pos, // + (unary plus, no-op)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod,
-    Lt, Le, Gt, Ge,
-    Is, IsNot, // "is" / "is not"
-    And, Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Is,
+    IsNot, // "is" / "is not"
+    And,
+    Or,
+}
+
+// Phase 2: simple match (EBNF §10, §16)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchExpr {
+    pub scrutinee: Box<Expr>,
+    pub arms: Vec<MatchArm>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: MatchArmBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pattern {
+    Wildcard(Span), // _
+    LitInt(i64, Span),
+    LitBool(bool, Span),
+    // For Phase 2 we ignore enum/tuple patterns
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchArmBody {
+    Expr(Box<Expr>),
+    Block(Block), // `do ... end` – evaluated for value via last expr? For now treat as block with return
 }
