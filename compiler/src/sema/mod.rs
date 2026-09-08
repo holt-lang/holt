@@ -981,17 +981,21 @@ impl Checker {
                 }
             }
         }
-        // Validate main per EBNF §37: `void main()` or `int main(string[] args)`
+        // Validate main per EBNF §37: `void main()` or `int main()` or `void main(string[] args)` or `int main(string[] args)` (return and args independent)
         if let Some(main) = self.funcs.get("main").cloned() {
             let is_void_main = main.ret == Ty::Void && main.params.is_empty();
+            let is_void_main_with_args = main.ret == Ty::Void
+                && main.params.len() == 1
+                && main.params[0] == Ty::Array(Box::new(Ty::String))
+                && main.param_names.get(0).map(|s| s == "args").unwrap_or(false);
             let is_int_main_no_args = main.ret == Ty::Int && main.params.is_empty();
             let is_int_main_with_args = main.ret == Ty::Int
                 && main.params.len() == 1
                 && main.params[0] == Ty::Array(Box::new(Ty::String))
                 && main.param_names.get(0).map(|s| s == "args").unwrap_or(false);
-            if !(is_void_main || is_int_main_no_args || is_int_main_with_args)
+            if !(is_void_main || is_void_main_with_args || is_int_main_no_args || is_int_main_with_args)
             {
-                self.errors.push(SemError{message: format!("invalid `main` signature: expected `void main()` or `int main()` or `int main(string[] args)`, found `{} main({})`", main.ret, main.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")), span: main.span});
+                self.errors.push(SemError{message: format!("invalid `main` signature: expected `void main()` or `int main()` or `void main(string[] args)` or `int main(string[] args)`, found `{} main({})`", main.ret, main.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")), span: main.span});
             }
         } else {
             self.errors.push(SemError {

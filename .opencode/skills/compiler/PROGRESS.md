@@ -153,13 +153,13 @@
 
 ## T-18 DONE — 2026-09-09 (top-level `var` + `int main(string[] args)`)
 
-- **Goal:** `top-level-declaration = variable-declaration | constant-declaration` per EBNF §35 + `main-function = void main() | int main(string[] args)` per §37.
+- **Goal:** `top-level-declaration = variable-declaration | constant-declaration` per EBNF §35 + `main-function = void main() | int main() | void main(string[] args) | int main(string[] args)` per §37 (return `void`/`int` independent of `string[] args`).
 - **Done:**
   - `compiler/src/ast.rs:35` `Item::Var(VarDecl)` + `430` `VarDecl {visibility}`.
   - `compiler/src/parse/mod.rs:1738` `is_var_decl_start` (`[vis] type ident` not `(`) + `1762` `parse_var_decl` (`[vis] type ident [= expr]` via `parse_visibility`) + `251` `At` inner `Var` + `283` top-level `is_var_decl_start` → `Item::Var`.
-  - `compiler/src/sema/mod.rs:842` `Item::Var` global `declare_var` + `Attributed` `Var`/`Const` + `984` `main` `void main()`/`int main()`/`int main(string[] args)` (`string[]` `Array(String)` `args` check).
-  - `compiler/src/codegen/mod.rs:695` `declare_const` `StringLit` via `const_string` + `730` `declare_global_var` (`const_string` for `string` global `gep`) + `960` `declare_function` `main(string[] args)` as `i32 ()` + `1254` `codegen_function` `is_main_with_args` `args` alloca `[16 x ptr]` zero.
-  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_top3.hlt` `int x=42` `public string s="hello"` `int main(string[] args)` → `hello`/`42`/`100`, `int main(string[] args)` with `args[0]` as `string[]` now accepted.
+  - `compiler/src/sema/mod.rs:842` `Item::Var` global `declare_var` + `Attributed` `Var`/`Const` + `984` `main` `void main()`/`void main(string[] args)`/`int main()`/`int main(string[] args)` (`void`/`int` independent of `string[] args` `Array(String)` `args`).
+  - `compiler/src/codegen/mod.rs:695` `declare_const` `StringLit` via `const_string` + `730` `declare_global_var` (`const_string` for `string` global `gep`) + `960` `declare_function` `main(*args)` as `i32 ()`/`void ()` (`void`/`int` + `args` → `i32`/`void` `()` with `args` local) + `1254` `codegen_function` `is_main_with_args` `args` alloca `[16 x ptr]` zero.
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_top3.hlt` `int x=42` `public string s="hello"` `int main(string[] args)` → `hello`/`42`/`100`, `void main(string[] args)` + all four `main` combos now accepted.
 
 ## Next — T-19
 
