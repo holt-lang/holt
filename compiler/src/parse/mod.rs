@@ -422,6 +422,90 @@ impl Parser {
         Ok(ConstDecl { visibility: vis, ty, name, name_span, init, span })
     }
 
+    fn is_destructure_start(&self) -> bool {
+        // Check for `a, b` or `a, _` then `=` pattern
+        // Must start with Ident, then `,` then Ident or `_`, then eventually `=`
+        if self.tokens.get(self.pos).map(|t| t.token == Token::Ident).unwrap_or(false) {
+            let mut p = self.pos + 1;
+            // need at least one `,`
+            if p >= self.tokens.len() || self.tokens[p].token != Token::Comma {
+                return false;
+            }
+            // after `,`, must have Ident or `_` (where `_` is Ident with slice "_")
+            // Check for `_` as Ident "_" ?
+            // In Holt, `_` is wildcard, lexed as Ident with text "_" ?
+            // We'll treat "_" as Ident "_" as well, but need to check
+            p += 1;
+            if p >= self.tokens.len() { return false; }
+            let is_ident_or_underscore = self.tokens[p].token == Token::Ident || {
+                // Check if slice is "_"
+                // For now, "_" is lexed as Ident with text "_", so token is Ident
+                false
+            };
+            if !is_ident_or_underscore && self.tokens[p].token != Token::Ident {
+                // Check for "_" as wildcard: it may be lexed as Ident "_" as well
+                // We'll just check token is Ident and slice "_"
+                return false;
+            }
+            // Now scan ahead for `=` after possible `, ident/_` repeats, skipping `,` and Ident/`_`
+            // We need to find `=` after the destructuring target
+            // Destructuring target is `a, b, _, c` etc, then `=`
+            // So we can simulate: starting at pos, we have `a , b , _ , c =`
+            // We need to ensure after the comma-separated list, next is `=`
+            // For simplicity, check if after the first `, Ident` we eventually hit `=` before `;` or newline
+            let mut q = p + 1;
+            while q < self.tokens.len() {
+                match self.tokens[q].token {
+                    Token::Comma => {
+                        q += 1;
+                        if q < self.tokens.len() && self.tokens[q].token == Token::Ident {
+                            // Could be Ident or "_" (both Ident)
+                            q += 1;
+                            continue;
+                        } else {
+                            return false;
+                        }
+                    }
+                    Token::Eq => return true,
+                    Token::Newline | Token::Semicolon => return false,
+                    _ => return false,
+                }
+            }
+            return false;
+        }
+        false
+    }
+
+    fn parse_destructure(&mut self) -> Result<DestructureStmt, ParseError> {
+        let start = self.peek_span().start;
+        let mut targets = Vec::new();
+        // first must be Ident
+        let (first, fspan) = self.parse_ident()?;
+        targets.push(DestructureTarget::Ident(first, fspan));
+        while self.consume_if(Token::Comma) {
+            // After comma, expect Ident or `_` (wildcard)
+            // `_` is lexed as Ident with text "_"
+            if self.peek_token() == Some(&Token::Ident) {
+                let tok = self.peek().unwrap().clone();
+                let slice = self.slice(tok.span);
+                if slice == "_" {
+                    self.advance();
+                    targets.push(DestructureTarget::Wildcard(tok.span));
+                } else {
+                    let (n, ns) = self.parse_ident()?;
+                    targets.push(DestructureTarget::Ident(n, ns));
+                }
+            } else {
+                return Err(ParseError { message: "expected identifier or `_` after `,` in destructuring".into(), span: self.peek_span() });
+            }
+        }
+        self.expect(Token::Eq, "expected `=` after destructuring target")?;
+        let expr = self.parse_expr()?;
+        self.expect_terminator("destructuring")?;
+        let span = Span::new(start, expr.span.end);
+        Ok(DestructureStmt { targets, expr, span })
+    }
+
     fn parse_visibility(&mut self) -> Visibility {
         match self.peek_token() {
             Some(Token::Public) => { self.advance(); Visibility::Public },
@@ -1540,8 +1624,10 @@ impl Parser {
                 }
             }
             _ => {
-                // Try var-decl detection: type (int/bool/void or Named Ident) + Ident + (= or terminator)
-                if self.is_var_decl_start() {
+                if self.is_destructure_start() {
+                    let d = self.parse_destructure()?;
+                    Ok(Stmt::Destructure(d))
+                } else if self.is_var_decl_start() {
                     let d = self.parse_var_decl()?;
                     Ok(Stmt::VarDecl(d))
                 } else {

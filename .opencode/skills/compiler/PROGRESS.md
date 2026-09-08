@@ -65,8 +65,18 @@
   - `compiler/src/codegen/mod.rs:31` `globals` + `lookup_var` `::`+global, `101` `compile_program` `Item::Const` declare, `540` `declare_const` global (`add_global` + `const_zero`/`int`/`bool`/`char`), `1403` `Stmt::Const` alloca+store (infer `ty` if None via `init_val.get_type()`).
   - **Verify:** `cargo test` 4 passed, `cargo check` 0 errors, `holt build examples/*.hlt` 6 ok, `/tmp/t8_test.hlt` `MAX/x/y/z` 100/42/5/10/115, `/tmp/t8_top.hlt` `public const` 123/456, `const y=5; y=6` error `cannot assign to const`.
 
-## Next — T-9
+## T-9 DONE — 2026-09-08 21:xx
 
-- **T-9 Statements: destructuring `a,b = expr` / `a,b,_ = expr` (decl + assign)** — `destructuring-target`.
-- Continue `T-9`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `destructuring-declaration` / `destructuring-assignment` `a,b = expr` / `a,b,_ = expr` per EBNF §14 `destructuring-target`.
+- **Done:**
+  - `compiler/src/ast.rs:388` `Stmt::Destructure` + `DestructureStmt {targets: Vec<DestructureTarget>}` (`Ident`/`Wildcard` for `_`).
+  - `compiler/src/parse/mod.rs:400` `is_destructure_start` + `parse_destructure` (`a, b, _ = expr` with `,`+`Ident`/`_`+`=`+`expr`), `parse_stmt` `Destructure` before `VarDecl`.
+  - `compiler/src/sema/mod.rs:1010` `Stmt::Destructure` ( `Tuple`/`Array` element types, `Wildcard` skip, `declare_var` for new `Ident` else `is_const` check, mismatch check).
+  - `compiler/src/codegen/mod.rs:1529` `Stmt::Destructure` ( `codegen_expr` tuple/array value, `extract_value` per `idx` for `Ident`, `lookup_var` for existing vs `create_entry_block_alloca` for new).
+  - **Verify:** `cargo test` 4 passed, `cargo check` 0 errors, `holt build examples/*.hlt` 6 ok, `/tmp/t9_test2.hlt` `a,b=(10,20)`→10/20, `c,d=(5,6)`→5/6, `e,_,f=(7,8,9)`→7/9, `/tmp/t9_arr.hlt` `x,y,_=arr` 100/200.
+
+## Next — T-10
+
+- **T-10 Statements: `assert` / `debug_assert expr [,expr];`** — `assert` as statement.
+- Continue `T-10`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
 

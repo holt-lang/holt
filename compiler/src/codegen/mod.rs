@@ -1549,6 +1549,37 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(alloca, init_val).unwrap();
                 Ok(false)
             }
+            Stmt::Destructure(d) => {
+                let val = self.codegen_expr(&d.expr)?;
+                let val_ty = val.get_type();
+                for (idx, target) in d.targets.iter().enumerate() {
+                    match target {
+                        DestructureTarget::Wildcard(_) => {},
+                        DestructureTarget::Ident(name, _) => {
+                            // Extract element at idx from tuple/array value
+                            let elem_val = if val_ty.is_struct_type() {
+                                self.builder.build_extract_value(val.into_struct_value(), idx as u32, &format!("destructure.{}", name)).unwrap()
+                            } else if val_ty.is_array_type() {
+                                self.builder.build_extract_value(val.into_array_value(), idx as u32, &format!("destructure.{}", name)).unwrap()
+                            } else {
+                                // fallback: if val is not struct/array, try to extract as struct (tuple)
+                                // For array stored as [16 x i64], extract_value works as above
+                                // If val is pointer (should not happen), load?
+                                val
+                            };
+                            // Check if var already exists (assign) or new (decl)
+                            if let Some((ptr, _)) = self.lookup_var(name) {
+                                self.builder.build_store(ptr, elem_val).unwrap();
+                            } else {
+                                let alloca = self.create_entry_block_alloca(name, elem_val.get_type());
+                                self.builder.build_store(alloca, elem_val).unwrap();
+                                self.vars.last_mut().unwrap().insert(name.clone(), (alloca, elem_val.get_type()));
+                            }
+                        }
+                    }
+                }
+                Ok(false)
+            }
             Stmt::Expr(e) => {
                 let _ = self.codegen_expr(&e.expr)?;
                 Ok(false)

@@ -387,6 +387,7 @@ pub struct Block {
 pub enum Stmt {
     VarDecl(VarDecl),
     Const(ConstDecl),
+    Destructure(DestructureStmt),
     If(IfStmt),
     While(WhileStmt),
     Loop(LoopStmt),
@@ -397,6 +398,19 @@ pub enum Stmt {
     Break(BreakStmt),
     Continue(ContinueStmt),
     Defer(DeferStmt),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestructureStmt {
+    pub targets: Vec<DestructureTarget>,
+    pub expr: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestructureTarget {
+    Ident(String, Span),
+    Wildcard(Span),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

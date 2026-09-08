@@ -1008,6 +1008,49 @@ impl Checker {
                 self.declare_const(&c.name, decl_ty, c.name_span);
                 false
             }
+            Stmt::Destructure(d) => {
+                let expr_ty = self.check_expr(&d.expr);
+                // Determine element types
+                let elem_tys: Vec<Ty> = match &expr_ty {
+                    Ty::Tuple(tys) => tys.clone(),
+                    Ty::Array(el) => vec![*el.clone(); d.targets.len()],
+                    _ => {
+                        // Check if expr is tuple literal directly
+                        if let ExprKind::Tuple(exprs) = &d.expr.kind {
+                            exprs.iter().map(|e| self.check_expr(e)).collect()
+                        } else {
+                            self.errors.push(SemError { message: format!("destructuring requires tuple or array, found `{expr_ty}`"), span: d.expr.span });
+                            vec![Ty::Int; d.targets.len()]
+                        }
+                    }
+                };
+                if elem_tys.len() != d.targets.len() {
+                    // Allow wildcard to be counted, but if elem_tys len != targets len, error unless tuple literal with different len?
+                    // For `a,b = (1,2,3)` with 2 targets and 3 elems, we take first 2? For now error
+                    if d.targets.len() != elem_tys.len() {
+                        self.errors.push(SemError { message: format!("destructuring mismatch: {} targets vs {} values", d.targets.len(), elem_tys.len()), span: d.span });
+                    }
+                }
+                for (idx, target) in d.targets.iter().enumerate() {
+                    match target {
+                        DestructureTarget::Wildcard(_) => {},
+                        DestructureTarget::Ident(name, span) => {
+                            let expected_ty = elem_tys.get(idx).cloned().unwrap_or(Ty::Int);
+                            if let Some(existing) = self.lookup_var(name) {
+                                if self.is_const(name) {
+                                    self.errors.push(SemError { message: format!("cannot assign to const `{}`", name), span: *span });
+                                }
+                                if existing != expected_ty && existing != Ty::Any && expected_ty != Ty::Any {
+                                    self.errors.push(SemError { message: format!("destructuring type mismatch for `{}`: expected `{}`, found `{}`", name, existing, expected_ty), span: *span });
+                                }
+                            } else {
+                                self.declare_var(name, expected_ty, *span);
+                            }
+                        }
+                    }
+                }
+                false
+            }
             Stmt::Expr(e) => {
                 let _ = self.check_expr(&e.expr);
                 false
