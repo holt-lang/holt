@@ -45,6 +45,7 @@ pub enum Item {
     Extern(ExternDecl),
     Init(Block),
     Const(ConstDecl),
+    Var(VarDecl),
     Attributed { attrs: Vec<Attribute>, item: Box<Item> },
 }
 
@@ -429,6 +430,7 @@ pub struct AssertStmt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarDecl {
+    pub visibility: Visibility,
     pub ty: Type,
     pub name: String,
     pub name_span: Span,

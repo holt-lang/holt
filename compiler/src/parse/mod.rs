@@ -272,6 +272,8 @@ impl Parser {
                         && self.tokens.get(self.pos + 1).map(|t| t.token == Token::Const).unwrap_or(false))
                 {
                     Item::Const(self.parse_const_decl()?)
+                } else if self.is_var_decl_start() {
+                    Item::Var(self.parse_var_decl()?)
                 } else {
                     Item::Function(self.parse_function()?)
                 };
@@ -300,6 +302,9 @@ impl Parser {
                 // Handle attributes at top-level (already handled above, but for safety)
                 let attrs = self.parse_attributes()?;
                 items.push(Item::Attributed{attrs, item: Box::new(Item::Function(self.parse_function()?))});
+            } else if self.is_var_decl_start() {
+                let decl = self.parse_var_decl()?;
+                items.push(Item::Var(decl));
             } else {
                 let func = self.parse_function()?;
                 items.push(Item::Function(func));
@@ -1737,6 +1742,8 @@ impl Parser {
 
     fn is_var_decl_start(&mut self) -> bool {
         let save = self.pos;
+        // Handle optional visibility `public`/`private`
+        let _vis = self.parse_visibility();
         // Try parse a type; if fails, not a decl
         let ty = match self.parse_type() {
             Ok(t) => t,
@@ -1746,20 +1753,21 @@ impl Parser {
             }
         };
         // After type, next token must be Ident (var name)
-        let is_ident = matches!(self.peek_token(), Some(Token::Ident));
-        self.pos = save;
-        // Need to ensure we actually consumed something and next is ident; also avoid mistaking `Point has` as decl
-        if !is_ident {
+        if !matches!(self.peek_token(), Some(Token::Ident)) {
+            self.pos = save;
             return false;
         }
-        // For Named type followed by Ident, we must ensure that the Ident after type is not "has" (which would be struct literal type usage)
-        // But `Point p` vs `Point has ...`: after type `Point`, next token is `p` vs `has`. So `Point has` would have next Token::Has not Ident, so already false.
-        // For array types like `int[] arr`, parse_type will consume `int[]` then next is `arr` Ident, so true.
-        let _ = ty; // suppress unused
-        true
+        // Consume ident for lookahead
+        let _ = self.parse_ident();
+        let next = self.peek_token().cloned();
+        self.pos = save;
+        let _ = ty;
+        // Variable decl if next is `=` or terminator (newline/; / End / EOF), not `(` (which is function)
+        matches!(next, Some(Token::Eq) | Some(Token::Newline) | Some(Token::Semicolon) | Some(Token::End) | None)
     }
 
     fn parse_var_decl(&mut self) -> Result<VarDecl, ParseError> {
+        let visibility = self.parse_visibility();
         let ty = self.parse_type()?;
         let (name, name_span) = self.parse_ident()?;
         let mut init = None;
@@ -1798,6 +1806,7 @@ impl Parser {
         let span = Span::new(ty.span().start, term_start);
         // Note: we consumed terminators already; span ends at init/end.
         Ok(VarDecl {
+            visibility,
             ty,
             name,
             name_span,

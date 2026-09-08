@@ -119,6 +119,7 @@ impl<'ctx> Codegen<'ctx> {
                 Item::Extension(ext) => self.declare_extension(ext)?,
                 Item::Extern(ext) => self.declare_extern(ext)?,
                 Item::Const(c) => self.declare_const(c)?,
+                Item::Var(v) => self.declare_global_var(v)?,
                 _ => {}
             }
         }
@@ -713,7 +714,17 @@ impl<'ctx> Codegen<'ctx> {
         let init_val = match &c.init.kind {
             ExprKind::IntLit(v) => self.context.i64_type().const_int(*v as u64, true).into(),
             ExprKind::BoolLit(b) => self.context.bool_type().const_int(if *b {1} else {0}, false).into(),
-            ExprKind::StringLit(_) => ty.const_zero(),
+            ExprKind::StringLit(s) => {
+                let str_val = self.context.const_string(s.as_bytes(), true);
+                let str_ty = str_val.get_type();
+                let str_global = self.module.add_global(str_ty, None, &format!("str.init.{}.{}", c.name, self.globals.len()));
+                str_global.set_initializer(&str_val);
+                str_global.set_constant(true);
+                str_global.set_linkage(inkwell::module::Linkage::Private);
+                let zero = self.context.i32_type().const_zero();
+                let ptr = unsafe { str_global.as_pointer_value().const_gep(str_ty, &[zero, zero]) };
+                ptr.as_basic_value_enum()
+            }
             ExprKind::CharLit(ch) => self.context.i32_type().const_int(*ch as u64, false).into(),
             _ => ty.const_zero(),
         };
@@ -723,6 +734,50 @@ impl<'ctx> Codegen<'ctx> {
         global.set_linkage(inkwell::module::Linkage::External);
         let ptr = global.as_pointer_value();
         self.globals.insert(c.name.clone(), (ptr, ty));
+        Ok(())
+    }
+
+    fn declare_global_var(&mut self, v: &VarDecl) -> Result<(), CodegenError> {
+        let ty = self.llvm_ty_for(&v.ty);
+        let global = self.module.add_global(ty, None, &v.name);
+        global.set_constant(false);
+        // For simple literals, set initializer directly; for complex, zero and init via holt.init
+        let init_val: BasicValueEnum<'ctx> = if let Some(init) = &v.init {
+            match &init.kind {
+                ExprKind::IntLit(val) => self.context.i64_type().const_int(*val as u64, true).into(),
+                ExprKind::BoolLit(b) => self.context.bool_type().const_int(if *b {1} else {0}, false).into(),
+                ExprKind::StringLit(s) => {
+                    // Create a private global string and use its pointer as initializer for `string` global
+                    let str_val = self.context.const_string(s.as_bytes(), true);
+                    let str_ty = str_val.get_type();
+                    let str_global = self.module.add_global(str_ty, None, &format!("str.init.{}.{}", v.name, self.globals.len()));
+                    str_global.set_initializer(&str_val);
+                    str_global.set_constant(true);
+                    str_global.set_linkage(inkwell::module::Linkage::Private);
+                    let zero = self.context.i32_type().const_zero();
+                    // GEP to first element: ptr @str, 0, 0
+                    let ptr = unsafe { str_global.as_pointer_value().const_gep(str_ty, &[zero, zero]) };
+                    ptr.as_basic_value_enum()
+                }
+                ExprKind::CharLit(ch) => self.context.i32_type().const_int(*ch as u64, false).into(),
+                ExprKind::FloatLit(s) => {
+                    if let Ok(f) = s.parse::<f64>() {
+                        self.context.f64_type().const_float(f).into()
+                    } else {
+                        ty.const_zero()
+                    }
+                }
+                _ => ty.const_zero(),
+            }
+        } else {
+            ty.const_zero()
+        };
+        if global.get_initializer().is_none() {
+            global.set_initializer(&init_val);
+        }
+        global.set_linkage(inkwell::module::Linkage::External);
+        let ptr = global.as_pointer_value();
+        self.globals.insert(v.name.clone(), (ptr, ty));
         Ok(())
     }
 
@@ -1027,9 +1082,17 @@ impl<'ctx> Codegen<'ctx> {
             })
             .collect();
         let is_c_varargs = f.params.iter().any(|p| p.is_variadic && p.name.is_empty());
-        // Special ABI for `main`: C `int main()` is always i32
+        // Special ABI for `main`: C `int main()` is always i32; `int main(string[] args)` is `i32 ()` with `args` as local empty `string[]`
+        let is_main_with_args = f.name == "main"
+            && f.params.len() == 1
+            && f.params[0].name == "args"
+            && matches!(&f.params[0].ty, Type::Array(el, _) if matches!(el.as_ref(), Type::String(_)));
         let fn_ty = if f.name == "main" {
-            self.context.i32_type().fn_type(&param_types, is_c_varargs)
+            if is_main_with_args {
+                self.context.i32_type().fn_type(&[], false)
+            } else {
+                self.context.i32_type().fn_type(&param_types, is_c_varargs)
+            }
         } else {
             match ret_sema {
                 crate::sema::Ty::Void => {
@@ -1244,13 +1307,26 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(entry);
 
         self.vars.push(HashMap::new());
-        for (i, param) in f.params.iter().enumerate() {
-            let param_val = func.get_nth_param(i as u32).unwrap();
-            if param.mode != ParamMode::None {
-                let inner_ty = self.llvm_ty_for(&param.ty);
-                let ptr = param_val.into_pointer_value();
-                self.vars.last_mut().unwrap().insert(param.name.clone(), (ptr, inner_ty));
-            } else if param.is_variadic {
+        // Special handling for `int main(string[] args)` where `args` is `string[]` and function is `i32 ()` with no LLVM params
+        let is_main_with_args = f.name == "main"
+            && f.params.len() == 1
+            && f.params[0].name == "args"
+            && matches!(&f.params[0].ty, crate::ast::Type::Array(el, _) if matches!(el.as_ref(), crate::ast::Type::String(_)));
+        if is_main_with_args {
+            let args_arr_ty = self.context.ptr_type(inkwell::AddressSpace::default()).array_type(16);
+            let args_ty: BasicTypeEnum<'ctx> = args_arr_ty.into();
+            let args_alloca = self.create_entry_block_alloca("args", args_ty);
+            let zero: BasicValueEnum<'ctx> = args_arr_ty.const_zero().into();
+            self.builder.build_store(args_alloca, zero).unwrap();
+            self.vars.last_mut().unwrap().insert("args".to_string(), (args_alloca, args_ty));
+        } else {
+            for (i, param) in f.params.iter().enumerate() {
+                let param_val = func.get_nth_param(i as u32).unwrap();
+                if param.mode != ParamMode::None {
+                    let inner_ty = self.llvm_ty_for(&param.ty);
+                    let ptr = param_val.into_pointer_value();
+                    self.vars.last_mut().unwrap().insert(param.name.clone(), (ptr, inner_ty));
+                } else if param.is_variadic {
                 // `...T vda` where `vda` is `T[]` array, `... vda` derived from previous
                 let elem_ty = self.llvm_ty_for(&param.ty);
                 // For derived `__derived__`, elem_ty is placeholder, use previous param's type
@@ -1273,8 +1349,9 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 let llvm_ty = self.llvm_ty_for(&param.ty);
                 let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
-                self.builder.build_store(alloca, param_val).unwrap();
-                self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                    self.builder.build_store(alloca, param_val).unwrap();
+                    self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                }
             }
         }
 

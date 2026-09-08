@@ -3,7 +3,7 @@
 **Workspace:** `holt-rs` — crates `holt` (main `holt build` CLI, `indicatif` spinner) + `compiler` (library + legacy `holtc` bin) — `inkwell 0.10 llvm21-1`, `logos 0.15`, `miette 7`.
 
 **Date:** 2026-09-09
-**EBNF:** `references/ebnf-0.1.txt` Draft 0.2 (updated for `get`/`set` public default + separate merge, `open` class-only, `[type] has` omitted, variadic `...` `T-14`, struct `T-15`, match `|`/`or`+`(a,b)` `T-17`)
+**EBNF:** `references/ebnf-0.1.txt` Draft 0.2 (updated for `get`/`set` public default + separate merge, `open` class-only, `[type] has` omitted, variadic `...` `T-14`, struct `T-15`, match `|`/`or`+`(a,b)` `T-17`, top-level `var` + `main(string[] args)` `T-18`)
 **Mode switch:** `plan → build` at 2026-09-08 03:xx (user: "save todo and progress next to skill file").
 
 ## Done
@@ -151,8 +151,18 @@
   - `compiler/src/codegen/mod.rs:3875` `infer_expr_ty` `Tuple`/`IntLit`/`BoolLit` + `3280` `codegen_match` `Alternative` OR (`build_or` per alt, `Tuple` inside) + `Tuple` AND (`extract_value` per element + `build_and`) + `3410` `Tuple`/`Alternative` var binds (`extract_value` + `alloca`).
   - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_match.hlt` `1|2`→10, `/tmp/test_match2.hlt` `3 or 4`→20, `1|2|3`→1, `4 or 5 or 6`→2, `(1,2)|(3,4)` + `(1,2) or (5,6)` + `(a,b)->a+b`→30, `match (3,4) do (1,2)|(3,4)`→10.
 
-## Next — T-18
+## T-18 DONE — 2026-09-09 (top-level `var` + `int main(string[] args)`)
 
-- **T-18 Top-level: `variable/constant` as top-level + `int main(string[] args)`** — remaining.
-- Continue `T-18`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `top-level-declaration = variable-declaration | constant-declaration` per EBNF §35 + `main-function = void main() | int main(string[] args)` per §37.
+- **Done:**
+  - `compiler/src/ast.rs:35` `Item::Var(VarDecl)` + `430` `VarDecl {visibility}`.
+  - `compiler/src/parse/mod.rs:1738` `is_var_decl_start` (`[vis] type ident` not `(`) + `1762` `parse_var_decl` (`[vis] type ident [= expr]` via `parse_visibility`) + `251` `At` inner `Var` + `283` top-level `is_var_decl_start` → `Item::Var`.
+  - `compiler/src/sema/mod.rs:842` `Item::Var` global `declare_var` + `Attributed` `Var`/`Const` + `984` `main` `void main()`/`int main()`/`int main(string[] args)` (`string[]` `Array(String)` `args` check).
+  - `compiler/src/codegen/mod.rs:695` `declare_const` `StringLit` via `const_string` + `730` `declare_global_var` (`const_string` for `string` global `gep`) + `960` `declare_function` `main(string[] args)` as `i32 ()` + `1254` `codegen_function` `is_main_with_args` `args` alloca `[16 x ptr]` zero.
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_top3.hlt` `int x=42` `public string s="hello"` `int main(string[] args)` → `hello`/`42`/`100`, `int main(string[] args)` with `args[0]` as `string[]` now accepted.
+
+## Next — T-19
+
+- **T-19 FFI: `extern-struct` / `extern-enum` / `extern-const`** — remaining.
+- Continue `T-19`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
 

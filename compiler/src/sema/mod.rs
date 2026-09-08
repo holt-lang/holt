@@ -858,6 +858,24 @@ impl Checker {
                 } else {
                     self.declare_const(&c.name, decl_ty, c.name_span);
                 }
+            } else if let Item::Var(v) = item {
+                let decl_ty = self.resolve_type(&v.ty);
+                if decl_ty == Ty::Void {
+                    self.errors.push(SemError{message: "global variable cannot have `void` type".into(), span: v.span});
+                }
+                if let Some(init) = &v.init {
+                    let init_ty = self.check_expr(init);
+                    let is_null = matches!(init.kind, ExprKind::Null);
+                    if !is_null && init_ty != decl_ty && decl_ty != Ty::Any && init_ty != Ty::Any {
+                        // Allow int literal for any?
+                        self.errors.push(SemError{message: format!("global var initializer mismatch: expected `{}`, found `{}`", decl_ty, init_ty), span: init.span});
+                    }
+                }
+                if self.scopes.last().map(|s| s.contains_key(&v.name)).unwrap_or(false) {
+                    self.errors.push(SemError{message: format!("redefinition of global var `{}`", v.name), span: v.name_span});
+                } else {
+                    self.declare_var(&v.name, decl_ty, v.name_span);
+                }
             }
         }
         // Handle attributed items as their inner
@@ -963,12 +981,17 @@ impl Checker {
                 }
             }
         }
-        // Validate main
+        // Validate main per EBNF §37: `void main()` or `int main(string[] args)`
         if let Some(main) = self.funcs.get("main").cloned() {
-            if !((main.ret == Ty::Void && main.params.is_empty())
-                || (main.ret == Ty::Int && main.params.is_empty()))
+            let is_void_main = main.ret == Ty::Void && main.params.is_empty();
+            let is_int_main_no_args = main.ret == Ty::Int && main.params.is_empty();
+            let is_int_main_with_args = main.ret == Ty::Int
+                && main.params.len() == 1
+                && main.params[0] == Ty::Array(Box::new(Ty::String))
+                && main.param_names.get(0).map(|s| s == "args").unwrap_or(false);
+            if !(is_void_main || is_int_main_no_args || is_int_main_with_args)
             {
-                self.errors.push(SemError{message: format!("invalid `main` signature: expected `void main()` or `int main()`, found `{} main({})`", main.ret, main.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")), span: main.span});
+                self.errors.push(SemError{message: format!("invalid `main` signature: expected `void main()` or `int main()` or `int main(string[] args)`, found `{} main({})`", main.ret, main.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")), span: main.span});
             }
         } else {
             self.errors.push(SemError {
