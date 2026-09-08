@@ -1021,6 +1021,80 @@ impl Parser {
         let mut members = Vec::new();
         while !self.is_eof() && self.peek_token() != Some(&Token::End) {
             if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            // Check for extern-struct / extern-enum / extern-const before extern-function
+            if self.peek_token() == Some(&Token::Struct) {
+                let start = self.advance().unwrap().span.start;
+                let (name, name_span) = self.parse_ident()?;
+                let mut fields = Vec::new();
+                if self.peek_token() == Some(&Token::Has) {
+                    self.advance(); // has
+                    self.consume_newlines();
+                    while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+                        if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+                        let fty = self.parse_type()?;
+                        let fty_span = fty.span();
+                        let (fname, fspan) = self.parse_ident()?;
+                        self.expect_terminator("extern field")?;
+                        fields.push(ExternField{ty: fty, name: fname, name_span: fspan, span: Span::new(fty_span.start, fspan.end)});
+                        self.consume_newlines();
+                    }
+                    self.expect(Token::End, "expected `end` to close extern struct")?;
+                }
+                let span = Span::new(start, name_span.end);
+                members.push(ExternMember::Struct{name, name_span, fields, span});
+                self.consume_newlines();
+                continue;
+            } else if self.peek_token() == Some(&Token::Enum) {
+                let start = self.advance().unwrap().span.start;
+                let (name, name_span) = self.parse_ident()?;
+                self.expect(Token::Has, "expected `has` after extern enum name")?;
+                self.consume_newlines();
+                let mut variants = Vec::new();
+                while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+                    if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+                    let (vname, vspan) = self.parse_ident()?;
+                    let mut discriminant = None;
+                    let mut payload_params = Vec::new();
+                    if self.consume_if(Token::Eq) {
+                        let expr = self.parse_expr()?;
+                        discriminant = Some(expr);
+                    }
+                    if self.peek_token() == Some(&Token::LParen) {
+                        self.advance(); // (
+                        if self.peek_token() != Some(&Token::RParen) {
+                            loop {
+                                let pty = self.parse_type()?;
+                                let (pname, pspan) = if self.peek_token() == Some(&Token::Ident) {
+                                    let (n, ns) = self.parse_ident()?;
+                                    (n, ns)
+                                } else {
+                                    (format!("_payload{}", payload_params.len()), pty.span())
+                                };
+                                let pspan2 = Span::new(pty.span().start, pspan.end);
+                                payload_params.push(Param{is_variadic: false, mode: ParamMode::None, ty: pty, name: pname, name_span: pspan, span: pspan2});
+                                if !self.consume_if(Token::Comma) { break; }
+                                if self.peek_token() == Some(&Token::RParen) { break; }
+                            }
+                        }
+                        self.expect(Token::RParen, "expected `)` after extern enum payload")?;
+                    }
+                    self.expect_terminator("extern enum variant")?;
+                    variants.push(EnumVariant{name: vname, name_span: vspan, discriminant, payload_params, span: Span::new(vspan.start, vspan.end)});
+                    self.consume_newlines();
+                }
+                let end = self.expect(Token::End, "expected `end` to close extern enum")?.span.end;
+                members.push(ExternMember::Enum{name, name_span, variants, span: Span::new(start, end)});
+                self.consume_newlines();
+                continue;
+            } else if self.peek_token() == Some(&Token::Const) {
+                let start = self.advance().unwrap().span.start;
+                let ty = self.parse_type()?;
+                let (name, name_span) = self.parse_ident()?;
+                self.expect_terminator("extern const")?;
+                members.push(ExternMember::Const{ty, name, name_span, span: Span::new(start, name_span.end)});
+                self.consume_newlines();
+                continue;
+            }
             let ty = self.parse_type()?;
             let (name, name_span) = self.parse_ident()?;
             if self.peek_token() == Some(&Token::LParen) {

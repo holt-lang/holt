@@ -886,15 +886,79 @@ impl Checker {
                 }
             }
         }
-        // Handle extern functions
+        // Handle extern functions / structs / enums / consts
         for item in &prog.items {
             if let Item::Extern(ex) = item {
                 for mem in &ex.members {
-                    if let crate::ast::ExternMember::Function{ty, name, name_span, params, ..} = mem {
-                        let ret = self.resolve_type(ty);
-                        let param_tys: Vec<Ty> = params.iter().map(|p| self.resolve_type(&p.ty)).collect();
-                        let param_modes: Vec<ParamMode> = vec![ParamMode::None; param_tys.len()];
-                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, param_modes, param_names: params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: params.iter().map(|p| p.is_variadic).collect(), generic_params: Vec::new(), where_clause: None, span: *name_span});
+                    match mem {
+                        crate::ast::ExternMember::Function{ty, name, name_span, params, ..} => {
+                            let ret = self.resolve_type(ty);
+                            let param_tys: Vec<Ty> = params.iter().map(|p| self.resolve_type(&p.ty)).collect();
+                            let param_modes: Vec<ParamMode> = vec![ParamMode::None; param_tys.len()];
+                            self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, param_modes, param_names: params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: params.iter().map(|p| p.is_variadic).collect(), generic_params: Vec::new(), where_clause: None, span: *name_span});
+                        }
+                        crate::ast::ExternMember::Struct{name, name_span, fields, ..} => {
+                            if self.structs.contains_key(name) {
+                                self.errors.push(SemError{message: format!("duplicate extern struct `{}`", name), span: *name_span});
+                            } else {
+                                let mut seen = HashSet::new();
+                                let mut flds = Vec::new();
+                                let mut fmap = HashMap::new();
+                                let mut fvis = HashMap::new();
+                                let mut fdefs = HashMap::new();
+                                for (idx, f) in fields.iter().enumerate() {
+                                    if !seen.insert(&f.name) {
+                                        self.errors.push(SemError{message: format!("duplicate field `{}` in extern struct `{}`", f.name, name), span: f.name_span});
+                                    }
+                                    let fty = self.resolve_type(&f.ty);
+                                    if fty == Ty::Void { self.errors.push(SemError{message: format!("field `{}` cannot be `void`", f.name), span: f.span}); }
+                                    fmap.insert(f.name.clone(), (idx, fty.clone()));
+                                    fvis.insert(f.name.clone(), crate::ast::Visibility::Public);
+                                    fdefs.insert(f.name.clone(), None);
+                                    flds.push((f.name.clone(), fty));
+                                }
+                                self.structs.insert(name.clone(), StructInfo{name: name.clone(), fields: flds, field_map: fmap, field_vis: fvis, field_defaults: fdefs, span: *name_span});
+                            }
+                        }
+                        crate::ast::ExternMember::Enum{name, name_span, variants, ..} => {
+                            if self.enums.contains_key(name) || self.structs.contains_key(name) {
+                                self.errors.push(SemError{message: format!("duplicate extern enum `{}`", name), span: *name_span});
+                            } else {
+                                let mut seen = HashSet::new();
+                                let mut vars = Vec::new();
+                                let mut vmap = HashMap::new();
+                                for (idx, v) in variants.iter().enumerate() {
+                                    if !seen.insert(&v.name) {
+                                        self.errors.push(SemError{message: format!("duplicate variant `{}` in extern enum `{}`", v.name, name), span: v.name_span});
+                                    }
+                                    let mut payload_tys = Vec::new();
+                                    for p in &v.payload_params {
+                                        let pt = self.resolve_type(&p.ty);
+                                        payload_tys.push(pt);
+                                    }
+                                    let tag = if let Some(expr) = &v.discriminant {
+                                        match &expr.kind {
+                                            ExprKind::IntLit(val) => *val as usize,
+                                            _ => { let _ = self.check_expr(expr); idx }
+                                        }
+                                    } else { idx };
+                                    vmap.insert(v.name.clone(), (tag, payload_tys.clone()));
+                                    vars.push(EnumVariantInfo{name: v.name.clone(), tag, payload_tys, discriminant_expr: v.discriminant.clone(), span: v.span});
+                                }
+                                self.enums.insert(name.clone(), EnumInfo{name: name.clone(), variants: vars, variant_map: vmap, span: *name_span});
+                            }
+                        }
+                        crate::ast::ExternMember::Const{ty, name, name_span, ..} => {
+                            let decl_ty = self.resolve_type(ty);
+                            if decl_ty == Ty::Void {
+                                self.errors.push(SemError{message: "extern const cannot be `void`".into(), span: *name_span});
+                            }
+                            if self.scopes.last().map(|s| s.contains_key(name)).unwrap_or(false) {
+                                self.errors.push(SemError{message: format!("redefinition of extern const `{}`", name), span: *name_span});
+                            } else {
+                                self.declare_const(name, decl_ty, *name_span);
+                            }
+                        }
                     }
                 }
             }
@@ -1406,6 +1470,19 @@ impl Checker {
                             return Ty::Struct(first.to_string());
                         }
                     }
+                    // Also handle bare type name like `MyEnum` where `MyEnum` is an enum/struct type (for `MyEnum.A`)
+                    if self.enums.contains_key(name) {
+                        return Ty::Enum(name.clone());
+                    }
+                    if self.structs.contains_key(name) || self.classes.contains_key(name) {
+                        return Ty::Struct(name.clone());
+                    }
+                    if self.enums.contains_key(lookup) {
+                        return Ty::Enum(lookup.to_string());
+                    }
+                    if self.structs.contains_key(lookup) || self.classes.contains_key(lookup) {
+                        return Ty::Struct(lookup.to_string());
+                    }
                     self.errors.push(SemError {
                         message: format!("undefined variable `{name}`"),
                         span: expr.span,
@@ -1846,77 +1923,52 @@ impl Checker {
             } => {
                 let obj_ty = self.check_expr(object);
                 if let Ty::Struct(ref sname) = obj_ty {
-                    if let Some(sinfo) = self.structs.get(sname) {
+                    if let Some(sinfo) = self.structs.get(sname).cloned() {
                         if let Some((_, fty)) = sinfo.field_map.get(field) {
-                            // visibility check for class fields: Default is private for fields/methods/properties, only ctor Default is public
                             if let Some(cinfo) = self.classes.get(sname) {
                                 if let Some(vis) = cinfo.field_vis.get(field) {
                                     if *vis != crate::ast::Visibility::Public && self.cur_class.as_deref() != Some(sname.as_str()) {
                                         self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
                                     }
-                                } else {
-                                    // Default for class field is private
-                                    if self.cur_class.as_deref() != Some(sname.as_str()) {
-                                        self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
-                                    }
+                                } else if self.cur_class.as_deref() != Some(sname.as_str()) {
+                                    self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
                                 }
-                                // also check if property overrides field? already handled
-                            } else {
-                                // pure struct: Default is public, only explicit `private` is private
-                                if let Some(vis) = sinfo.field_vis.get(field) {
-                                    if *vis == crate::ast::Visibility::Private {
-                                        self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
-                                    }
+                            } else if let Some(vis) = sinfo.field_vis.get(field) {
+                                if *vis == crate::ast::Visibility::Private {
+                                    self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
                                 }
                             }
-                            // also check property getter if shadows field? prefer field
                             fty.clone()
                         } else if let Some(cinfo) = self.classes.get(sname) {
                             if let Some(prop) = cinfo.properties.get(field) {
-                                // property visibility: Default is private
                                 if prop.visibility != crate::ast::Visibility::Public && self.cur_class.as_deref() != Some(sname.as_str()) {
                                     self.errors.push(SemError{message: format!("property `{field}` is private"), span: *field_span});
                                 }
-                                if prop.has_get {
-                                    prop.ty.clone()
-                                } else {
-                                    self.errors.push(SemError{message: format!("property `{field}` has no getter"), span: *field_span});
-                                    Ty::Int
-                                }
+                                if prop.has_get { prop.ty.clone() } else { self.errors.push(SemError{message: format!("property `{field}` has no getter"), span: *field_span}); Ty::Int }
                             } else {
-                                self.errors.push(SemError {
-                                    message: format!(
-                                        "struct `{sname}` has no field `{field}`"
-                                    ),
-                                    span: *field_span,
-                                });
-                                Ty::Int
+                                self.errors.push(SemError { message: format!("struct `{sname}` has no field `{field}`"), span: *field_span, }); Ty::Int
                             }
                         } else {
-                            self.errors.push(SemError {
-                                message: format!(
-                                    "struct `{sname}` has no field `{field}`"
-                                ),
-                                span: *field_span,
-                            });
-                            Ty::Int
+                            self.errors.push(SemError { message: format!("struct `{sname}` has no field `{field}`"), span: *field_span, }); Ty::Int
+                        }
+                    } else if let Some(cinfo) = self.classes.get(sname) {
+                        if let Some(prop) = cinfo.properties.get(field) {
+                            if prop.visibility != crate::ast::Visibility::Public && self.cur_class.as_deref() != Some(sname.as_str()) {
+                                self.errors.push(SemError{message: format!("property `{field}` is private"), span: *field_span});
+                            }
+                            if prop.has_get { prop.ty.clone() } else { self.errors.push(SemError{message: format!("property `{field}` has no getter"), span: *field_span}); Ty::Int }
+                        } else {
+                            self.errors.push(SemError { message: format!("struct `{sname}` has no field `{field}`"), span: *field_span, }); Ty::Int
                         }
                     } else {
-                        self.errors.push(SemError {
-                            message: format!("unknown struct `{sname}`"),
-                            span: object.span,
-                        });
-                        Ty::Int
+                        self.errors.push(SemError { message: format!("unknown struct `{sname}`"), span: object.span, }); Ty::Int
                     }
+                } else if let Ty::Enum(ref ename) = obj_ty {
+                    if let Some(einfo) = self.enums.get(ename) {
+                        if let Some((_, _)) = einfo.variant_map.get(field) { Ty::Enum(ename.clone()) } else { self.errors.push(SemError{message: format!("enum `{}` has no variant `{}`", ename, field), span: *field_span}); Ty::Int }
+                    } else { self.errors.push(SemError{message: format!("unknown enum `{}`", ename), span: *field_span}); Ty::Int }
                 } else {
-                    self.errors.push(SemError {
-                        message: format!(
-                            "field access on non-struct `{}`, field `{}`",
-                            obj_ty, field
-                        ),
-                        span: *field_span,
-                    });
-                    Ty::Int
+                    self.errors.push(SemError { message: format!("field access on non-struct `{}`, field `{}`", obj_ty, field), span: *field_span, }); Ty::Int
                 }
             }
             ExprKind::StructLit { ty, fields } => {

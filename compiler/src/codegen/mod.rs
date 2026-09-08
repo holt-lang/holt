@@ -648,47 +648,90 @@ impl<'ctx> Codegen<'ctx> {
 
     fn declare_extern(&mut self, ext: &ExternDecl) -> Result<(), CodegenError> {
         for mem in &ext.members {
-            if let crate::ast::ExternMember::Function{ty, name, params, ..} = mem {
-                let ret_ty: crate::sema::Ty = ty.into();
-                let mut is_c_varargs = params.iter().any(|p| p.is_variadic && p.name.is_empty());
-                // Special: `extern "c" from "libc" do int printf(string arg) end` in advanced.hlt declares `printf` with one `string` param
-                // but real C `printf` is variadic `int printf(const char*, ...)`. For `printInt` intrinsic we need variadic `i32 (ptr, ...)`.
-                // If user declares `printf` with single `string` param and non-variadic, treat it as variadic C `printf`.
-                if name == "printf" && params.len() == 1 && !is_c_varargs {
-                    if let Some(p) = params.first() {
-                        if matches!(&p.ty, Type::String(_)) {
-                            is_c_varargs = true;
+            match mem {
+                crate::ast::ExternMember::Function{ty, name, params, ..} => {
+                    let ret_ty: crate::sema::Ty = ty.into();
+                    let mut is_c_varargs = params.iter().any(|p| p.is_variadic && p.name.is_empty());
+                    // Special: `extern "c" from "libc" do int printf(string arg) end` in advanced.hlt declares `printf` with one `string` param
+                    // but real C `printf` is variadic `int printf(const char*, ...)`. For `printInt` intrinsic we need variadic `i32 (ptr, ...)`.
+                    // If user declares `printf` with single `string` param and non-variadic, treat it as variadic C `printf`.
+                    if name == "printf" && params.len() == 1 && !is_c_varargs {
+                        if let Some(p) = params.first() {
+                            if matches!(&p.ty, Type::String(_)) {
+                                is_c_varargs = true;
+                            }
                         }
                     }
-                }
-                // For C `printf`, ensure variadic `i32 (ptr, ...)` even though Holt `int` maps to `i64`
-                if name == "printf" && is_c_varargs {
-                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
-                    let fn_ty = self.context.i32_type().fn_type(&[ptr_ty], true);
-                    self.module.add_function(name, fn_ty, None);
-                    continue;
-                }
-                let param_tys: Vec<crate::sema::Ty> = params.iter().filter(|p| !(p.is_variadic && p.name.is_empty())).map(|p| {
-                    let base: crate::sema::Ty = (&p.ty).into();
-                    if p.is_variadic {
-                        crate::sema::Ty::Array(Box::new(base))
-                    } else { base }
-                }).collect();
-                let param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = param_tys.iter().filter_map(|t| self.llvm_ty_for_sema(t).map(|bt| bt.into())).collect();
-                let fn_ty = match ret_ty {
-                    crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, is_c_varargs),
-                    crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, is_c_varargs),
-                    crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, is_c_varargs),
-                    crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, is_c_varargs),
-                    crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, is_c_varargs),
-                    crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_llvm, is_c_varargs),
-                    crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_llvm, is_c_varargs),
-                    crate::sema::Ty::Struct(_) | crate::sema::Ty::Enum(_) | crate::sema::Ty::Generic(_,_) => {
-                        if let Some(bt) = self.llvm_ty_for_sema(&ret_ty) { bt.fn_type(&param_llvm, is_c_varargs) } else { self.context.void_type().fn_type(&param_llvm, is_c_varargs) }
+                    // For C `printf`, ensure variadic `i32 (ptr, ...)` even though Holt `int` maps to `i64`
+                    if name == "printf" && is_c_varargs {
+                        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                        let fn_ty = self.context.i32_type().fn_type(&[ptr_ty], true);
+                        self.module.add_function(name, fn_ty, None);
+                        continue;
                     }
-                    _ => self.context.void_type().fn_type(&param_llvm, is_c_varargs),
-                };
-                self.module.add_function(name, fn_ty, None);
+                    let param_tys: Vec<crate::sema::Ty> = params.iter().filter(|p| !(p.is_variadic && p.name.is_empty())).map(|p| {
+                        let base: crate::sema::Ty = (&p.ty).into();
+                        if p.is_variadic {
+                            crate::sema::Ty::Array(Box::new(base))
+                        } else { base }
+                    }).collect();
+                    let param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = param_tys.iter().filter_map(|t| self.llvm_ty_for_sema(t).map(|bt| bt.into())).collect();
+                    let fn_ty = match ret_ty {
+                        crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, is_c_varargs),
+                        crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, is_c_varargs),
+                        crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, is_c_varargs),
+                        crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, is_c_varargs),
+                        crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, is_c_varargs),
+                        crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_llvm, is_c_varargs),
+                        crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_llvm, is_c_varargs),
+                        crate::sema::Ty::Struct(_) | crate::sema::Ty::Enum(_) | crate::sema::Ty::Generic(_,_) => {
+                            if let Some(bt) = self.llvm_ty_for_sema(&ret_ty) { bt.fn_type(&param_llvm, is_c_varargs) } else { self.context.void_type().fn_type(&param_llvm, is_c_varargs) }
+                        }
+                        _ => self.context.void_type().fn_type(&param_llvm, is_c_varargs),
+                    };
+                    self.module.add_function(name, fn_ty, None);
+                }
+                crate::ast::ExternMember::Struct{name, fields, ..} => {
+                    if self.struct_types.contains_key(name) { continue; }
+                    let opaque = self.context.opaque_struct_type(name);
+                    self.struct_types.insert(name.clone(), opaque);
+                    let mut field_map = HashMap::new();
+                    let mut field_tys = Vec::new();
+                    for (idx, f) in fields.iter().enumerate() {
+                        let lty = self.llvm_ty_for(&f.ty);
+                        field_map.insert(f.name.clone(), idx as u32);
+                        field_tys.push(lty);
+                    }
+                    opaque.set_body(&field_tys, false);
+                    self.struct_fields.insert(name.clone(), field_map);
+                    self.struct_field_defaults.insert(name.clone(), HashMap::new());
+                }
+                crate::ast::ExternMember::Enum{name, variants, ..} => {
+                    if self.enum_types.contains_key(name) || self.struct_types.contains_key(name) { continue; }
+                    let enum_ty = self.context.opaque_struct_type(name);
+                    let payload_ty = self.context.i64_type();
+                    let tag_ty = self.context.i32_type();
+                    enum_ty.set_body(&[tag_ty.into(), payload_ty.into()], false);
+                    self.enum_types.insert(name.clone(), enum_ty);
+                    let mut tag_map = HashMap::new();
+                    for (idx, v) in variants.iter().enumerate() {
+                        let tag = if let Some(expr) = &v.discriminant {
+                            if let ExprKind::IntLit(val) = &expr.kind { *val as u32 } else { idx as u32 }
+                        } else { idx as u32 };
+                        tag_map.insert(v.name.clone(), tag);
+                    }
+                    self.enum_variant_tags.insert(name.clone(), tag_map);
+                }
+                crate::ast::ExternMember::Const{ty, name, ..} => {
+                    let lty = self.llvm_ty_for(ty);
+                    let global = self.module.add_global(lty, None, name);
+                    global.set_constant(true);
+                    global.set_linkage(inkwell::module::Linkage::External);
+                    // No initializer for extern const (provided by external library)
+                    global.set_initializer(&lty.const_zero());
+                    let ptr = global.as_pointer_value();
+                    self.globals.insert(name.clone(), (ptr, lty));
+                }
             }
         }
         Ok(())
@@ -3047,8 +3090,22 @@ impl<'ctx> Codegen<'ctx> {
                 field,
                 field_span: _,
             } => {
-                // Check for property getter first
+                // Check for enum variant `MyEnum.A` where `MyEnum` is enum and `A` is variant
                 let obj_ty = self.infer_expr_ty(object)?;
+                if let crate::sema::Ty::Enum(ref ename) = obj_ty {
+                    if let Some(tag_map) = self.enum_variant_tags.get(ename) {
+                        if let Some(tag) = tag_map.get(field) {
+                            let enum_ty = self.enum_types.get(ename).unwrap();
+                            let mut agg: BasicValueEnum<'ctx> = enum_ty.get_undef().into();
+                            let tag_val = self.context.i32_type().const_int(*tag as u64, false);
+                            let tmp = self.builder.build_insert_value(agg.into_struct_value(), tag_val, 0, "enum.tag").unwrap();
+                            agg = tmp.as_basic_value_enum();
+                            // payload remains zero (no args for `MyEnum.A`)
+                            return Ok(agg);
+                        }
+                    }
+                }
+                // Check for property getter first
                 if let crate::sema::Ty::Struct(ref sname) = obj_ty {
                     if let Some(props) = self.class_properties.get(sname) {
                         if let Some(prop) = props.get(field) {
@@ -3974,6 +4031,20 @@ impl<'ctx> Codegen<'ctx> {
                         }
                     }
                 }
+                for (gname, _) in &self.globals {
+                    if gname == name || gname == lookup {
+                        // Check if global is enum/struct type name? Not needed
+                        continue;
+                    }
+                }
+                if self.enum_types.contains_key(name) || self.enum_types.contains_key(lookup) {
+                    let key = if self.enum_types.contains_key(name) { name } else { lookup };
+                    return Ok(crate::sema::Ty::Enum(key.to_string()));
+                }
+                if self.struct_types.contains_key(name) || self.struct_types.contains_key(lookup) {
+                    let key = if self.struct_types.contains_key(name) { name } else { lookup };
+                    return Ok(crate::sema::Ty::Struct(key.to_string()));
+                }
                 Err(CodegenError{message: format!("cannot infer type of {name}"), span: expr.span})
             }
             ExprKind::This | ExprKind::Super => {
@@ -3995,6 +4066,13 @@ impl<'ctx> Codegen<'ctx> {
                         return Ok(crate::sema::Ty::Struct(sname2));
                     }
                     return Err(CodegenError{message: "unsupported field type inference".into(), span: expr.span});
+                } else if let crate::sema::Ty::Enum(ref ename) = obj_ty {
+                    if let Some(einfo) = self.enum_variant_tags.get(ename) {
+                        if einfo.contains_key(field) {
+                            return Ok(crate::sema::Ty::Enum(ename.clone()));
+                        }
+                    }
+                    return Err(CodegenError{message: format!("enum `{}` has no variant `{}`", ename, field), span: expr.span});
                 }
                 Err(CodegenError{message: "member access inference on non-struct".into(), span: expr.span})
             }

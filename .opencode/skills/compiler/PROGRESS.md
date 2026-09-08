@@ -161,8 +161,17 @@
   - `compiler/src/codegen/mod.rs:695` `declare_const` `StringLit` via `const_string` + `730` `declare_global_var` (`const_string` for `string` global `gep`) + `960` `declare_function` `main(*args)` as `i32 ()`/`void ()` (`void`/`int` + `args` → `i32`/`void` `()` with `args` local) + `1254` `codegen_function` `is_main_with_args` `args` alloca `[16 x ptr]` zero.
   - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_top3.hlt` `int x=42` `public string s="hello"` `int main(string[] args)` → `hello`/`42`/`100`, `void main(string[] args)` + all four `main` combos now accepted.
 
-## Next — T-19
+## T-19 DONE — 2026-09-09 (extern `struct`/`enum`/`const`)
 
-- **T-19 FFI: `extern-struct` / `extern-enum` / `extern-const`** — remaining.
-- Continue `T-19`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `extern-member = extern-function | extern-struct | extern-enum | extern-const` per EBNF §36 `extern-declaration`.
+- **Done:**
+  - `compiler/src/parse/mod.rs:1009` `parse_extern_decl` (`struct` `ident [has {type ident;}]` + `enum` `ident has {ident [= expr] [(type)]}` + `const` `type ident` + `type ident "("` for function) + `compiler/src/ast.rs:360` `ExternMember::{Struct, Enum, Const}` already.
+  - `compiler/src/sema/mod.rs:890` `ExternMember::Struct` → `StructInfo` + `Enum` → `EnumInfo` + `Const` → `declare_const` + `check_expr` for `Ident` `MyEnum`→`Enum`/`MyEnum.A` `MemberAccess` `Enum` variant.
+  - `compiler/src/codegen/mod.rs:649` `declare_extern` `Struct` opaque `set_body`/`Enum` `opaque {i32,i64}`/`Const` `External` `const_zero` + `infer_expr_ty` `Ident` `MyEnum`→`Enum` + `MemberAccess` `Enum` `MyEnum.A` → `EnumVariant` `insert_value` tag.
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_extern3.hlt` `MyStruct has x=1 y=2` `MyEnum.A`, `/tmp/test_extern_all.hlt` `OpaqueStruct` (no `has`) as `[]` + `MyEnum` + `MY_CONST` not used.
+
+## Next — T-20
+
+- **T-20 Extensions: `field`/`operator`/`property`/`conversion` members (only `Function` now)** — remaining.
+- Continue `T-20`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
 
