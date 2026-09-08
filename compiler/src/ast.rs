@@ -280,8 +280,8 @@ pub struct EnumDecl {
 pub struct EnumVariant {
     pub name: String,
     pub name_span: Span,
-    pub discriminant: Option<i64>,
-    pub payload_ty: Option<Type>, // minimal single payload type e.g. Some(int)
+    pub discriminant: Option<Expr>, // EBNF: `identifier [ "=" expression ]`
+    pub payload_params: Vec<Param>, // EBNF: `identifier [ "(" [parameter-list] ")" ]` multi-param
     pub span: Span,
 }
 
@@ -718,7 +718,7 @@ pub enum Pattern {
     Enum {
         variant: String,
         variant_span: Span,
-        payload: Option<Box<Pattern>>,
+        payload: Option<Vec<Pattern>>,
     },
 }
 

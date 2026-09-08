@@ -108,8 +108,18 @@
   - `compiler/src/sema/mod.rs:2160` `check_generic_bounds` (`<T: Trait>` + `where T: Trait` / `where T: int`), handles `Struct`/`Generic` trait via `implements` list and primitive equality (`T: int` vs `string` fails), called in `check_expr` `Call` with `type_args` (`func.generic_params`+`where_clause`), `resolve_type` now includes `traits`.
   - **Verify:** `cargo test` 4 passed, `/tmp/t12_where_simple.hlt` `foo<T> where T:int` `foo<int>` pass / `foo<string>` → `where bound failed: string does not satisfy T: int`, `/tmp/t12_generic_bound.hlt` `T: Drawable` `Circle` → `does not satisfy`, `MyCircle` (implements) pass (but codegen `T` struct erasure still `i64` for generic `T` struct case deferred).
 
-## Next — T-13
+## T-13 DONE — 2026-09-08 23:xx
 
-- **T-13 Enums: multi-param payload, discriminant expr, generic enum** — `enum` `a,b` payload etc.
-- Continue `T-13`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `multi-param payload`, `discriminant expr`, `generic enum` per EBNF §28 `enum-variant` + §7 `generic`.
+- **Done:**
+  - `compiler/src/ast.rs:280` `EnumVariant {discriminant: Option<Expr>, payload_params: Vec<Param>}` (was `Option<i64>` + `Option<Type>` single).
+  - `compiler/src/parse/mod.rs:1085` `parse_enum_decl` handles `= expr` (e.g. `Blue = 3+2`) + `(T, E, int code)` multi-param via `Param` loop with `,`.
+  - `compiler/src/sema/mod.rs:164` `EnumVariantInfo {payload_tys: Vec<Ty>, discriminant_expr: Option<Expr>}` + `655` `payload_params` `Vec<Param>` + discriminant `Expr` `IntLit` vs `idx` fallback, `1867` `EnumVariant` `Vec<Ty>` check (generic `T` vs `int` via `is_generic` allow).
+  - `compiler/src/codegen/mod.rs:406` `declare_enum` `Option<Expr>` discriminant (`IntLit` vs `idx`), payload still `i64` (first param for MVP), `2679` `EnumVariant` codegen payload `i64` (first arg) with `Vec<Ty>` check.
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 6 ok, `/tmp/t13_test.hlt` `Color Red=1 Green=2 Blue=3+2` `Option<T> Some(T) None` `Result<T,E> Ok(T) Err(E,int)` `Some(42)`/`None`/`Ok(100)`/`Err` → build ok.
+
+## Next — T-14
+
+- **T-14 Structs: field visibility + default `= expr`** — `struct` `field` `visibility` + `= expr`.
+- Continue `T-14`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
 

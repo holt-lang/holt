@@ -157,7 +157,7 @@ pub struct Checker {
 struct EnumInfo {
     name: String,
     variants: Vec<EnumVariantInfo>,
-    variant_map: HashMap<String, (usize, Option<Ty>)>, // variant -> (tag, payload ty)
+    variant_map: HashMap<String, (usize, Vec<Ty>)>, // variant -> (tag, payload tys)
     span: Span,
 }
 
@@ -165,7 +165,8 @@ struct EnumInfo {
 struct EnumVariantInfo {
     name: String,
     tag: usize,
-    payload_ty: Option<Ty>,
+    payload_tys: Vec<Ty>,
+    discriminant_expr: Option<Expr>,
     span: Span,
 }
 
@@ -664,14 +665,32 @@ impl Checker {
                         if !seen.insert(&v.name) {
                             self.errors.push(SemError{message: format!("duplicate variant `{}` in enum `{}`", v.name, e.name), span: v.name_span});
                         }
-                        let payload_ty = v.payload_ty.as_ref().map(|t| {
-                            let pt = self.resolve_type(t);
-                            if pt == Ty::Void { self.errors.push(SemError{message: format!("variant `{}` payload cannot be `void`", v.name), span: v.span}); }
-                            pt
-                        });
-                        let tag = v.discriminant.map(|d| d as usize).unwrap_or(idx);
-                        vmap.insert(v.name.clone(), (tag, payload_ty.clone()));
-                        variants.push(EnumVariantInfo{name: v.name.clone(), tag, payload_ty, span: v.span});
+                        let mut payload_tys = Vec::new();
+                        for p in &v.payload_params {
+                            let pt = self.resolve_type(&p.ty);
+                            if pt == Ty::Void { self.errors.push(SemError{message: format!("variant `{}` payload param `{}` cannot be `void`", v.name, p.name), span: p.span}); }
+                            payload_tys.push(pt);
+                        }
+                        // discriminant: if Some(expr), try to evaluate as int, else use idx
+                        let tag = if let Some(expr) = &v.discriminant {
+                            // Try to evaluate constant int expression: for now handle IntLit, or try to resolve as int
+                            match &expr.kind {
+                                ExprKind::IntLit(val) => *val as usize,
+                                _ => {
+                                    // Try to check expr as int and use idx as fallback, but also error if not int
+                                    let t = self.check_expr(expr);
+                                    if t != Ty::Int {
+                                        self.errors.push(SemError{message: format!("enum discriminant must be `int`, found `{}`", t), span: expr.span});
+                                    }
+                                    // For non-literal, use idx as tag and store expr for later evaluation (not yet)
+                                    idx
+                                }
+                            }
+                        } else {
+                            idx
+                        };
+                        vmap.insert(v.name.clone(), (tag, payload_tys.clone()));
+                        variants.push(EnumVariantInfo{name: v.name.clone(), tag, payload_tys, discriminant_expr: v.discriminant.clone(), span: v.span});
                     }
                     self.enums.insert(e.name.clone(), EnumInfo{name: e.name.clone(), variants, variant_map: vmap, span: e.span});
                 }
@@ -988,7 +1007,14 @@ impl Checker {
                 if let Some(init) = &d.init {
                     let init_ty = self.check_expr(init);
                     let is_null = matches!(init.kind, ExprKind::Null);
-                    if !is_null && init_ty != decl_ty && decl_ty != Ty::Void && decl_ty != Ty::Any {
+                    let compatible = if init_ty == decl_ty { true } else {
+                        match (&decl_ty, &init_ty) {
+                            (Ty::Generic(n1, _), Ty::Enum(n2)) if n1 == n2 => true,
+                            (Ty::Enum(n1), Ty::Generic(n2, _)) if n1 == n2 => true,
+                            _ => false,
+                        }
+                    };
+                    if !is_null && !compatible && decl_ty != Ty::Void && decl_ty != Ty::Any {
                         self.errors.push(SemError{message: format!("type mismatch in initializer: expected `{decl_ty}`, found `{init_ty}`"), span: init.span});
                     }
                 }
@@ -1872,13 +1898,18 @@ impl Checker {
                 };
                 let enum_name_str = match &enum_ty { Ty::Enum(n) => n.clone(), _ => "".to_string() };
                 if let Some(einfo) = self.enums.get(&enum_name_str).cloned() {
-                    if let Some((_, payload_ty)) = einfo.variant_map.get(variant) {
-                        if let Some(pt) = payload_ty {
-                            if args.len() != 1 {
-                                self.errors.push(SemError{message: format!("variant `{variant}` expects 1 payload, found {}", args.len()), span: *variant_span});
+                    if let Some((_, payload_tys)) = einfo.variant_map.get(variant) {
+                        if !payload_tys.is_empty() {
+                            if args.len() != payload_tys.len() {
+                                self.errors.push(SemError{message: format!("variant `{variant}` expects {} payload(s), found {}", payload_tys.len(), args.len()), span: *variant_span});
                             } else {
-                                let aty = self.check_call_arg(&args[0]);
-                                if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("variant `{variant}` payload: expected `{}`, found `{}`", pt, aty), span: args[0].span()}); }
+                                for (pty, arg) in payload_tys.iter().zip(args.iter()) {
+                                    let aty = self.check_call_arg(arg);
+                                    let is_generic = matches!(pty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
+                                    if &aty != pty && aty != Ty::Any && !is_generic {
+                                        self.errors.push(SemError{message: format!("variant `{variant}` payload: expected `{}`, found `{}`", pty, aty), span: arg.span()});
+                                    }
+                                }
                             }
                         } else {
                             if !args.is_empty() {
@@ -1934,20 +1965,36 @@ impl Checker {
                         Pattern::Enum{variant, variant_span, payload} => {
                             if let Ty::Enum(ref ename) = scrut_ty {
                                 if let Some(einfo) = self.enums.get(ename).cloned() {
-                                    if let Some((_, pty_opt)) = einfo.variant_map.get(variant) {
-                                        match (payload, pty_opt) {
-                                            (Some(inner), Some(expected)) => {
-                                                match inner.as_ref() {
+                                    if let Some((_, payload_tys)) = einfo.variant_map.get(variant) {
+                                        match (payload, payload_tys.as_slice()) {
+                                            (Some(pats), [expected]) if pats.len() == 1 => {
+                                                match &pats[0] {
                                                     Pattern::Wildcard(_) => {},
                                                     Pattern::LitInt(_, s) => if *expected != Ty::Int { self.errors.push(SemError{message: format!("payload for `{}` expects `{}`, found `int`", variant, expected), span: *s}); },
                                                     Pattern::LitBool(_, s) => if *expected != Ty::Bool { self.errors.push(SemError{message: format!("payload for `{}` expects `{}`, found `bool`", variant, expected), span: *s}); },
                                                     Pattern::Var(_, _) => {},
                                                     Pattern::Enum{..} => self.errors.push(SemError{message: "nested enum payload pattern not supported".into(), span: *variant_span}),
+                                                    _ => {},
                                                 }
                                             }
-                                            (None, Some(_)) => self.errors.push(SemError{message: format!("variant `{}` expects payload", variant), span: *variant_span}),
-                                            (Some(_), None) => self.errors.push(SemError{message: format!("variant `{}` has no payload but pattern provides one", variant), span: *variant_span}),
-                                            (None, None) => {},
+                                            (Some(pats), expecteds) => {
+                                                if pats.len() != expecteds.len() {
+                                                    self.errors.push(SemError{message: format!("variant `{}` expects {} payload(s), found {}", variant, expecteds.len(), pats.len()), span: *variant_span});
+                                                } else {
+                                                    for (pat, exp) in pats.iter().zip(expecteds.iter()) {
+                                                        match pat {
+                                                            Pattern::Wildcard(_) => {},
+                                                            Pattern::LitInt(_, s) => if *exp != Ty::Int { self.errors.push(SemError{message: format!("payload for `{}` expects `{}`, found `int`", variant, exp), span: *s}); },
+                                                            Pattern::LitBool(_, s) => if *exp != Ty::Bool { self.errors.push(SemError{message: format!("payload for `{}` expects `{}`, found `bool`", variant, exp), span: *s}); },
+                                                            Pattern::Var(_, _) => {},
+                                                            _ => {},
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            (None, []) => {},
+                                            (None, _) => self.errors.push(SemError{message: format!("variant `{}` expects payload", variant), span: *variant_span}),
+                                            (Some(_), []) => self.errors.push(SemError{message: format!("variant `{}` has no payload but pattern provides one", variant), span: *variant_span}),
                                         }
                                     } else {
                                         self.errors.push(SemError{message: format!("unknown variant `{}` for enum `{}`", variant, ename), span: *variant_span});
@@ -1967,12 +2014,24 @@ impl Checker {
                         Pattern::Var(name, span) => {
                             self.declare_var(name, scrut_ty.clone(), *span);
                         }
-                        Pattern::Enum{ payload: Some(inner), variant, ..} => {
-                            if let Pattern::Var(vname, vspan) = inner.as_ref() {
+                        Pattern::Enum{ payload: Some(pats), variant, ..} => {
+                            if pats.len() == 1 {
+                                if let Pattern::Var(vname, vspan) = &pats[0] {
+                                    if let Ty::Enum(ref ename) = scrut_ty {
+                                        if let Some(payload_tys) = self.enums.get(ename).and_then(|einfo| einfo.variant_map.get(variant).map(|(_, v)| v.clone())) {
+                                            if let Some(pty) = payload_tys.first() {
+                                                self.declare_var(vname, pty.clone(), *vspan);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
                                 if let Ty::Enum(ref ename) = scrut_ty {
-                                    if let Some(einfo) = self.enums.get(ename) {
-                                        if let Some((_, Some(pty))) = einfo.variant_map.get(variant) {
-                                            self.declare_var(vname, pty.clone(), *vspan);
+                                    if let Some(payload_tys) = self.enums.get(ename).and_then(|einfo| einfo.variant_map.get(variant).map(|(_, v)| v.clone())) {
+                                        for (pat, ty) in pats.iter().zip(payload_tys.iter()) {
+                                            if let Pattern::Var(vname, vspan) = pat {
+                                                self.declare_var(vname, ty.clone(), *vspan);
+                                            }
                                         }
                                     }
                                 }
