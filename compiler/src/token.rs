@@ -259,6 +259,8 @@ pub enum Token {
     PlusPlus,
     #[token("--")]
     MinusMinus,
+    #[token("...")]
+    DotDotDot,
     #[token("..")]
     DotDot,
     #[token("==")]
@@ -434,6 +436,7 @@ impl std::fmt::Display for Token {
             Self::XorAssign => "^=",
             Self::PlusPlus => "++",
             Self::MinusMinus => "--",
+            Self::DotDotDot => "...",
             Self::DotDot => "..",
             Self::EqEq => "==",
             Self::Plus => "+",

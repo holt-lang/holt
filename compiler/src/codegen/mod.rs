@@ -64,6 +64,7 @@ struct TyInfo {
     params: Vec<crate::sema::Ty>,
     param_modes: Vec<ParamMode>,
     param_names: Vec<String>,
+    param_is_variadic: Vec<bool>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -221,15 +222,46 @@ impl<'ctx> Codegen<'ctx> {
             let ret_ty = self.resolve_ty_for_codegen(&ret_ty_raw);
             let mut param_semas: Vec<crate::sema::Ty> = Vec::new();
             param_semas.push(crate::sema::Ty::Struct(c.name.clone()));
-            for p in &m.params {
+            for (idx, p) in m.params.iter().enumerate() {
                 let raw: crate::sema::Ty = (&p.ty).into();
-                param_semas.push(self.resolve_ty_for_codegen(&raw));
+                let resolved = self.resolve_ty_for_codegen(&raw);
+                let final_ty = if p.is_variadic {
+                    if p.ty.name() == "__derived__" {
+                        if idx == 0 {
+                            crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int))
+                        } else {
+                            let prev_raw: crate::sema::Ty = (&m.params[idx-1].ty).into();
+                            let prev_res = self.resolve_ty_for_codegen(&prev_raw);
+                            crate::sema::Ty::Array(Box::new(prev_res))
+                        }
+                    } else {
+                        crate::sema::Ty::Array(Box::new(resolved))
+                    }
+                } else {
+                    resolved
+                };
+                param_semas.push(final_ty);
             }
             let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
             let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
-            for p in &m.params {
+            for (idx, p) in m.params.iter().enumerate() {
                 let t: crate::sema::Ty = (&p.ty).into();
-                if let Some(bt) = self.llvm_ty_for_sema(&t) { param_llvm.push(bt.into()); }
+                let sema_t = if p.is_variadic {
+                    if p.ty.name() == "__derived__" {
+                        if idx == 0 {
+                            crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int))
+                        } else {
+                            let prev_raw: crate::sema::Ty = (&m.params[idx-1].ty).into();
+                            let prev_res = self.resolve_ty_for_codegen(&prev_raw);
+                            crate::sema::Ty::Array(Box::new(prev_res))
+                        }
+                    } else {
+                        crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&t)))
+                    }
+                } else {
+                    self.resolve_ty_for_codegen(&t)
+                };
+                if let Some(bt) = self.llvm_ty_for_sema(&sema_t) { param_llvm.push(bt.into()); }
             }
             let fn_ty = match ret_ty {
                 crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
@@ -261,7 +293,13 @@ impl<'ctx> Codegen<'ctx> {
             };
             let mangled = format!("{}__{}", c.name, m.name);
             let func = self.module.add_function(&mangled, fn_ty, None);
-            let tyinfo = TyInfo{ret: ret_ty.clone(), params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()};
+            let mut full_names = vec!["this".to_string()];
+            full_names.extend(m.params.iter().map(|p| p.name.clone()));
+            let mut full_modes = vec![ParamMode::None];
+            full_modes.extend(m.params.iter().map(|p| p.mode));
+            let mut full_variadic = vec![false];
+            full_variadic.extend(m.params.iter().map(|p| p.is_variadic));
+            let tyinfo = TyInfo{ret: ret_ty.clone(), params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic};
             methods.insert(m.name.clone(), (func, tyinfo));
         }
         self.class_methods.insert(c.name.clone(), methods);
@@ -270,12 +308,32 @@ impl<'ctx> Codegen<'ctx> {
         for op in &c.operators {
             let ret_ty = crate::sema::Ty::Int; // MVP: operators return int
             let mut param_semas = vec![crate::sema::Ty::Struct(c.name.clone())];
-            for pp in &op.params { param_semas.push(self.resolve_ty_for_codegen(&(&pp.ty).into())); }
+            for (idx, pp) in op.params.iter().enumerate() {
+                let raw: crate::sema::Ty = (&pp.ty).into();
+                let res = self.resolve_ty_for_codegen(&raw);
+                let final_ty = if pp.is_variadic {
+                    if pp.ty.name() == "__derived__" {
+                        if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                            let prev_raw: crate::sema::Ty = (&op.params[idx-1].ty).into();
+                            crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                        }
+                    } else { crate::sema::Ty::Array(Box::new(res)) }
+                } else { res };
+                param_semas.push(final_ty);
+            }
             let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
             let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
-            for pp in &op.params {
+            for (idx, pp) in op.params.iter().enumerate() {
                 let t: crate::sema::Ty = (&pp.ty).into();
-                if let Some(bt) = self.llvm_ty_for_sema(&t) { param_llvm.push(bt.into()); }
+                let sema_t = if pp.is_variadic {
+                    if pp.ty.name() == "__derived__" {
+                        if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                            let prev_raw: crate::sema::Ty = (&op.params[idx-1].ty).into();
+                            crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                        }
+                    } else { crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&t))) }
+                } else { self.resolve_ty_for_codegen(&t) };
+                if let Some(bt) = self.llvm_ty_for_sema(&sema_t) { param_llvm.push(bt.into()); }
             }
             let fn_ty = match ret_ty {
                 crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
@@ -295,7 +353,13 @@ impl<'ctx> Codegen<'ctx> {
             };
             let mangled = format!("{}__op_{}", c.name, op_mangled);
             let func = self.module.add_function(&mangled, fn_ty, None);
-            ops.insert(op.op.clone(), (func, TyInfo{ret: ret_ty.clone(), params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()}));
+            let mut full_names = vec!["this".to_string()];
+            full_names.extend(op.params.iter().map(|p| p.name.clone()));
+            let mut full_modes = vec![ParamMode::None];
+            full_modes.extend(op.params.iter().map(|p| p.mode));
+            let mut full_variadic = vec![false];
+            full_variadic.extend(op.params.iter().map(|p| p.is_variadic));
+            ops.insert(op.op.clone(), (func, TyInfo{ret: ret_ty.clone(), params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic}));
         }
         if !ops.is_empty() { self.class_operators.insert(c.name.clone(), ops); }
         // Inherit parent methods for extends (static dispatch)
@@ -314,21 +378,46 @@ impl<'ctx> Codegen<'ctx> {
         let mut ctors = Vec::new();
         for (idx, ctor) in c.constructors.iter().enumerate() {
             let mut param_semas = vec![crate::sema::Ty::Struct(c.name.clone())];
-            for p in &ctor.params {
+            for (pidx, p) in ctor.params.iter().enumerate() {
                 let raw: crate::sema::Ty = (&p.ty).into();
-                param_semas.push(self.resolve_ty_for_codegen(&raw));
+                let res = self.resolve_ty_for_codegen(&raw);
+                let final_ty = if p.is_variadic {
+                    if p.ty.name() == "__derived__" {
+                        if pidx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                            let prev_raw: crate::sema::Ty = (&ctor.params[pidx-1].ty).into();
+                            crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                        }
+                    } else { crate::sema::Ty::Array(Box::new(res)) }
+                } else { res };
+                param_semas.push(final_ty);
             }
             let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
             let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
-            for p in &ctor.params {
+            for (pidx, p) in ctor.params.iter().enumerate() {
                 let raw: crate::sema::Ty = (&p.ty).into();
-                let t = self.resolve_ty_for_codegen(&raw);
-                if let Some(bt) = self.llvm_ty_for_sema(&t) { param_llvm.push(bt.into()); }
+                let sema_t = if p.is_variadic {
+                    if p.ty.name() == "__derived__" {
+                        if pidx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                            let prev_raw: crate::sema::Ty = (&ctor.params[pidx-1].ty).into();
+                            crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                        }
+                    } else {
+                        let res = self.resolve_ty_for_codegen(&raw);
+                        crate::sema::Ty::Array(Box::new(res))
+                    }
+                } else { self.resolve_ty_for_codegen(&raw) };
+                if let Some(bt) = self.llvm_ty_for_sema(&sema_t) { param_llvm.push(bt.into()); }
             }
             let fn_ty = self.context.void_type().fn_type(&param_llvm, false);
             let mangled = format!("{}__ctor{}", c.name, if c.constructors.len()>1 { format!("{}", idx)} else {"".to_string()});
             let func = self.module.add_function(&mangled, fn_ty, None);
-            ctors.push((func, TyInfo{ret: crate::sema::Ty::Void, params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()}));
+            let mut full_names = vec!["this".to_string()];
+            full_names.extend(ctor.params.iter().map(|p| p.name.clone()));
+            let mut full_modes = vec![ParamMode::None];
+            full_modes.extend(ctor.params.iter().map(|p| p.mode));
+            let mut full_variadic = vec![false];
+            full_variadic.extend(ctor.params.iter().map(|p| p.is_variadic));
+            ctors.push((func, TyInfo{ret: crate::sema::Ty::Void, params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic}));
         }
         if !ctors.is_empty() { self.class_constructors.insert(c.name.clone(), ctors); }
         // Declare properties: getter/setter — allow separate declarations that merge
@@ -353,7 +442,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.module.add_function(&mangled, fn_ty, None)
                 };
                 let mut params = vec![crate::sema::Ty::Struct(c.name.clone())];
-                pg = Some((func, TyInfo{ret: prop_ty.clone(), params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new()}));
+                pg = Some((func, TyInfo{ret: prop_ty.clone(), params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new(), param_is_variadic: Vec::new()}));
             }
             if let Some((ref param,_)) = prop.setter {
                 let setter_ty_raw: crate::sema::Ty = (&param.ty).into();
@@ -368,7 +457,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.module.add_function(&mangled, fn_ty, None)
                 };
                 let mut params = vec![crate::sema::Ty::Struct(c.name.clone()), setter_ty.clone()];
-                ps = Some((func, TyInfo{ret: crate::sema::Ty::Void, params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new()}));
+                ps = Some((func, TyInfo{ret: crate::sema::Ty::Void, params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new(), param_is_variadic: Vec::new()}));
             }
             if let Some(existing) = props.get(&prop.name).cloned() {
                 let mut merged_getter = existing.getter;
@@ -465,12 +554,32 @@ impl<'ctx> Codegen<'ctx> {
                 let ret_ty_raw: crate::sema::Ty = (&f.ret_ty).into();
                 let ret_ty = self.resolve_ty_for_codegen(&ret_ty_raw);
                 let mut param_semas: Vec<crate::sema::Ty> = vec![crate::sema::Ty::Struct(target.clone())];
-                for pp in &f.params { param_semas.push(self.resolve_ty_for_codegen(&(&pp.ty).into())); }
+                for (idx, pp) in f.params.iter().enumerate() {
+                    let raw: crate::sema::Ty = (&pp.ty).into();
+                    let res = self.resolve_ty_for_codegen(&raw);
+                    let final_ty = if pp.is_variadic {
+                        if pp.ty.name() == "__derived__" {
+                            if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                                let prev_raw: crate::sema::Ty = (&f.params[idx-1].ty).into();
+                                crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                            }
+                        } else { crate::sema::Ty::Array(Box::new(res)) }
+                    } else { res };
+                    param_semas.push(final_ty);
+                }
                 let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
                 let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
-                for pp in &f.params {
+                for (idx, pp) in f.params.iter().enumerate() {
                     let t: crate::sema::Ty = (&pp.ty).into();
-                    if let Some(bt) = self.llvm_ty_for_sema(&t) { param_llvm.push(bt.into()); }
+                    let sema_t = if pp.is_variadic {
+                        if pp.ty.name() == "__derived__" {
+                            if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                                let prev_raw: crate::sema::Ty = (&f.params[idx-1].ty).into();
+                                crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                            }
+                        } else { crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&t))) }
+                    } else { self.resolve_ty_for_codegen(&t) };
+                    if let Some(bt) = self.llvm_ty_for_sema(&sema_t) { param_llvm.push(bt.into()); }
                 }
                 let fn_ty = match ret_ty {
                     crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
@@ -502,7 +611,13 @@ impl<'ctx> Codegen<'ctx> {
                 let mangled = format!("{}__{}", target, f.name);
                 let func = self.module.add_function(&mangled, fn_ty, None);
                 let entry = self.class_methods.entry(target.clone()).or_insert_with(std::collections::HashMap::new);
-                entry.insert(f.name.clone(), (func, TyInfo{ret: ret_ty, params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()}));
+                let mut full_names = vec!["this".to_string()];
+                full_names.extend(f.params.iter().map(|p| p.name.clone()));
+                let mut full_modes = vec![ParamMode::None];
+                full_modes.extend(f.params.iter().map(|p| p.mode));
+                let mut full_variadic = vec![false];
+                full_variadic.extend(f.params.iter().map(|p| p.is_variadic));
+                entry.insert(f.name.clone(), (func, TyInfo{ret: ret_ty, params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic}));
             }
         }
         Ok(())
@@ -512,20 +627,43 @@ impl<'ctx> Codegen<'ctx> {
         for mem in &ext.members {
             if let crate::ast::ExternMember::Function{ty, name, params, ..} = mem {
                 let ret_ty: crate::sema::Ty = ty.into();
-                let param_tys: Vec<crate::sema::Ty> = params.iter().map(|p| (&p.ty).into()).collect();
+                let mut is_c_varargs = params.iter().any(|p| p.is_variadic && p.name.is_empty());
+                // Special: `extern "c" from "libc" do int printf(string arg) end` in advanced.hlt declares `printf` with one `string` param
+                // but real C `printf` is variadic `int printf(const char*, ...)`. For `printInt` intrinsic we need variadic `i32 (ptr, ...)`.
+                // If user declares `printf` with single `string` param and non-variadic, treat it as variadic C `printf`.
+                if name == "printf" && params.len() == 1 && !is_c_varargs {
+                    if let Some(p) = params.first() {
+                        if matches!(&p.ty, Type::String(_)) {
+                            is_c_varargs = true;
+                        }
+                    }
+                }
+                // For C `printf`, ensure variadic `i32 (ptr, ...)` even though Holt `int` maps to `i64`
+                if name == "printf" && is_c_varargs {
+                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                    let fn_ty = self.context.i32_type().fn_type(&[ptr_ty], true);
+                    self.module.add_function(name, fn_ty, None);
+                    continue;
+                }
+                let param_tys: Vec<crate::sema::Ty> = params.iter().filter(|p| !(p.is_variadic && p.name.is_empty())).map(|p| {
+                    let base: crate::sema::Ty = (&p.ty).into();
+                    if p.is_variadic {
+                        crate::sema::Ty::Array(Box::new(base))
+                    } else { base }
+                }).collect();
                 let param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = param_tys.iter().filter_map(|t| self.llvm_ty_for_sema(t).map(|bt| bt.into())).collect();
                 let fn_ty = match ret_ty {
-                    crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_llvm, false),
+                    crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, is_c_varargs),
+                    crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, is_c_varargs),
+                    crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, is_c_varargs),
+                    crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, is_c_varargs),
+                    crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, is_c_varargs),
+                    crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_llvm, is_c_varargs),
+                    crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_llvm, is_c_varargs),
                     crate::sema::Ty::Struct(_) | crate::sema::Ty::Enum(_) | crate::sema::Ty::Generic(_,_) => {
-                        if let Some(bt) = self.llvm_ty_for_sema(&ret_ty) { bt.fn_type(&param_llvm, false) } else { self.context.void_type().fn_type(&param_llvm, false) }
+                        if let Some(bt) = self.llvm_ty_for_sema(&ret_ty) { bt.fn_type(&param_llvm, is_c_varargs) } else { self.context.void_type().fn_type(&param_llvm, is_c_varargs) }
                     }
-                    _ => self.context.void_type().fn_type(&param_llvm, false),
+                    _ => self.context.void_type().fn_type(&param_llvm, is_c_varargs),
                 };
                 self.module.add_function(name, fn_ty, None);
             }
@@ -641,6 +779,9 @@ impl<'ctx> Codegen<'ctx> {
                 panic!("void not a first-class type in llvm_ty_for")
             }
             Type::Named(n, _) => {
+                if n == "__derived__" {
+                    return self.context.i64_type().into();
+                }
                 let lookup = n.rsplit("::").next().unwrap_or(n);
                 if lookup.len() == 1 && lookup.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                     return self.context.i64_type().into();
@@ -674,7 +815,17 @@ impl<'ctx> Codegen<'ctx> {
                 self.context.struct_type(&tys_llvm, false).into()
             }
             Type::Any(_) => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
-            Type::Array(_, _) => self.context.i64_type().array_type(16).into(),
+            Type::Array(el, _) => {
+                let inner = self.llvm_ty_for(el);
+                match inner {
+                    BasicTypeEnum::IntType(it) => it.array_type(16).into(),
+                    BasicTypeEnum::PointerType(pt) => pt.array_type(16).into(),
+                    BasicTypeEnum::FloatType(ft) => ft.array_type(16).into(),
+                    BasicTypeEnum::StructType(st) => st.array_type(16).into(),
+                    BasicTypeEnum::ArrayType(at) => at.array_type(16).into(),
+                    _ => self.context.i64_type().array_type(16).into(),
+                }
+            }
             Type::Pointer(_, _) => self
                 .context
                 .ptr_type(inkwell::AddressSpace::default())
@@ -706,6 +857,9 @@ impl<'ctx> Codegen<'ctx> {
             ),
             crate::sema::Ty::Void => None,
             crate::sema::Ty::Struct(n) => {
+                if n == "__derived__" {
+                    return Some(self.context.i64_type().into());
+                }
                 let lookup = n.rsplit("::").next().unwrap_or(n);
                 if lookup.len() == 1 && lookup.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                     return Some(self.context.i64_type().into());
@@ -736,8 +890,19 @@ impl<'ctx> Codegen<'ctx> {
             }
             crate::sema::Ty::Any => Some(self.context.ptr_type(inkwell::AddressSpace::default()).into()),
             crate::sema::Ty::Function(_, _) => Some(self.context.ptr_type(inkwell::AddressSpace::default()).into()),
-            crate::sema::Ty::Array(_) => {
-                Some(self.context.i64_type().array_type(16).into())
+            crate::sema::Ty::Array(el) => {
+                if let Some(inner) = self.llvm_ty_for_sema(el) {
+                    match inner {
+                        BasicTypeEnum::IntType(it) => Some(it.array_type(16).into()),
+                        BasicTypeEnum::PointerType(pt) => Some(pt.array_type(16).into()),
+                        BasicTypeEnum::FloatType(ft) => Some(ft.array_type(16).into()),
+                        BasicTypeEnum::StructType(st) => Some(st.array_type(16).into()),
+                        BasicTypeEnum::ArrayType(at) => Some(at.array_type(16).into()),
+                        _ => Some(self.context.i64_type().array_type(16).into()),
+                    }
+                } else {
+                    Some(self.context.i64_type().array_type(16).into())
+                }
             }
             crate::sema::Ty::Pointer(_) => Some(
                 self.context
@@ -773,17 +938,65 @@ impl<'ctx> Codegen<'ctx> {
     fn declare_function(&mut self, f: &Function) -> Result<(), CodegenError> {
         let ret_sema_raw: crate::sema::Ty = (&f.ret_ty).into();
         let ret_sema = self.resolve_ty_for_codegen(&ret_sema_raw);
-        let param_semas_raw: Vec<crate::sema::Ty> =
-            f.params.iter().map(|p| (&p.ty).into()).collect();
-        let param_semas: Vec<crate::sema::Ty> = param_semas_raw.iter().map(|t| self.resolve_ty_for_codegen(t)).collect();
+        let param_semas: Vec<crate::sema::Ty> = f.params.iter().enumerate().map(|(idx, p)| {
+            let raw: crate::sema::Ty = (&p.ty).into();
+            let res = self.resolve_ty_for_codegen(&raw);
+            if p.is_variadic {
+                if p.ty.name() == "__derived__" {
+                    if idx == 0 {
+                        crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int))
+                    } else {
+                        let prev_raw: crate::sema::Ty = (&f.params[idx-1].ty).into();
+                        let prev_res = self.resolve_ty_for_codegen(&prev_raw);
+                        crate::sema::Ty::Array(Box::new(prev_res))
+                    }
+                } else {
+                    crate::sema::Ty::Array(Box::new(res))
+                }
+            } else {
+                res
+            }
+        }).collect();
         let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
+        let param_is_variadic: Vec<bool> = f.params.iter().map(|p| p.is_variadic).collect();
 
         let param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = f
             .params
             .iter()
+            .filter(|p| !(p.is_variadic && p.name.is_empty())) // `...` alone for C varargs has no param, not a real param
             .map(|p| {
                 if p.mode != ParamMode::None {
                     self.context.ptr_type(inkwell::AddressSpace::default()).into()
+                } else if p.is_variadic {
+                    // `...T vda` where `vda` is `T[]` array, or `... vda` derived
+                    let elem_ty: crate::sema::Ty = if p.ty.name() == "__derived__" {
+                        if let Some(prev_idx) = f.params.iter().position(|x| x.name == p.name) {
+                            if prev_idx > 0 {
+                                (&f.params[prev_idx-1].ty).into()
+                            } else {
+                                crate::sema::Ty::Int
+                            }
+                        } else {
+                            crate::sema::Ty::Int
+                        }
+                    } else {
+                        (&p.ty).into()
+                    };
+                    let elem_rt = self.resolve_ty_for_codegen(&elem_ty);
+                    if let Some(bt) = self.llvm_ty_for_sema(&elem_rt) {
+                        if elem_rt == crate::sema::Ty::Int {
+                            self.context.i64_type().array_type(16).into()
+                        } else {
+                            let elem_llvm = self.llvm_ty_for_sema(&elem_rt).unwrap();
+                            match elem_llvm {
+                                inkwell::types::BasicTypeEnum::PointerType(pt) => pt.array_type(16).into(),
+                                inkwell::types::BasicTypeEnum::IntType(it) => it.array_type(16).into(),
+                                _ => elem_llvm.into(),
+                            }
+                        }
+                    } else {
+                        self.context.ptr_type(inkwell::AddressSpace::default()).into()
+                    }
                 } else {
                     let t: crate::sema::Ty = (&p.ty).into();
                     let rt = self.resolve_ty_for_codegen(&t);
@@ -791,49 +1004,49 @@ impl<'ctx> Codegen<'ctx> {
                 }
             })
             .collect();
-
+        let is_c_varargs = f.params.iter().any(|p| p.is_variadic && p.name.is_empty());
         // Special ABI for `main`: C `int main()` is always i32
         let fn_ty = if f.name == "main" {
-            self.context.i32_type().fn_type(&param_types, false)
+            self.context.i32_type().fn_type(&param_types, is_c_varargs)
         } else {
             match ret_sema {
                 crate::sema::Ty::Void => {
-                    self.context.void_type().fn_type(&param_types, false)
+                    self.context.void_type().fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Int => {
-                    self.context.i64_type().fn_type(&param_types, false)
+                    self.context.i64_type().fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Bool => {
-                    self.context.bool_type().fn_type(&param_types, false)
+                    self.context.bool_type().fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Char => {
-                    self.context.i32_type().fn_type(&param_types, false)
+                    self.context.i32_type().fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::String => self
                     .context
                     .ptr_type(inkwell::AddressSpace::default())
-                    .fn_type(&param_types, false),
+                    .fn_type(&param_types, is_c_varargs),
                 crate::sema::Ty::Struct(ref n) if n.len()==1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) => {
-                    self.context.i64_type().fn_type(&param_types, false)
+                    self.context.i64_type().fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Struct(ref n) => {
                     let st = self.struct_types.get(n).ok_or(CodegenError {
                         message: format!("unknown struct {n}"),
                         span: f.ret_ty.span(),
                     })?;
-                    st.fn_type(&param_types, false)
+                    st.fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Array(ref el) => {
                     // arrays as fixed [16 x elem] return — rarely used but support
                     let elem_ty = self.llvm_ty_for_sema(el).unwrap();
                     // For array element i64, array type is [16 x i64]
                     let arr_ty = self.context.i64_type().array_type(16);
-                    arr_ty.fn_type(&param_types, false)
+                    arr_ty.fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Pointer(_) => self
                     .context
                     .ptr_type(inkwell::AddressSpace::default())
-                    .fn_type(&param_types, false),
+                    .fn_type(&param_types, is_c_varargs),
                 crate::sema::Ty::Optional(ref el) => {
                     let inner = self.llvm_ty_for_sema(el).unwrap();
                     self.context
@@ -841,19 +1054,19 @@ impl<'ctx> Codegen<'ctx> {
                             &[inner.into(), self.context.bool_type().into()],
                             false,
                         )
-                        .fn_type(&param_types, false)
+                        .fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Enum(ref n) => {
                     let et = self.enum_types.get(n).ok_or(CodegenError{message: format!("unknown enum {n}"), span: f.ret_ty.span()})?;
-                    et.fn_type(&param_types, false)
+                    et.fn_type(&param_types, is_c_varargs)
                 }
-                crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_types, false),
-                crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_types, false),
-                crate::sema::Ty::Generic(ref n, _) if n.len()==1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) => self.context.i64_type().fn_type(&param_types, false),
-                crate::sema::Ty::Generic(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, false),
-                crate::sema::Ty::Tuple(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, false),
-                crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, false),
-                crate::sema::Ty::Function(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, false),
+                crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_types, is_c_varargs),
+                crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_types, is_c_varargs),
+                crate::sema::Ty::Generic(ref n, _) if n.len()==1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) => self.context.i64_type().fn_type(&param_types, is_c_varargs),
+                crate::sema::Ty::Generic(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, is_c_varargs),
+                crate::sema::Ty::Tuple(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, is_c_varargs),
+                crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, is_c_varargs),
+                crate::sema::Ty::Function(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_types, is_c_varargs),
             }
         };
 
@@ -867,6 +1080,7 @@ impl<'ctx> Codegen<'ctx> {
                     params: param_semas,
                     param_modes,
                     param_names: f.params.iter().map(|p| p.name.clone()).collect(),
+                    param_is_variadic: f.params.iter().map(|p| p.is_variadic).collect(),
                 },
             ),
         );
@@ -1011,10 +1225,29 @@ impl<'ctx> Codegen<'ctx> {
         for (i, param) in f.params.iter().enumerate() {
             let param_val = func.get_nth_param(i as u32).unwrap();
             if param.mode != ParamMode::None {
-                // out/ref: incoming is ptr to caller's storage
                 let inner_ty = self.llvm_ty_for(&param.ty);
                 let ptr = param_val.into_pointer_value();
                 self.vars.last_mut().unwrap().insert(param.name.clone(), (ptr, inner_ty));
+            } else if param.is_variadic {
+                // `...T vda` where `vda` is `T[]` array, `... vda` derived from previous
+                let elem_ty = self.llvm_ty_for(&param.ty);
+                // For derived `__derived__`, elem_ty is placeholder, use previous param's type
+                let actual_elem_ty = if param.ty.name() == "__derived__" {
+                    if i > 0 {
+                        self.llvm_ty_for(&f.params[i-1].ty)
+                    } else { elem_ty }
+                } else { elem_ty };
+                let arr_ty = match actual_elem_ty {
+                    ty if ty.is_int_type() => self.context.i64_type().array_type(16).into(),
+                    ty if ty.is_pointer_type() => ty.into_pointer_type().array_type(16).into(),
+                    _ => actual_elem_ty,
+                };
+                // For variadic, the param is already an array value (passed as array), need alloca for it
+                let alloca = self.create_entry_block_alloca(&param.name, arr_ty);
+                // param_val is array value for `...T vda` case, not pointer, so store it
+                // For `...T vda` where `vda` is `T[]`, the LLVM param is array type, so param_val is array value
+                self.builder.build_store(alloca, param_val).unwrap();
+                self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, arr_ty));
             } else {
                 let llvm_ty = self.llvm_ty_for(&param.ty);
                 let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
@@ -1121,7 +1354,32 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_store(this_alloca, this_param).unwrap();
         self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
         for (i, param) in method.params.iter().enumerate() {
-            let llvm_ty = self.llvm_ty_for(&param.ty);
+            // Variadic `...T vda` -> `T[]` array type, `... vda` derived from previous
+            let llvm_ty = if param.is_variadic {
+                if param.ty.name() == "__derived__" {
+                    if i == 0 {
+                        self.context.i64_type().array_type(16).into()
+                    } else {
+                        let prev_ty = self.llvm_ty_for(&method.params[i-1].ty);
+                        match prev_ty {
+                            ty if ty.is_int_type() => self.context.i64_type().array_type(16).into(),
+                            ty if ty.is_pointer_type() => ty.into_pointer_type().array_type(16).into(),
+                            ty if ty.is_struct_type() => ty.into_struct_type().array_type(16).into(),
+                            _ => prev_ty,
+                        }
+                    }
+                } else {
+                    let elem_ty = self.llvm_ty_for(&param.ty);
+                    match elem_ty {
+                        ty if ty.is_int_type() => self.context.i64_type().array_type(16).into(),
+                        ty if ty.is_pointer_type() => ty.into_pointer_type().array_type(16).into(),
+                        ty if ty.is_struct_type() => ty.into_struct_type().array_type(16).into(),
+                        _ => elem_ty,
+                    }
+                }
+            } else {
+                self.llvm_ty_for(&param.ty)
+            };
             let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
             let param_val = func.get_nth_param((i+1) as u32).unwrap();
             self.builder.build_store(alloca, param_val).unwrap();
@@ -1179,7 +1437,29 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_store(this_alloca, this_param).unwrap();
         self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
         for (i, param) in ctor.params.iter().enumerate() {
-            let llvm_ty = self.llvm_ty_for(&param.ty);
+            let llvm_ty = if param.is_variadic {
+                if param.ty.name() == "__derived__" {
+                    if i == 0 {
+                        self.context.i64_type().array_type(16).into()
+                    } else {
+                        let prev_ty = self.llvm_ty_for(&ctor.params[i-1].ty);
+                        match prev_ty {
+                            ty if ty.is_int_type() => self.context.i64_type().array_type(16).into(),
+                            ty if ty.is_pointer_type() => ty.into_pointer_type().array_type(16).into(),
+                            _ => prev_ty,
+                        }
+                    }
+                } else {
+                    let elem_ty = self.llvm_ty_for(&param.ty);
+                    match elem_ty {
+                        ty if ty.is_int_type() => self.context.i64_type().array_type(16).into(),
+                        ty if ty.is_pointer_type() => ty.into_pointer_type().array_type(16).into(),
+                        _ => elem_ty,
+                    }
+                }
+            } else {
+                self.llvm_ty_for(&param.ty)
+            };
             let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
             let val = func.get_nth_param((i+1) as u32).unwrap();
             self.builder.build_store(alloca, val).unwrap();
@@ -1960,11 +2240,64 @@ impl<'ctx> Codegen<'ctx> {
                     _ => return Err(CodegenError{message: format!("method call on non-class"), span: expr.span}),
                 };
                 let methods = self.class_methods.get(&cls_name).ok_or(CodegenError{message: format!("unknown class {cls_name}"), span: expr.span})?;
-                let (func, _info) = methods.get(method).cloned().ok_or(CodegenError{message: format!("unknown method {method} for class {cls_name}"), span: expr.span})?;
+                let (func, info) = methods.get(method).cloned().ok_or(CodegenError{message: format!("unknown method {method} for class {cls_name}"), span: expr.span})?;
                 let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = vec![this_ptr.into()];
-                for a in args {
-                    let v = self.codegen_call_arg(a)?;
-                    arg_vals.push(v.into());
+                // Variadic handling for method `...T vda` (with `this` offset)
+                let variadic_idx = info.param_is_variadic.iter().position(|&v| v);
+                if let Some(vidx) = variadic_idx {
+                    // vidx includes `this` at 0, so real fixed before variadic = vidx -1
+                    let fixed_real = if vidx == 0 { 0 } else { vidx - 1 };
+                    // push fixed real params
+                    for (i, a) in args.iter().take(fixed_real).enumerate() {
+                        let v = self.codegen_call_arg(a)?;
+                        arg_vals.push(v.into());
+                    }
+                    // variadic element type
+                    let elem_ty = info.params.get(vidx).and_then(|t| if let crate::sema::Ty::Array(el) = t { Some(&**el) } else { None }).cloned().unwrap_or(crate::sema::Ty::Int);
+                    let arr_llvm_ty: BasicTypeEnum = if let Some(bt) = self.llvm_ty_for_sema(&elem_ty) {
+                        match bt {
+                            BasicTypeEnum::PointerType(pt) => pt.array_type(16).into(),
+                            BasicTypeEnum::IntType(it) => it.array_type(16).into(),
+                            BasicTypeEnum::FloatType(ft) => ft.array_type(16).into(),
+                            BasicTypeEnum::StructType(st) => st.array_type(16).into(),
+                            BasicTypeEnum::ArrayType(at) => at.array_type(16).into(),
+                            _ => self.context.i64_type().array_type(16).into(),
+                        }
+                    } else {
+                        self.context.i64_type().array_type(16).into()
+                    };
+                    let total_real_params = info.params.len() - 1; // excluding this
+                    let remaining_after = total_real_params - (vidx - 1) - 1; // params after variadic
+                    let vda_count = if remaining_after == 0 {
+                        args.len() - fixed_real
+                    } else {
+                        if args.len() >= total_real_params { args.len() - total_real_params + 1 } else { 0 }
+                    };
+                    let mut arr_val: BasicValueEnum = arr_llvm_ty.into_array_type().get_undef().into();
+                    if args.len() <= fixed_real {
+                        arr_val = arr_llvm_ty.const_zero().into();
+                    } else {
+                        for (j, arg) in args.iter().skip(fixed_real).take(vda_count).enumerate() {
+                            let v = self.codegen_call_arg(arg)?;
+                            if arr_val.is_array_value() {
+                                let tmp = self.builder.build_insert_value(arr_val.into_array_value(), v, j as u32, &format!("vararg.{}", j)).unwrap();
+                                arr_val = tmp.as_basic_value_enum();
+                            }
+                        }
+                        if vda_count == 0 {
+                            arr_val = arr_llvm_ty.const_zero().into();
+                        }
+                    }
+                    arg_vals.push(arr_val.into());
+                    for arg in args.iter().skip(fixed_real + vda_count) {
+                        let v = self.codegen_call_arg(arg)?;
+                        arg_vals.push(v.into());
+                    }
+                } else {
+                    for a in args {
+                        let v = self.codegen_call_arg(a)?;
+                        arg_vals.push(v.into());
+                    }
                 }
                 let call = self.builder.build_call(func, &arg_vals, "call").unwrap();
                 let vk = call.try_as_basic_value();
@@ -2471,28 +2804,115 @@ impl<'ctx> Codegen<'ctx> {
                 // Try direct function, extern, or variable function pointer
                 if let Some((func, info)) = self.funcs.get(callee).cloned() {
                     let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-                    let has_named = args.iter().any(|a| matches!(a, CallArg::Named{..}));
-                    if has_named && !info.param_names.is_empty() {
-                        let mut map: std::collections::HashMap<String, &CallArg> = std::collections::HashMap::new();
-                        for a in args {
-                            if let CallArg::Named { name, .. } = a {
-                                map.insert(name.clone(), a);
-                            }
-                        }
-                        for pname in &info.param_names {
-                            if let Some(arg) = map.get(pname) {
-                                let v = self.codegen_call_arg(arg)?;
+                    let variadic_idx = info.param_is_variadic.iter().position(|&v| v);
+                    let is_c_varargs = info.param_is_variadic.iter().enumerate().any(|(i, &v)| v && info.param_names.get(i).map(|n| n.is_empty()).unwrap_or(false));
+                    if let Some(vidx) = variadic_idx {
+                        if is_c_varargs {
+                            // C varargs `...` alone: push fixed args then variadic args directly
+                            for a in args { let v = self.codegen_call_arg(a)?; arg_vals.push(v.into()); }
+                        } else {
+                            // Holt variadic `...T vda` where `vda` is `T[]`
+                            let fixed = vidx;
+                            // fixed params before variadic
+                            for (i, a) in args.iter().take(fixed).enumerate() {
+                                // handle named if any? For variadic with named, assume positional for fixed
+                                let v = self.codegen_call_arg(a)?;
                                 arg_vals.push(v.into());
+                            }
+                            // variadic tail: `vda` as `T[]` array
+                            let elem_ty = info.params.get(vidx).and_then(|t| if let crate::sema::Ty::Array(el) = t { Some(&**el) } else { None }).cloned().unwrap_or(crate::sema::Ty::Int);
+                            let arr_llvm_ty: BasicTypeEnum = if let Some(bt) = self.llvm_ty_for_sema(&elem_ty) {
+                                match bt {
+                                    BasicTypeEnum::PointerType(pt) => pt.array_type(16).into(),
+                                    BasicTypeEnum::IntType(it) => it.array_type(16).into(),
+                                    BasicTypeEnum::FloatType(ft) => ft.array_type(16).into(),
+                                    BasicTypeEnum::StructType(st) => st.array_type(16).into(),
+                                    BasicTypeEnum::ArrayType(at) => at.array_type(16).into(),
+                                    _ => self.context.i64_type().array_type(16).into(),
+                                }
                             } else {
-                                // fallback: try positional (should not happen for all-named)
-                                // find positional arg at same index if exists
-                                // For now, push zero
-                                arg_vals.push(self.context.i64_type().const_int(0,false).into());
+                                self.context.i64_type().array_type(16).into()
+                            };
+                            let mut arr_val: BasicValueEnum = arr_llvm_ty.into_array_type().get_undef().into();
+                            // Fill array with variadic args
+                            for (j, arg) in args.iter().skip(fixed).enumerate() {
+                                let v = self.codegen_call_arg(arg)?;
+                                let idx = self.context.i32_type().const_int(j as u64, false);
+                                // For array, use insert_value
+                                if arr_val.is_array_value() {
+                                    let tmp = self.builder.build_insert_value(arr_val.into_array_value(), v, j as u32, &format!("vararg.{}", j)).unwrap();
+                                    arr_val = tmp.as_basic_value_enum();
+                                } else {
+                                    // For struct? Just use first
+                                    arr_val = v;
+                                }
+                            }
+                            // If no variadic args, arr_val is undef, need to make zero
+                            if args.len() <= fixed {
+                                arr_val = arr_llvm_ty.const_zero().into();
+                            }
+                            arg_vals.push(arr_val.into());
+                            // Handle remaining fixed params after variadic if any (when variadic not last but explicit type allows middle)
+                            // For `a, ...int vda, b` where `vda` is variadic in middle, `b` is after, we need to handle
+                            // For now, assume variadic is last for derived, but for explicit middle, we need to handle
+                            // For `...string vda, bool cond` with `vda` variadic in middle, `cond` is after, the variadic `vda` should consume `args[fixed.. args.len()-1]` and `cond` is last arg
+                            // Detect if variadic not last: if vidx + 1 < info.params.len(), then last param is after variadic
+                            if vidx + 1 < info.params.len() {
+                                // For `...string vda, bool cond` with `vda` at vidx, `cond` at vidx+1, the call `log("fmt", "a", "b", true)` where `fmt` at 0, `vda` at 1 is variadic, `cond` at 2 is bool
+                                // `args` is `["fmt", "a", "b", true]` with 4 args, `fixed` is vidx (1), `vda` is at 1, `cond` is at 2
+                                // We already handled `vda` as array with `args[1..3]` as `["a","b"]` and `true` as `cond` should be last
+                                // But our current handling for variadic `vda` as array with `args[fixed..]` as all remaining, would include `true` as part of `vda` incorrectly
+                                // For explicit variadic in middle, we need to know how many args belong to `vda` vs `cond`
+                                // For MVP, assume variadic `vda` consumes `args.len() - params.len() + 1` args
+                                // E.g., `log(string fmt, ...string vda, bool cond)` with `fmt` at 0, `vda` at 1, `cond` at 2, `params.len()=3`, `args.len()=4` where `args` is `["fmt", "a", "b", true]` -> `vda` should be `["a","b"]` (2) and `cond` is `true` (1)
+                                // So variadic element count = args.len() - params.len() + 1
+                                // We already pushed `vda` as array with all remaining, but we need to handle `cond` separately
+                                // For now, we already pushed `vda` as array with `args[fixed..]` (= `["a","b",true]`), which incorrectly includes `true`
+                                // To fix, we need to handle variadic not last: `vda` should be `args[fixed .. args.len() - (params.len() - vidx -1)]`
+                                // For `vda` at 1 with `params.len()=3`, `args.len()=4`, `vda` count = 4 -3 +1 =2, so `vda` is `args[1..3]` = `["a","b"]`, `cond` is `args[3]` = `true`
+                                // We should handle this
+                                let remaining_params = info.params.len() - vidx - 1;
+                                let vda_count = args.len() - info.params.len() + 1;
+                                // Rebuild arg_vals without the incorrect vda, and fix
+                                // For now, pop the incorrectly built vda and rebuild
+                                arg_vals.pop();
+                                // Rebuild vda with correct count
+                                let mut arr_val2: BasicValueEnum = arr_llvm_ty.const_zero().into();
+                                for (j, arg) in args.iter().skip(fixed).take(vda_count).enumerate() {
+                                    let v = self.codegen_call_arg(arg)?;
+                                    if arr_val2.is_array_value() {
+                                        let tmp = self.builder.build_insert_value(arr_val2.into_array_value(), v, j as u32, &format!("vararg.fix.{}", j)).unwrap();
+                                        arr_val2 = tmp.as_basic_value_enum();
+                                    }
+                                }
+                                arg_vals.push(arr_val2.into());
+                                // Push remaining fixed after variadic
+                                for arg in args.iter().skip(fixed + vda_count) {
+                                    let v = self.codegen_call_arg(arg)?;
+                                    arg_vals.push(v.into());
+                                }
                             }
                         }
-                        // If there are positional args mixed, they are ignored in this path (MVP: require all named if any named)
                     } else {
-                        for a in args { let v = self.codegen_call_arg(a)?; arg_vals.push(v.into()); }
+                        let has_named = args.iter().any(|a| matches!(a, CallArg::Named{..}));
+                        if has_named && !info.param_names.is_empty() {
+                            let mut map: std::collections::HashMap<String, &CallArg> = std::collections::HashMap::new();
+                            for a in args {
+                                if let CallArg::Named { name, .. } = a {
+                                    map.insert(name.clone(), a);
+                                }
+                            }
+                            for pname in &info.param_names {
+                                if let Some(arg) = map.get(pname) {
+                                    let v = self.codegen_call_arg(arg)?;
+                                    arg_vals.push(v.into());
+                                } else {
+                                    arg_vals.push(self.context.i64_type().const_int(0,false).into());
+                                }
+                            }
+                        } else {
+                            for a in args { let v = self.codegen_call_arg(a)?; arg_vals.push(v.into()); }
+                        }
                     }
                     let call = self.builder.build_call(func, &arg_vals, "call").unwrap();
                     let vk = call.try_as_basic_value();

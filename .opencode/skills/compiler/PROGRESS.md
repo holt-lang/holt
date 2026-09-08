@@ -118,8 +118,20 @@
   - `compiler/src/codegen/mod.rs:406` `declare_enum` `Option<Expr>` discriminant (`IntLit` vs `idx`), payload still `i64` (first param for MVP), `2679` `EnumVariant` codegen payload `i64` (first arg) with `Vec<Ty>` check.
   - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 6 ok, `/tmp/t13_test.hlt` `Color Red=1 Green=2 Blue=3+2` `Option<T> Some(T) None` `Result<T,E> Ok(T) Err(E,int)` `Some(42)`/`None`/`Ok(100)`/`Err` → build ok.
 
-## Next — T-14
+## T-14 DONE — 2026-09-09 (variadic `...`)
 
-- **T-14 Structs: field visibility + default `= expr`** — `struct` `field` `visibility` + `= expr`.
-- Continue `T-14`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `parameter = ["..."] [parameter-mode] [type] ident` per EBNF §21 `parameter` + `extern-parameter` (`...int vda` → `vda: int[]`, `...T vda` → `T[]` with `where T: Trait`, `... vda` derived from previous `type` and must be last, `...` may appear anywhere when explicit `type` present `log(string fmt, ...string vda, bool cond)`).
+- **Done:**
+  - `references/ebnf-0.1.txt:848` `parameter` comment + `variadic-marker = "..."` + `extern-parameter` `...` alone vs `...T vda`/`... vda`.
+  - `compiler/src/token.rs:263` `DotDotDot`, `compiler/src/ast.rs:85` `Param.is_variadic` + `ExternParam.is_variadic`.
+  - `compiler/src/parse/mod.rs:1377` `parse_param` (`...` + `__derived__` for `... vda`, `ref`/`out` + `where`-preserving), `536` `parse_class_decl` (methods/ctors/operators via `parse_param`), `904` `parse_trait_decl`, `2531` closure `|...|` via `parse_param`.
+  - `compiler/src/sema/mod.rs:88` `FuncSig.param_is_variadic`, `465` class methods/`390` trait/`639` operator/`722` extension + `808` free fn `Array` wrapping (`__derived__` → `prev_type[]`), derived-must-be-last + not-first, `1503` `Call`/`1969` `MethodCall` via `check_call_with_sig` (middle variadic `vda_count = args.len()-params.len()+1`, generic `...T` `where` via `check_generic_bounds`), `55` `Ty::Display` `Generic` `T<>` fix.
+  - `compiler/src/codegen/mod.rs:900` `declare_function`/`214` `declare_class`/`500` `declare_extension`/`626` `declare_extern` (`...` alone `is_c_varargs` vs `...T vda`) `TyInfo` `Array` + `llvm_ty_for`/`llvm_ty_for_sema` element-aware `[16 x T]` (`string`→`ptr`, `int`→`i64`), `2746` `Call`/`2154` `MethodCall` array building (`[16 x T]` `insert_value` + middle variadic), `extern "c" printf(string)` → variadic `i32 (ptr, ...)` for `printInt`.
+  - `examples/variadic.hlt` demonstrates `...int`/`...string`/`...T where T: int`/`... vda` derived/`...string vda, bool cond` middle.
+- **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok (incl. `variadic.hlt` `42 hi`/`10`/`a1`/`aab`), `/tmp/test_variadic1` derived-not-last → error, `/tmp/test_variadic3` derived-first → error, class `Logger.log`/`logDerived` ok, `extern printf(string)` still links.
+
+## Next — T-15
+
+- **T-15 Structs: field visibility + default `= expr`** — `struct` `field` `visibility` + `= expr`.
+- Continue `T-15`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
 

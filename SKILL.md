@@ -176,15 +176,16 @@ T-10 Statements: assert / debug_assert expr [,expr] ;
 T-11 Functions: ref/out parameter-mode, initialize; for free fns, generic params + where preservation (currently Vec::new())
 T-12 Traits: function-signature generic + where
 T-13 Enums: multi-param payload (a,b) + discriminant expr (non-int) + generic enum monomorph
-T-14 Structs: field visibility + default = expr handling (currently ignored parse_struct_decl:326)
-T-15 Where/bounds: enforce generic bounds and where-constraints (currently parsed but unchecked)
-T-16 Match: | alternative chains, tuple-pattern (a,b), exhaustive enum handling
-T-17 Loops: for over non-array (String iteration already), defer inside for
-T-18 Functions: int main(string[] args) signature per EBNF §37 (sema currently rejects)
-T-19 FFI: extern-struct has {field} end / extern-enum / extern-const const T N;
-T-20 Extensions: field/operator/property/conversion members (currently only Function)
-T-21 Top-level: variable-declaration / constant-declaration as top-level (parse_program fallback is Function)
-T-22 Docs/examples: keep README Build & Run (holt build) and examples advanced/data_control/abstraction in sync
+T-14 Variadic `...` in all functions — explicit `...T` anywhere, derived `...` must be last (int log(string fmt, ...int vda) / ... vda derived / ...string vda, bool cond + generics where)
+T-15 Structs: field visibility + default = expr handling (currently ignored parse_struct_decl:326)
+T-16 Where/bounds: enforce generic bounds and where-constraints (currently parsed but unchecked)
+T-17 Match: | alternative chains, tuple-pattern (a,b), exhaustive enum handling
+T-18 Loops: for over non-array (String iteration already), defer inside for
+T-19 Functions: int main(string[] args) signature per EBNF §37 (sema currently rejects)
+T-20 FFI: extern-struct has {field} end / extern-enum / extern-const const T N;
+T-21 Extensions: field/operator/property/conversion members (currently only Function)
+T-22 Top-level: variable-declaration / constant-declaration as top-level (parse_program fallback is Function)
+T-23 Docs/examples: keep README Build & Run (holt build) and examples advanced/data_control/abstraction/variadic in sync
 ```
 
 Check off via `TodoWrite` and `cargo run -p holt -- build examples/<file>` for each.

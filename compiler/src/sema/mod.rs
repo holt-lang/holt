@@ -74,7 +74,13 @@ impl std::fmt::Display for Ty {
             Ty::Double => write!(f, "double"),
             Ty::Struct(n) => write!(f, "{}", n),
             Ty::Enum(n) => write!(f, "{}", n),
-            Ty::Generic(n, args) => write!(f, "{}<{}>", n, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
+            Ty::Generic(n, args) => {
+                if args.is_empty() {
+                    write!(f, "{}", n)
+                } else {
+                    write!(f, "{}<{}>", n, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))
+                }
+            }
             Ty::Tuple(tys) => write!(f, "({})", tys.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::Any => write!(f, "any"),
             Ty::Function(ret, args) => write!(f, "function<{}({})>", ret, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
@@ -91,6 +97,7 @@ struct FuncSig {
     params: Vec<Ty>,
     param_modes: Vec<ParamMode>,
     param_names: Vec<String>,
+    param_is_variadic: Vec<bool>,
     generic_params: Vec<GenericParam>,
     where_clause: Option<WhereClause>,
     span: Span,
@@ -262,7 +269,10 @@ impl Checker {
                     return t;
                 }
             }
-            if self.enums.contains_key(lookup) {
+            if n == "__derived__" {
+                // Variadic derived `... vda` without explicit type: placeholder, will be resolved to `prev_type[]` in check_function
+                t = Ty::Array(Box::new(Ty::Any));
+            } else if self.enums.contains_key(lookup) {
                 t = Ty::Enum(lookup.to_string());
             } else if !self.structs.contains_key(lookup) && !self.classes.contains_key(lookup) && !self.traits.contains_key(lookup) {
                 // Check if it's generic param (single uppercase)
@@ -389,14 +399,29 @@ impl Checker {
                         if methods.contains_key(&m.name) {
                             self.errors.push(SemError{message: format!("duplicate method `{}` in trait `{}`", m.name, t.name), span: m.name_span});
                         } else {
-                            let param_tys: Vec<Ty> = m.params.iter().map(|p| {
-                                let ty = self.resolve_type(&p.ty);
+                            let param_tys: Vec<Ty> = m.params.iter().enumerate().map(|(idx, p)| {
+                                let mut ty = self.resolve_type(&p.ty);
+                                if p.is_variadic {
+                                    if p.ty.name() == "__derived__" {
+                                        if idx == 0 {
+                                            self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: p.span});
+                                        } else {
+                                            let prev_t = self.resolve_type(&m.params[idx-1].ty);
+                                            ty = Ty::Array(Box::new(prev_t));
+                                        }
+                                    } else {
+                                        ty = Ty::Array(Box::new(ty));
+                                    }
+                                    if p.ty.name() == "__derived__" && idx + 1 != m.params.len() {
+                                        self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: p.span});
+                                    }
+                                }
                                 if ty == Ty::Void { self.errors.push(SemError{message: format!("parameter `{}` cannot be `void`", p.name), span: p.span}); }
                                 ty
                             }).collect();
                             let param_modes: Vec<ParamMode> = m.params.iter().map(|p| p.mode).collect();
                             let ret_ty = self.resolve_type(&m.ret_ty);
-                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), generic_params: m.generic_params.clone(), where_clause: m.where_clause.clone(), span: m.name_span});
+                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: m.params.iter().map(|p| p.is_variadic).collect(), generic_params: m.generic_params.clone(), where_clause: m.where_clause.clone(), span: m.name_span});
                         }
                     }
                     self.traits.insert(t.name.clone(), TraitInfo{name: t.name.clone(), methods, span: t.span});
@@ -464,8 +489,23 @@ impl Checker {
                         if methods.contains_key(&m.name) {
                             self.errors.push(SemError{message: format!("duplicate method `{}` in class `{}`", m.name, c.name), span: m.name_span});
                         } else {
-                            let param_tys: Vec<Ty> = m.params.iter().map(|p| {
-                                let t = self.resolve_type(&p.ty);
+                            let param_tys: Vec<Ty> = m.params.iter().enumerate().map(|(idx, p)| {
+                                let mut t = self.resolve_type(&p.ty);
+                                if p.is_variadic {
+                                    if p.ty.name() == "__derived__" {
+                                        if idx == 0 {
+                                            self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: p.span});
+                                        } else {
+                                            let prev_t = self.resolve_type(&m.params[idx-1].ty);
+                                            t = Ty::Array(Box::new(prev_t));
+                                        }
+                                    } else {
+                                        t = Ty::Array(Box::new(t));
+                                    }
+                                    if p.ty.name() == "__derived__" && idx + 1 != m.params.len() {
+                                        self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: p.span});
+                                    }
+                                }
                                 if t == Ty::Void { self.errors.push(SemError{message: format!("parameter `{}` cannot be `void`", p.name), span: p.span}); }
                                 t
                             }).collect();
@@ -473,7 +513,7 @@ impl Checker {
                             let ret_ty = self.resolve_type(&m.ret_ty);
                             let mut pseen = HashSet::new();
                             for p in &m.params { if !pseen.insert(&p.name) { self.errors.push(SemError{message: format!("duplicate param `{}`", p.name), span: p.name_span}); } }
-                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), generic_params: m.generic_params.clone(), where_clause: m.where_clause.clone(), span: m.name_span});
+                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: m.params.iter().map(|p| p.is_variadic).collect(), generic_params: m.generic_params.clone(), where_clause: m.where_clause.clone(), span: m.name_span});
                             method_vis.insert(m.name.clone(), m.visibility);
                         }
                     }
@@ -499,15 +539,30 @@ impl Checker {
                         }
                         let mut pseen = HashSet::new();
                         let mut param_tys = Vec::new();
-                        for p in &ctor.params {
-                            let ty = self.resolve_type(&p.ty);
+                        for (idx, p) in ctor.params.iter().enumerate() {
+                            let mut ty = self.resolve_type(&p.ty);
+                            if p.is_variadic {
+                                if p.ty.name() == "__derived__" {
+                                    if idx == 0 {
+                                        self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: p.span});
+                                    } else {
+                                        let prev_t = self.resolve_type(&ctor.params[idx-1].ty);
+                                        ty = Ty::Array(Box::new(prev_t));
+                                    }
+                                } else {
+                                    ty = Ty::Array(Box::new(ty));
+                                }
+                                if p.ty.name() == "__derived__" && idx + 1 != ctor.params.len() {
+                                    self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: p.span});
+                                }
+                            }
                             if ty == Ty::Void { self.errors.push(SemError{message: format!("constructor param `{}` cannot be `void`", p.name), span: p.span}); }
                             if !pseen.insert(&p.name) { self.errors.push(SemError{message: format!("duplicate param `{}` in constructor", p.name), span: p.name_span}); }
                             param_tys.push(ty);
                         }
                         let param_modes: Vec<ParamMode> = ctor.params.iter().map(|p| p.mode).collect();
                         // constructors are void return
-                        ctor_sigs.push((FuncSig{ret: Ty::Void, params: param_tys, param_modes, param_names: ctor.params.iter().map(|p| p.name.clone()).collect(), generic_params: Vec::new(), where_clause: None, span: ctor.name_span}, ctor.visibility));
+                        ctor_sigs.push((FuncSig{ret: Ty::Void, params: param_tys, param_modes, param_names: ctor.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: ctor.params.iter().map(|p| p.is_variadic).collect(), generic_params: Vec::new(), where_clause: None, span: ctor.name_span}, ctor.visibility));
                     }
                     // Validate destructors: name must match class name
                     for dtor in &c.destructors {
@@ -592,11 +647,29 @@ impl Checker {
                     let mut op_map: HashMap<String, FuncSig> = HashMap::new();
                     for op in &c.operators {
                         let mut p_tys = Vec::new();
-                        for pp in &op.params { p_tys.push(self.resolve_type(&pp.ty)); }
+                        for (idx, pp) in op.params.iter().enumerate() {
+                            let mut ty = self.resolve_type(&pp.ty);
+                            if pp.is_variadic {
+                                if pp.ty.name() == "__derived__" {
+                                    if idx == 0 {
+                                        self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: pp.span});
+                                    } else {
+                                        let prev_t = self.resolve_type(&op.params[idx-1].ty);
+                                        ty = Ty::Array(Box::new(prev_t));
+                                    }
+                                } else {
+                                    ty = Ty::Array(Box::new(ty));
+                                }
+                                if pp.ty.name() == "__derived__" && idx + 1 != op.params.len() {
+                                    self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: pp.span});
+                                }
+                            }
+                            p_tys.push(ty);
+                        }
                         let p_modes: Vec<ParamMode> = op.params.iter().map(|p| p.mode).collect();
                         // For MVP, assume operator returns int (or struct for + if class)
                         let ret = Ty::Int;
-                        op_map.insert(op.op.clone(), FuncSig{ret: ret.clone(), params: p_tys, param_modes: p_modes, param_names: op.params.iter().map(|p| p.name.clone()).collect(), generic_params: Vec::new(), where_clause: op.where_clause.clone(), span: op.span});
+                        op_map.insert(op.op.clone(), FuncSig{ret: ret.clone(), params: p_tys, param_modes: p_modes, param_names: op.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: op.params.iter().map(|p| p.is_variadic).collect(), generic_params: Vec::new(), where_clause: op.where_clause.clone(), span: op.span});
                     }
                     let mut conv_vec: Vec<(Ty, Ty, Span)> = Vec::new();
                     for conv in &c.conversions {
@@ -713,7 +786,7 @@ impl Checker {
                         let ret_ty = self.resolve_type(&f.ret_ty);
                         let param_tys: Vec<Ty> = f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
                         let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
-                        let sig = FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: f.params.iter().map(|p| p.name.clone()).collect(), generic_params: f.generic_params.clone(), where_clause: f.where_clause.clone(), span: f.name_span};
+                        let sig = FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: f.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: f.params.iter().map(|p| p.is_variadic).collect(), generic_params: f.generic_params.clone(), where_clause: f.where_clause.clone(), span: f.name_span};
                         pending_ext.push((f.name.clone(), sig, f.visibility));
                     }
                 }
@@ -768,7 +841,7 @@ impl Checker {
                         let ret = self.resolve_type(ty);
                         let param_tys: Vec<Ty> = params.iter().map(|p| self.resolve_type(&p.ty)).collect();
                         let param_modes: Vec<ParamMode> = vec![ParamMode::None; param_tys.len()];
-                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, param_modes, param_names: params.iter().map(|p| p.name.clone()).collect(), generic_params: Vec::new(), where_clause: None, span: *name_span});
+                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, param_modes, param_names: params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: params.iter().map(|p| p.is_variadic).collect(), generic_params: Vec::new(), where_clause: None, span: *name_span});
                     }
                 }
             }
@@ -798,8 +871,21 @@ impl Checker {
                     let param_tys: Vec<Ty> = f
                         .params
                         .iter()
-                        .map(|p| {
-                            let t = self.resolve_type(&p.ty);
+                        .enumerate()
+                        .map(|(idx, p)| {
+                            let mut t = self.resolve_type(&p.ty);
+                            if p.is_variadic {
+                                if p.ty.name() == "__derived__" {
+                                    if idx == 0 {
+                                        // error already pushed in check_function, but for FuncSig keep as Array(Int) placeholder
+                                    } else {
+                                        let prev_t = self.resolve_type(&f.params[idx-1].ty);
+                                        t = Ty::Array(Box::new(prev_t));
+                                    }
+                                } else {
+                                    t = Ty::Array(Box::new(t));
+                                }
+                            }
                             if t == Ty::Void {
                                 self.errors.push(SemError {
                                     message: format!(
@@ -833,6 +919,7 @@ impl Checker {
                             params: param_tys,
                             param_modes,
                             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
+                            param_is_variadic: f.params.iter().map(|p| p.is_variadic).collect(),
                             generic_params: f.generic_params.clone(),
                             where_clause: f.where_clause.clone(),
                             span: f.name_span,
@@ -890,8 +977,25 @@ impl Checker {
         let ret_ty = self.resolve_type(&f.ret_ty);
         self.cur_ret = Some(ret_ty.clone());
         self.push_scope();
-        for p in &f.params {
-            let ty = self.resolve_type(&p.ty);
+        for (idx, p) in f.params.iter().enumerate() {
+            let mut ty = self.resolve_type(&p.ty);
+            if p.is_variadic {
+                // `...T vda` where `T` is element type, `vda` is `T[]`; `... vda` derived from previous
+                if p.ty.name() == "__derived__" {
+                    if idx == 0 {
+                        self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: p.span});
+                    } else {
+                        let prev_ty = self.resolve_type(&f.params[idx-1].ty);
+                        ty = Ty::Array(Box::new(prev_ty));
+                    }
+                } else {
+                    ty = Ty::Array(Box::new(ty));
+                }
+                // For derived `... vda` must be last
+                if p.ty.name() == "__derived__" && idx + 1 != f.params.len() {
+                    self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: p.span});
+                }
+            }
             self.declare_var(&p.name, ty, p.name_span);
         }
         let always_returns = self.check_block(&f.body, &ret_ty);
@@ -909,8 +1013,23 @@ impl Checker {
         self.push_scope();
         // implicit `this`
         self.declare_var("this", Ty::Struct(class_name.to_string()), f.name_span);
-        for p in &f.params {
-            let ty = self.resolve_type(&p.ty);
+        for (idx, p) in f.params.iter().enumerate() {
+            let mut ty = self.resolve_type(&p.ty);
+            if p.is_variadic {
+                if p.ty.name() == "__derived__" {
+                    if idx == 0 {
+                        self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: p.span});
+                    } else {
+                        let prev_ty = self.resolve_type(&f.params[idx-1].ty);
+                        ty = Ty::Array(Box::new(prev_ty));
+                    }
+                } else {
+                    ty = Ty::Array(Box::new(ty));
+                }
+                if p.ty.name() == "__derived__" && idx + 1 != f.params.len() {
+                    self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: p.span});
+                }
+            }
             self.declare_var(&p.name, ty, p.name_span);
         }
         let always_returns = self.check_block(&f.body, &ret_ty);
@@ -1488,29 +1607,44 @@ impl Checker {
                         let is_generic = !type_args.is_empty();
                         // For minimal, if type_args provided, substitute
                         if !type_args.is_empty() {
-                            // Substitute T in params and ret
+                            // Substitute T in params and ret (including Array wrapper for variadic)
                             let subst_ty = |ty: &Ty| -> Ty {
                                 match ty {
                                     Ty::Generic(n, _) if generic_subst.contains_key(n) => generic_subst[n].clone(),
                                     Ty::Struct(n) if generic_subst.contains_key(n) => generic_subst[n].clone(),
+                                    Ty::Array(el) => {
+                                        let inner = match el.as_ref() {
+                                            Ty::Generic(n, _) if generic_subst.contains_key(n) => generic_subst[n].clone(),
+                                            Ty::Struct(n) if generic_subst.contains_key(n) => generic_subst[n].clone(),
+                                            Ty::Array(inner2) => {
+                                                let subst_inner = match inner2.as_ref() {
+                                                    Ty::Generic(n, _) if generic_subst.contains_key(n) => generic_subst[n].clone(),
+                                                    Ty::Struct(n) if generic_subst.contains_key(n) => generic_subst[n].clone(),
+                                                    other => other.clone(),
+                                                };
+                                                Ty::Array(Box::new(subst_inner))
+                                            }
+                                            other => other.clone(),
+                                        };
+                                        Ty::Array(Box::new(inner))
+                                    }
                                     other => other.clone(),
                                 }
                             };
-                            // Check args against substituted params
-                            for (i, arg) in args.iter().enumerate() {
-                                let aty = self.check_call_arg(arg);
-                                let pidx = if let CallArg::Named { name, .. } = arg {
-                                    func.param_names.iter().position(|n| n == name).unwrap_or(i)
-                                } else { i };
-                                if let Some(param_ty) = func.params.get(pidx) {
-                                    let expected = subst_ty(param_ty);
-                                    if &aty != &expected {
-                                        self.errors.push(SemError{message: format!("argument {} of `{}`: expected `{}`, found `{}`", i+1, callee, expected, aty), span: arg.span()});
-                                    }
-                                }
-                            }
-                            let ret_ty = subst_ty(&func.ret);
-                            return ret_ty;
+                            // Build substituted sig and delegate to variadic-aware check
+                            let substituted_params: Vec<Ty> = func.params.iter().map(|p| subst_ty(p)).collect();
+                            let substituted_sig = FuncSig {
+                                ret: subst_ty(&func.ret),
+                                params: substituted_params,
+                                param_modes: func.param_modes.clone(),
+                                param_names: func.param_names.clone(),
+                                param_is_variadic: func.param_is_variadic.clone(),
+                                generic_params: vec![],
+                                where_clause: None,
+                                span: func.span,
+                            };
+                            self.check_call_with_sig(args, &substituted_sig, *callee_span, callee);
+                            return substituted_sig.ret;
                         }
                     }
                 }
@@ -1584,24 +1718,31 @@ impl Checker {
                 }
                 let sig = self.funcs.get(callee).cloned();
                 if let Some(sig) = sig {
-                    if sig.params.len() != args.len() {
-                        self.errors.push(SemError {
-                            message: format!(
-                                "`{callee}` expects {} args, found {}",
-                                sig.params.len(),
-                                args.len()
-                            ),
-                            span: *callee_span,
-                        });
-                    }
-                    for (i, arg) in args.iter().enumerate() {
-                        let aty = self.check_call_arg(arg);
-                        let pidx = if let CallArg::Named { name, .. } = arg {
-                            sig.param_names.iter().position(|n| n == name).unwrap_or(i)
-                        } else { i };
-                        if let Some(param_ty) = sig.params.get(pidx) {
-                            if &aty != param_ty && aty != Ty::Any {
-                                self.errors.push(SemError{message: format!("argument {} of `{callee}`: expected `{}`, found `{aty}`", i+1, param_ty), span: arg.span()});
+                    if sig.param_is_variadic.iter().any(|&v| v) {
+                        self.check_call_with_sig(args, &sig, *callee_span, callee);
+                    } else {
+                        if sig.params.len() != args.len() {
+                            self.errors.push(SemError {
+                                message: format!(
+                                    "`{callee}` expects {} args, found {}",
+                                    sig.params.len(),
+                                    args.len()
+                                ),
+                                span: *callee_span,
+                            });
+                        }
+                        for (i, arg) in args.iter().enumerate() {
+                            let aty = self.check_call_arg(arg);
+                            let pidx = if let CallArg::Named { name, .. } = arg {
+                                sig.param_names.iter().position(|n| n == name).unwrap_or(i)
+                            } else { i };
+                            if let Some(param_ty) = sig.params.get(pidx) {
+                                if &aty != param_ty && aty != Ty::Any {
+                                    let is_generic = matches!(param_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
+                                    if !is_generic {
+                                        self.errors.push(SemError{message: format!("argument {} of `{callee}`: expected `{}`, found `{aty}`", i+1, param_ty), span: arg.span()});
+                                    }
+                                }
                             }
                         }
                     }
@@ -1845,16 +1986,20 @@ impl Checker {
                         } else if self.cur_class.as_deref() != Some(sname.as_str()) {
                             self.errors.push(SemError{message: format!("method `{method}` is private"), span: *method_span});
                         }
-                        if meth.params.len() != args.len() {
-                            self.errors.push(SemError{message: format!("method `{}` expects {} args, found {}", method, meth.params.len(), args.len()), span: *method_span});
-                        }
-                        for (i, a) in args.iter().enumerate() {
-                            let aty = self.check_call_arg(a);
-                            let pidx = if let CallArg::Named { name, .. } = a {
-                                meth.param_names.iter().position(|n| n == name).unwrap_or(i)
-                            } else { i };
-                            if let Some(pt) = meth.params.get(pidx) {
-                                if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("arg {} of `{}`: expected `{}`, found `{}`", i+1, method, pt, aty), span: a.span()}); }
+                        if meth.param_is_variadic.iter().any(|&v| v) {
+                            self.check_call_with_sig(args, meth, *method_span, method);
+                        } else {
+                            if meth.params.len() != args.len() {
+                                self.errors.push(SemError{message: format!("method `{}` expects {} args, found {}", method, meth.params.len(), args.len()), span: *method_span});
+                            }
+                            for (i, a) in args.iter().enumerate() {
+                                let aty = self.check_call_arg(a);
+                                let pidx = if let CallArg::Named { name, .. } = a {
+                                    meth.param_names.iter().position(|n| n == name).unwrap_or(i)
+                                } else { i };
+                                if let Some(pt) = meth.params.get(pidx) {
+                                    if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("arg {} of `{}`: expected `{}`, found `{}`", i+1, method, pt, aty), span: a.span()}); }
+                                }
                             }
                         }
                         meth.ret.clone()
@@ -2149,6 +2294,68 @@ impl Checker {
     }
 
     fn check_call_with_sig(&mut self, args: &[CallArg], sig: &FuncSig, callee_span: Span, callee: &str) {
+        let variadic_idx = sig.param_is_variadic.iter().position(|&v| v);
+        if let Some(vidx) = variadic_idx {
+            // Variadic `...T vda` where `vda` is `T[]`, or `...` alone for C varargs
+            let fixed = vidx; // number of fixed params before variadic
+            if args.len() < fixed {
+                self.errors.push(SemError { message: format!("`{}` expects at least {} args, found {}", callee, fixed, args.len()), span: callee_span });
+            }
+            // Check fixed params
+            for (i, arg) in args.iter().take(fixed).enumerate() {
+                let aty = self.check_call_arg(arg);
+                let pidx = if let CallArg::Named { name, .. } = arg {
+                    sig.param_names.iter().position(|n| n == name).unwrap_or(i)
+                } else { i };
+                if let Some(param_ty) = sig.params.get(pidx) {
+                    if &aty != param_ty && aty != Ty::Any {
+                        let is_generic = matches!(param_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
+                        if !is_generic {
+                            self.errors.push(SemError { message: format!("argument {} of `{}`: expected `{}`, found `{}`", i+1, callee, param_ty, aty), span: arg.span() });
+                        }
+                    }
+                }
+            }
+            // Check variadic tail: `vda` is `T[]` where `T` is element type
+            if let Some(vty) = sig.params.get(vidx) {
+                let elem_ty = if let Ty::Array(el) = vty { &**el } else { vty };
+                // Handle variadic not last: `...T vda, U next` where `vda` consumes `args.len() - sig.params.len() + 1` args
+                let remaining_params = sig.params.len() - vidx - 1;
+                let vda_count = if remaining_params == 0 {
+                    args.len() - fixed
+                } else {
+                    args.len() - sig.params.len() + 1
+                };
+                for (i, arg) in args.iter().skip(fixed).take(vda_count).enumerate() {
+                    let aty = self.check_call_arg(arg);
+                    let is_generic_elem = matches!(elem_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
+                    let is_any_elem = *elem_ty == Ty::Any;
+                    if &aty != elem_ty && aty != Ty::Any && !is_generic_elem && !is_any_elem {
+                        self.errors.push(SemError { message: format!("variadic argument {} of `{}`: expected `{}`, found `{}`", fixed + i + 1, callee, elem_ty, aty), span: arg.span() });
+                    }
+                }
+                // Check remaining fixed params after variadic
+                for (j, arg) in args.iter().skip(fixed + vda_count).enumerate() {
+                    let pidx = vidx + 1 + j;
+                    if let Some(param_ty) = sig.params.get(pidx) {
+                        let aty = self.check_call_arg(arg);
+                        if &aty != param_ty && aty != Ty::Any {
+                            let is_generic = matches!(param_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
+                            if !is_generic {
+                                self.errors.push(SemError { message: format!("argument {} of `{}`: expected `{}`, found `{}`", pidx + 1, callee, param_ty, aty), span: arg.span() });
+                            }
+                        }
+                    }
+                }
+            }
+            // Also check where bounds for variadic generic
+            if !sig.generic_params.is_empty() || sig.where_clause.is_some() {
+                // For `...T vda where T: Trait`, the `T` for variadic element should also be checked
+                // We already check via check_generic_bounds for type_args, but for variadic we need to ensure `T` is checked
+                // For now, rely on check_generic_bounds for type_args
+            }
+            return;
+        }
         if sig.params.len() != args.len() {
             self.errors.push(SemError { message: format!("`{}` expects {} args, found {}", callee, sig.params.len(), args.len()), span: callee_span });
         }

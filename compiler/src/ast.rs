@@ -82,6 +82,7 @@ pub enum ParamMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
     pub mode: ParamMode,
+    pub is_variadic: bool,
     pub ty: Type,
     pub name: String,
     pub name_span: Span,
@@ -365,6 +366,7 @@ pub enum ExternMember {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternParam {
+    pub is_variadic: bool,
     pub ty: Type,
     pub name: String,
     pub name_span: Span,

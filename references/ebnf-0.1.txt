@@ -849,13 +849,17 @@ parameter-list =
     parameter , { "," , parameter } ;
 
 parameter =
-    [ parameter-mode ] ,
-    type , identifier ,
+    [ "..." ] , [ parameter-mode ] , [ type ] , identifier ,
     [ "=" , expression ] ;
+    (* `...` marks variadic: `...int vda` → `vda: int[]`, `...T vda` → `vda: T[]` with `where T: Trait` allowed,
+       `... vda` (no type) → `vda: prev_type[]` derived from previous `type` and must be last;
+       `...` may appear anywhere when explicit `type` present, e.g. `log(string fmt, ...string vda, bool cond)` *)
 
 parameter-mode =
       "ref"
     | "out" ;
+
+variadic-marker = "..." ;
 
 
 
@@ -1231,10 +1235,12 @@ extern-function =
 
 
 extern-parameter-list =
-    extern-parameter , { "," , extern-parameter } ;
+    [ extern-parameter { "," , extern-parameter } ] [ "," , "..." ] | "..." ;
 
 extern-parameter =
-    type , identifier ;
+    [ "..." ] , [ type ] , identifier
+  | "..." ;
+  (* `...` alone for C varargs like `printf(string fmt, ...)`; `...int vda` → `vda: int[]` *)
 
 
 extern-struct =
