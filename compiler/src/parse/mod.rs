@@ -267,6 +267,11 @@ impl Parser {
                     Item::Extension(self.parse_extension_decl()?)
                 } else if self.peek_token() == Some(&Token::Extern) {
                     Item::Extern(self.parse_extern_decl()?)
+                } else if self.peek_token() == Some(&Token::Const)
+                    || (matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private))
+                        && self.tokens.get(self.pos + 1).map(|t| t.token == Token::Const).unwrap_or(false))
+                {
+                    Item::Const(self.parse_const_decl()?)
                 } else {
                     Item::Function(self.parse_function()?)
                 };
@@ -285,6 +290,12 @@ impl Parser {
                 let blk = self.parse_block()?;
                 let span = Span::new(start, blk.span.end);
                 items.push(Item::Init(blk));
+            } else if self.peek_token() == Some(&Token::Const)
+                || (matches!(self.peek_token(), Some(Token::Public) | Some(Token::Private))
+                    && self.tokens.get(self.pos + 1).map(|t| t.token == Token::Const).unwrap_or(false))
+            {
+                let decl = self.parse_const_decl()?;
+                items.push(Item::Const(decl));
             } else if self.peek_token() == Some(&Token::At) {
                 // Handle attributes at top-level (already handled above, but for safety)
                 let attrs = self.parse_attributes()?;
@@ -349,6 +360,66 @@ impl Parser {
             where_clause,
             span: Span::new(start, end),
         })
+    }
+
+    fn is_type_start(&self) -> bool {
+        matches!(
+            self.peek_token(),
+            Some(Token::Int)
+                | Some(Token::Bool)
+                | Some(Token::Void)
+                | Some(Token::StringKw)
+                | Some(Token::CharKw)
+                | Some(Token::Float)
+                | Some(Token::Double)
+                | Some(Token::Any)
+                | Some(Token::Function)
+                | Some(Token::Ident)
+                | Some(Token::LParen)
+        )
+    }
+
+    fn parse_const_decl(&mut self) -> Result<ConstDecl, ParseError> {
+        let vis = self.parse_visibility();
+        let start = self.expect(Token::Const, "expected `const`")?.span.start;
+        // optional type: try to detect `const Type Ident =` vs `const Ident =`
+        let mut ty: Option<Type> = None;
+        let mut name = String::new();
+        let mut name_span = Span::new(start, start);
+        // Lookahead for typed form
+        // Save pos, try parse type, then check if next is Ident and after that is `=`
+        let save = self.pos;
+        let mut is_typed = false;
+        if self.is_type_start() {
+            if let Ok(t) = self.parse_type() {
+                if self.peek_token() == Some(&Token::Ident) {
+                    // Peek further to see if after Ident we have `=`
+                    if self.tokens.get(self.pos + 1).map(|st| st.token == Token::Eq).unwrap_or(false) {
+                        ty = Some(t);
+                        let (n, ns) = self.parse_ident()?;
+                        name = n;
+                        name_span = ns;
+                        is_typed = true;
+                    }
+                }
+                if !is_typed {
+                    // rollback: the parsed type was actually the ident (untyped case)
+                    self.pos = save;
+                }
+            } else {
+                self.pos = save;
+            }
+        }
+        if !is_typed {
+            let (n, ns) = self.parse_ident()?;
+            name = n;
+            name_span = ns;
+        }
+        self.expect(Token::Eq, "expected `=` after const name")?;
+        let init = self.parse_expr()?;
+        self.expect_terminator("const declaration")?;
+        let span = Span::new(start, init.span.end);
+        Ok(ConstDecl { visibility: vis, ty, name, name_span, init, span })
     }
 
     fn parse_visibility(&mut self) -> Visibility {
@@ -458,7 +529,7 @@ impl Parser {
                         let pty = self.parse_type()?;
                         let (pn, pn_span) = self.parse_ident()?;
                         let pspan = Span::new(pty.span().start, pn_span.end);
-                        params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                        params.push(Param{mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan});
                         if self.consume_if(Token::Comma) { continue; } else { break; }
                     }
                 }
@@ -534,7 +605,7 @@ impl Parser {
                         let pty = self.parse_type()?;
                         let (pn, pn_span) = self.parse_ident()?;
                         let pspan = Span::new(pty.span().start, pn_span.end);
-                        let param = Param{ty: pty, name: pn, name_span: pn_span, span: pspan};
+                        let param = Param{mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan};
                         self.expect(Token::RParen, "expected `)` after setter param")?;
                         let body = self.parse_block()?;
                         setter = Some((param, body));
@@ -545,7 +616,7 @@ impl Parser {
                     let pty = self.parse_type()?;
                     let (pn, pn_span) = self.parse_ident()?;
                     let pspan = Span::new(pty.span().start, pn_span.end);
-                    let param = Param{ty: pty, name: pn, name_span: pn_span, span: pspan};
+                    let param = Param{mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan};
                     self.expect(Token::RParen, "expected `)` after setter param")?;
                     let body = self.parse_block()?;
                     setter = Some((param, body));
@@ -614,7 +685,7 @@ impl Parser {
                         let pty = self.parse_type()?;
                         let (pn, pn_span) = self.parse_ident()?;
                         let pspan = Span::new(pty.span().start, pn_span.end);
-                        params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                        params.push(Param{mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan});
                         if !self.consume_if(Token::Comma) { break; }
                     }
                 }
@@ -683,7 +754,7 @@ impl Parser {
                         let pty = self.parse_type()?;
                         let (pn, pn_span) = self.parse_ident()?;
                         let pspan = Span::new(pty.span().start, pn_span.end);
-                        params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                        params.push(Param{mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan});
                         if self.consume_if(Token::Comma) { continue; } else { break; }
                     }
                 }
@@ -749,7 +820,7 @@ impl Parser {
                     let pty = self.parse_type()?;
                     let (pn, pn_span) = self.parse_ident()?;
                     let pspan = Span::new(pty.span().start, pn_span.end);
-                    params.push(Param{ty: pty, name: pn, name_span: pn_span, span: pspan});
+                    params.push(Param{mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan});
                     if self.consume_if(Token::Comma) { continue; } else { break; }
                 }
             }
@@ -1025,9 +1096,68 @@ impl Parser {
                     self.advance();
                     Type::Any(st.span)
                 }
+                Token::Function => {
+                    self.advance();
+                    self.expect(Token::Lt, "expected `<` after `function`")?;
+                    let ret_ty = if self.peek_token() == Some(&Token::LParen) {
+                        Type::Void(st.span)
+                    } else {
+                        self.parse_type()?
+                    };
+                    self.expect(Token::LParen, "expected `(` after function return type")?;
+                    let mut args = Vec::new();
+                    if self.peek_token() != Some(&Token::RParen) {
+                        loop {
+                            let aty = self.parse_type()?;
+                            args.push(aty);
+                            if !self.consume_if(Token::Comma) { break; }
+                        }
+                    }
+                    self.expect(Token::RParen, "expected `)` after function params")?;
+                    self.expect(Token::Gt, "expected `>` after function type")?;
+                    let span = Span::new(st.span.start, self.tokens[self.pos-1].span.end);
+                    Type::FunctionType(Box::new(ret_ty), args, span)
+                }
+                Token::LParen => {
+                    self.advance();
+                    if self.peek_token() == Some(&Token::RParen) {
+                        self.advance();
+                        let span = Span::new(st.span.start, self.tokens[self.pos-1].span.end);
+                        Type::Tuple(vec![], span)
+                    } else {
+                        let first = self.parse_type()?;
+                        if self.consume_if(Token::Comma) {
+                            let mut tys = vec![first];
+                            if self.peek_token() != Some(&Token::RParen) {
+                                loop {
+                                    if self.peek_token() == Some(&Token::RParen) { break; }
+                                    let aty = self.parse_type()?;
+                                    tys.push(aty);
+                                    if !self.consume_if(Token::Comma) { break; }
+                                    if self.peek_token() == Some(&Token::RParen) { break; }
+                                }
+                            }
+                            self.expect(Token::RParen, "expected `)` after tuple types")?;
+                            let span = Span::new(st.span.start, self.tokens[self.pos-1].span.end);
+                            Type::Tuple(tys, span)
+                        } else {
+                            self.expect(Token::RParen, "expected `)` after type")?;
+                            first
+                        }
+                    }
+                }
                 Token::Ident => {
                     self.advance();
-                    Type::Named(self.slice(st.span).to_string(), st.span)
+                    let mut name = self.slice(st.span).to_string();
+                    let mut end = st.span.end;
+                    while self.peek_token() == Some(&Token::ColonColon) {
+                        self.advance();
+                        let (seg, sspan) = self.parse_ident()?;
+                        name.push_str("::");
+                        name.push_str(&seg);
+                        end = sspan.end;
+                    }
+                    Type::Named(name, Span::new(st.span.start, end))
                 }
                 _ => {
                     return Err(ParseError {
@@ -1087,6 +1217,100 @@ impl Parser {
             break;
         }
         Ok(ty)
+    }
+
+    fn parse_param(&mut self) -> Result<Param, ParseError> {
+        let mode = if self.peek_token() == Some(&Token::Ref) {
+            self.advance();
+            ParamMode::Ref
+        } else if self.peek_token() == Some(&Token::Out) {
+            self.advance();
+            ParamMode::Out
+        } else {
+            ParamMode::None
+        };
+        let ty = self.parse_type()?;
+        let (pn, pn_span) = self.parse_ident()?;
+        let pspan = Span::new(ty.span().start, pn_span.end);
+        if self.consume_if(Token::Eq) {
+            let _ = self.parse_expr()?;
+        }
+        Ok(Param { mode, ty, name: pn, name_span: pn_span, span: pspan })
+    }
+
+    fn parse_call_arg(&mut self) -> Result<CallArg, ParseError> {
+        // out [type] ident
+        if self.peek_token() == Some(&Token::Out) {
+            let start = self.advance().unwrap().span.start;
+            // Lookahead to distinguish `out Type ident` vs `out ident`
+            // If next token is primitive type keyword, treat as typed
+            // If next is Ident, look at following token to decide
+            let is_typed = match self.peek_token() {
+                Some(Token::Int) | Some(Token::Bool) | Some(Token::Void) | Some(Token::StringKw)
+                | Some(Token::CharKw) | Some(Token::Float) | Some(Token::Double) | Some(Token::Any) | Some(Token::Function) => true,
+                Some(Token::Ident) => {
+                    // Need to see if there is a second Ident after potential type
+                    // Type can be `Ident` or `Ident::Ident` or generic, but for simple check, if we have Ident + Ident before comma/paren, it's typed
+                    if let Some(next2) = self.tokens.get(self.pos + 1) {
+                        matches!(next2.token, Token::Ident) || matches!(next2.token, Token::ColonColon) || matches!(next2.token, Token::Lt) || matches!(next2.token, Token::Question) || matches!(next2.token, Token::Star) || matches!(next2.token, Token::LBracket)
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if is_typed {
+                // parse type then ident
+                let ty = self.parse_type()?;
+                let (name, nspan) = self.parse_ident()?;
+                let span = Span::new(start, nspan.end);
+                return Ok(CallArg::Out { ty: Some(ty), name, name_span: nspan, span });
+            } else {
+                // untyped: `out ident`
+                // For `out x` where x was peeked as Ident, it will be here
+                // Also handle case where we incorrectly thought typed but it's actually single Ident typed case where type == ident and next is , or )
+                // The above is_typed logic already handles single Ident as untyped, so safe
+                let (name, nspan) = self.parse_ident().map_err(|_| ParseError { message: "expected identifier after `out`".into(), span: self.peek_span() })?;
+                let span = Span::new(start, nspan.end);
+                return Ok(CallArg::Out { ty: None, name, name_span: nspan, span });
+            }
+        }
+        if self.peek_token() == Some(&Token::Ref) {
+            let start = self.advance().unwrap().span.start;
+            let expr = self.parse_expr()?;
+            let span = Span::new(start, expr.span.end);
+            return Ok(CallArg::Ref { expr: Box::new(expr), span });
+        }
+        // named-argument: ident ':' expr  (but not '::' )
+        if self.peek_token() == Some(&Token::Ident) {
+            if self.tokens.get(self.pos + 1).map(|t| t.token == Token::Colon).unwrap_or(false) {
+                let (name, nspan) = self.parse_ident()?;
+                self.advance(); // :
+                let value = self.parse_expr()?;
+                let span = Span::new(nspan.start, value.span.end);
+                return Ok(CallArg::Named { name, name_span: nspan, value, span });
+            }
+        }
+        let expr = self.parse_expr()?;
+        Ok(CallArg::Expr(expr))
+    }
+
+    fn parse_call_args(&mut self) -> Result<Vec<CallArg>, ParseError> {
+        let mut args = Vec::new();
+        if self.peek_token() == Some(&Token::RParen) {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_call_arg()?);
+            if !self.consume_if(Token::Comma) {
+                break;
+            }
+            // allow trailing comma before )
+            if self.peek_token() == Some(&Token::RParen) {
+                break;
+            }
+        }
+        Ok(args)
     }
 
     fn parse_generic_params_opt(&mut self) -> Vec<GenericParam> {
@@ -1174,18 +1398,10 @@ impl Parser {
         let generic_params = self.parse_generic_params_opt();
         self.expect(Token::LParen, "function params")?;
         let mut params = Vec::new();
-        // params: [type ident {, type ident}]
         if self.peek_token() != Some(&Token::RParen) {
             loop {
-                let ty = self.parse_type()?;
-                let (pn, pn_span) = self.parse_ident()?;
-                let pspan = Span::new(ty.span().start, pn_span.end);
-                params.push(Param {
-                    ty,
-                    name: pn,
-                    name_span: pn_span,
-                    span: pspan,
-                });
+                let param = self.parse_param()?;
+                params.push(param);
                 if self.consume_if(Token::Comma) {
                     continue;
                 } else {
@@ -1304,6 +1520,24 @@ impl Parser {
             Some(Token::Do) => {
                 let b = self.parse_block()?;
                 Ok(Stmt::Block(b))
+            }
+            Some(Token::Const) => {
+                let c = self.parse_const_decl()?;
+                Ok(Stmt::Const(c))
+            }
+            Some(Token::Public) | Some(Token::Private) => {
+                // Could be `public const` or `private const` or typed var decl with visibility
+                let is_const = self.tokens.get(self.pos + 1).map(|t| t.token == Token::Const).unwrap_or(false);
+                if is_const {
+                    let c = self.parse_const_decl()?;
+                    Ok(Stmt::Const(c))
+                } else if self.is_var_decl_start() {
+                    let d = self.parse_var_decl()?;
+                    Ok(Stmt::VarDecl(d))
+                } else {
+                    let e = self.parse_expr_stmt()?;
+                    Ok(Stmt::Expr(e))
+                }
             }
             _ => {
                 // Try var-decl detection: type (int/bool/void or Named Ident) + Ident + (= or terminator)
@@ -1531,35 +1765,50 @@ impl Parser {
     }
 
     fn parse_assignment(&mut self) -> Result<Expr, ParseError> {
-        let lhs = self.parse_or()?;
-        if self.peek_token() == Some(&Token::Eq) {
-            // Allow Ident, MemberAccess, Index as lvalue (Phase 2)
-            let is_lvalue = matches!(
-                lhs.kind,
-                ExprKind::Ident(_)
-                    | ExprKind::MemberAccess { .. }
-                    | ExprKind::Index { .. }
-                    | ExprKind::Paren(_)
-            );
-            if !is_lvalue {
-                return Err(ParseError {
-                    message:
-                        "assignment target must be identifier or field access"
-                            .into(),
-                    span: lhs.span,
-                });
-            }
-            // Normalize paren lvalue? unwrap paren for `(x) = 1` not supported
-            if let ExprKind::Paren(_) = lhs.kind {
-                return Err(ParseError {
-                    message: "cannot assign to parenthesized expression".into(),
-                    span: lhs.span,
-                });
-            }
-            let lhs_span = lhs.span;
-            self.advance(); // consume =
-            let rhs = self.parse_assignment()?; // right-assoc
-            let span = Span::new(lhs_span.start, rhs.span.end);
+        let lhs = self.parse_conditional()?;
+        let is_assign = matches!(
+            self.peek_token(),
+            Some(Token::Eq)
+                | Some(Token::PlusAssign)
+                | Some(Token::MinusAssign)
+                | Some(Token::StarAssign)
+                | Some(Token::SlashAssign)
+                | Some(Token::PercentAssign)
+                | Some(Token::AndAssign)
+                | Some(Token::OrAssign)
+                | Some(Token::XorAssign)
+                | Some(Token::LShiftAssign)
+                | Some(Token::RShiftAssign)
+        );
+        if !is_assign {
+            return Ok(lhs);
+        }
+        // Allow Ident, MemberAccess, Index, NullableMemberAccess as lvalue
+        let is_lvalue = matches!(
+            lhs.kind,
+            ExprKind::Ident(_)
+                | ExprKind::MemberAccess { .. }
+                | ExprKind::NullableMemberAccess { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::Paren(_)
+        );
+        if !is_lvalue {
+            return Err(ParseError {
+                message: "assignment target must be identifier or field access".into(),
+                span: lhs.span,
+            });
+        }
+        if let ExprKind::Paren(_) = lhs.kind {
+            return Err(ParseError {
+                message: "cannot assign to parenthesized expression".into(),
+                span: lhs.span,
+            });
+        }
+        let op_tok = self.advance().unwrap();
+        let lhs_span = lhs.span;
+        let rhs = self.parse_assignment()?;
+        let span = Span::new(lhs_span.start, rhs.span.end);
+        if op_tok.token == Token::Eq {
             return Ok(Expr {
                 kind: ExprKind::Assign {
                     lhs: Box::new(lhs),
@@ -1567,6 +1816,51 @@ impl Parser {
                 },
                 span,
             });
+        } else {
+            let op = match op_tok.token {
+                Token::PlusAssign => BinOp::CompoundAdd,
+                Token::MinusAssign => BinOp::CompoundSub,
+                Token::StarAssign => BinOp::CompoundMul,
+                Token::SlashAssign => BinOp::CompoundDiv,
+                Token::PercentAssign => BinOp::CompoundMod,
+                Token::AndAssign => BinOp::CompoundBitAnd,
+                Token::OrAssign => BinOp::CompoundBitOr,
+                Token::XorAssign => BinOp::CompoundBitXor,
+                Token::LShiftAssign => BinOp::CompoundShl,
+                Token::RShiftAssign => BinOp::CompoundShr,
+                _ => unreachable!(),
+            };
+            return Ok(Expr {
+                kind: ExprKind::CompoundAssign {
+                    op,
+                    lhs: Box::new(lhs),
+                    value: Box::new(rhs),
+                },
+                span,
+            });
+        }
+    }
+
+    fn parse_conditional(&mut self) -> Result<Expr, ParseError> {
+        let cond = self.parse_null_coalesce()?;
+        if self.peek_token() == Some(&Token::Question) {
+            self.advance(); // ?
+            let then_branch = self.parse_expr()?;
+            self.expect(Token::Colon, "expected `:` after `?` in conditional")?;
+            let else_branch = self.parse_conditional()?;
+            let span = Span::new(cond.span.start, else_branch.span.end);
+            return Ok(Expr{kind: ExprKind::Conditional{cond: Box::new(cond), then_branch: Box::new(then_branch), else_branch: Box::new(else_branch)}, span});
+        }
+        Ok(cond)
+    }
+
+    fn parse_null_coalesce(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_or()?;
+        while self.peek_token() == Some(&Token::QuestionQuestion) {
+            self.advance();
+            let rhs = self.parse_or()?;
+            let span = Span::new(lhs.span.start, rhs.span.end);
+            lhs = Expr{kind: ExprKind::Binary{op: BinOp::NullCoalesce, lhs: Box::new(lhs), rhs: Box::new(rhs)}, span};
         }
         Ok(lhs)
     }
@@ -1590,7 +1884,7 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_equality()?;
+        let mut lhs = self.parse_bitwise_or()?;
         while self.peek_token() == Some(&Token::And) {
             self.advance();
             let rhs = self.parse_equality()?;
@@ -1603,6 +1897,42 @@ impl Parser {
                 },
                 span,
             };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitwise_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bitwise_xor()?;
+        while self.peek_token() == Some(&Token::Pipe) {
+            // Need to distinguish `|` vs `||`? But we already handle `or` as keyword, and `|` as bitwise, and `||` is not tokenized? Actually `||` would be two `|`? But we treat `|` as single
+            // Check that next is not `|` for `||`? For now, handle single `|`
+            // Avoid consuming `||` which is not a token; we have `Pipe` for single `|`
+            self.advance();
+            let rhs = self.parse_bitwise_xor()?;
+            let span = Span::new(lhs.span.start, rhs.span.end);
+            lhs = Expr{kind: ExprKind::Binary{op: BinOp::BitOr, lhs: Box::new(lhs), rhs: Box::new(rhs)}, span};
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitwise_xor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bitwise_and()?;
+        while self.peek_token() == Some(&Token::Caret) {
+            self.advance();
+            let rhs = self.parse_bitwise_and()?;
+            let span = Span::new(lhs.span.start, rhs.span.end);
+            lhs = Expr{kind: ExprKind::Binary{op: BinOp::BitXor, lhs: Box::new(lhs), rhs: Box::new(rhs)}, span};
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitwise_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_equality()?;
+        while self.peek_token() == Some(&Token::Ampersand) {
+            self.advance();
+            let rhs = self.parse_equality()?;
+            let span = Span::new(lhs.span.start, rhs.span.end);
+            lhs = Expr{kind: ExprKind::Binary{op: BinOp::BitAnd, lhs: Box::new(lhs), rhs: Box::new(rhs)}, span};
         }
         Ok(lhs)
     }
@@ -1650,8 +1980,52 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_relational(&mut self) -> Result<Expr, ParseError> {
+    fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_range()?;
+        loop {
+            let op = match self.peek_token() {
+                Some(Token::LShift) => BinOp::Shl,
+                Some(Token::RShift) => BinOp::Shr,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_range()?;
+            let span = Span::new(lhs.span.start, rhs.span.end);
+            lhs = Expr{kind: ExprKind::Binary{op, lhs: Box::new(lhs), rhs: Box::new(rhs)}, span};
+        }
+        Ok(lhs)
+    }
+
+    fn parse_range(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_add()?;
+        loop {
+            let (op, inclusive) = match self.peek_token() {
+                Some(Token::DotDot) => (BinOp::Range, false),
+                Some(Token::DotDotEq) => (BinOp::RangeInclusive, true),
+                _ => break,
+            };
+            self.advance();
+            // Right-hand side may be omitted for `a..` or `..b`? EBNF allows [expr] .. [expr]
+            // For now, require rhs expr if present, else create range with None
+            let rhs = if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon) | Some(Token::Comma) | Some(Token::RParen) | Some(Token::RBracket) | Some(Token::End) | None) {
+                None
+            } else {
+                Some(Box::new(self.parse_add()?))
+            };
+            let end = rhs.as_ref().map(|e| e.span.end).unwrap_or(lhs.span.end);
+            let span = Span::new(lhs.span.start, end);
+            // Represent range as Binary with Range op, or as Range struct
+            // Use Range variant for start/end optional
+            lhs = Expr{kind: ExprKind::Range{start: Some(Box::new(lhs.clone())), end: rhs, inclusive}, span};
+            // For simple .. as binary, also handle as Binary for codegen fallback
+            // Break after one range to avoid chaining `a..b..c`
+            break;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_relational(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_shift()?;
         loop {
             let op = match self.peek_token() {
                 Some(Token::Lt) => BinOp::Lt,
@@ -1760,6 +2134,42 @@ impl Parser {
                 span,
             });
         }
+        if self.peek_token() == Some(&Token::Tilde) {
+            let start = self.advance().unwrap().span.start;
+            let expr = self.parse_unary()?;
+            let span = Span::new(start, expr.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Unary {
+                    op: UnaryOp::BitNot,
+                    expr: Box::new(expr),
+                },
+                span,
+            });
+        }
+        if self.peek_token() == Some(&Token::PlusPlus) {
+            let start = self.advance().unwrap().span.start;
+            let expr = self.parse_unary()?;
+            let span = Span::new(start, expr.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Unary {
+                    op: UnaryOp::Inc,
+                    expr: Box::new(expr),
+                },
+                span,
+            });
+        }
+        if self.peek_token() == Some(&Token::MinusMinus) {
+            let start = self.advance().unwrap().span.start;
+            let expr = self.parse_unary()?;
+            let span = Span::new(start, expr.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Unary {
+                    op: UnaryOp::Dec,
+                    expr: Box::new(expr),
+                },
+                span,
+            });
+        }
         self.parse_postfix()
     }
 
@@ -1810,16 +2220,9 @@ impl Parser {
                                     }
                                     self.expect(Token::Gt, "expected `>` after type arguments").unwrap();
                                     self.expect(Token::LParen, "expected `(` after type arguments").unwrap();
-                                    let mut args = Vec::new();
-                                    if self.peek_token() != Some(&Token::RParen) {
-                                        loop {
-                                            args.push(self.parse_expr().unwrap());
-                                            if !self.consume_if(Token::Comma) { break; }
-                                        }
-                                    }
+                                    let args = self.parse_call_args()?;
                                     self.expect(Token::RParen, "expected `)` after call args").unwrap();
                                     let end = self.tokens[self.pos-1].span.end;
-                                    let span = Span::new(s.clone().len(), end); // placeholder, will fix
                                     let callee_name = s.clone();
                                     let callee_span = expr.span;
                                     let span2 = Span::new(callee_span.start, end);
@@ -1839,13 +2242,7 @@ impl Parser {
                         let callee_name = s.clone();
                         let callee_span = expr.span;
                         self.advance(); // (
-                        let mut args = Vec::new();
-                        if self.peek_token() != Some(&Token::RParen) {
-                            loop {
-                                args.push(self.parse_expr()?);
-                                if self.consume_if(Token::Comma) { continue; } else { break; }
-                            }
-                        }
+                        let args = self.parse_call_args()?;
                         let end = self.expect(Token::RParen, "expected `)` after call args")?.span.end;
                         let span = Span::new(callee_span.start, end);
                         expr = Expr{kind: ExprKind::Call{callee: callee_name, callee_span, args, type_args: Vec::new()}, span};
@@ -1858,13 +2255,7 @@ impl Parser {
                         let meth_span = *field_span;
                         let outer_span_start = expr.span.start;
                         self.advance(); // (
-                        let mut args = Vec::new();
-                        if self.peek_token() != Some(&Token::RParen) {
-                            loop {
-                                args.push(self.parse_expr()?);
-                                if self.consume_if(Token::Comma) { continue; } else { break; }
-                            }
-                        }
+                        let args = self.parse_call_args()?;
                         let end = self.expect(Token::RParen, "expected `)` after call args")?.span.end;
                         let span = Span::new(outer_span_start, end);
                         expr = Expr{kind: ExprKind::MethodCall{object: obj, method: meth, method_span: meth_span, args}, span};
@@ -1888,16 +2279,72 @@ impl Parser {
                 };
                 continue;
             }
-            // index: '[' expr ']' (EBNF §8 index-expression, Phase 2 simple single expr)
+            // nullable member access: '?.' ident (EBNF §8)
+            if self.peek_token() == Some(&Token::QuestionDot) {
+                self.advance(); // consume ?.
+                let (field, fspan) = self.parse_ident()?;
+                let span = Span::new(expr.span.start, fspan.end);
+                expr = Expr {
+                    kind: ExprKind::NullableMemberAccess {
+                        object: Box::new(expr),
+                        field,
+                        field_span: fspan,
+                    },
+                    span,
+                };
+                continue;
+            }
+            // postfix increment/decrement: `++` / `--` (EBNF §8)
+            if self.peek_token() == Some(&Token::PlusPlus) {
+                let end = self.advance().unwrap().span.end;
+                let span = Span::new(expr.span.start, end);
+                expr = Expr{kind: ExprKind::Postfix{op: UnaryOp::Inc, expr: Box::new(expr)}, span};
+                continue;
+            }
+            if self.peek_token() == Some(&Token::MinusMinus) {
+                let end = self.advance().unwrap().span.end;
+                let span = Span::new(expr.span.start, end);
+                expr = Expr{kind: ExprKind::Postfix{op: UnaryOp::Dec, expr: Box::new(expr)}, span};
+                continue;
+            }
+            // index: '[' index-or-range ']'  EBNF §8  index-or-range = expression | range-expression | [expr] range-operator [expr]
             if self.peek_token() == Some(&Token::LBracket) {
                 self.advance(); // [
-                let index = self.parse_expr()?;
+                // Handle leading range `..` / `..=`  (start omitted)
                 if matches!(self.peek_token(), Some(Token::DotDot) | Some(Token::DotDotEq)) {
-                    return Err(ParseError{message: "range indexing not supported in Phase 2".into(), span: self.peek_span()});
+                    let op = self.advance().unwrap();
+                    let inclusive = op.token == Token::DotDotEq;
+                    let end = if self.peek_token() != Some(&Token::RBracket) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else { None };
+                    let rb = self.expect(Token::RBracket, "expected `]` after index")?;
+                    let span = Span::new(expr.span.start, rb.span.end);
+                    expr = Expr{kind: ExprKind::Slice{object: Box::new(expr), start: None, end, inclusive}, span};
+                    continue;
+                }
+                let start = self.parse_expr()?;
+                // If start is already a Range (e.g. `1..2`, `1..`, `1..=5`), convert to Slice
+                if let ExprKind::Range { start: rs, end: re, inclusive } = &start.kind {
+                    let rb = self.expect(Token::RBracket, "expected `]` after index")?;
+                    let span = Span::new(expr.span.start, rb.span.end);
+                    expr = Expr{kind: ExprKind::Slice{object: Box::new(expr), start: rs.clone(), end: re.clone(), inclusive: *inclusive}, span};
+                    continue;
+                }
+                // Check for trailing `..` / `..=` after single expr (e.g. `a[1..]`, `a[1..5]` where `1..5` was not parsed as Range because we parsed only `1`? But `parse_expr` already consumes `..`, so this branch only for `1` where `..` not consumed? Actually `1..` as start would have been Range already, so this handles `1` followed by `..` not yet consumed if `1` was parsed as `parse_add` only? But `parse_expr` includes Range, so `1..` would be Range, not here. This handles case where start was single and next is `..` (should not happen if Range consumed, but handle for safety)
+                if matches!(self.peek_token(), Some(Token::DotDot) | Some(Token::DotDotEq)) {
+                    let op = self.advance().unwrap();
+                    let inclusive = op.token == Token::DotDotEq;
+                    let end = if self.peek_token() != Some(&Token::RBracket) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else { None };
+                    let rb = self.expect(Token::RBracket, "expected `]` after index")?;
+                    let span = Span::new(expr.span.start, rb.span.end);
+                    expr = Expr{kind: ExprKind::Slice{object: Box::new(expr), start: Some(Box::new(start)), end, inclusive}, span};
+                    continue;
                 }
                 let rb = self.expect(Token::RBracket, "expected `]` after index")?;
                 let span = Span::new(expr.span.start, rb.span.end);
-                expr = Expr{kind: ExprKind::Index{object: Box::new(expr), index: Box::new(index)}, span};
+                expr = Expr{kind: ExprKind::Index{object: Box::new(expr), index: Box::new(start)}, span};
                 continue;
             }
             break;
@@ -1920,7 +2367,7 @@ impl Parser {
                     if let Ok(ty) = self.parse_type() {
                         if let Ok((pn, pn_span)) = self.parse_ident() {
                             let pspan = Span::new(ty.span().start, pn_span.end);
-                            params.push(Param{ty, name: pn, name_span: pn_span, span: pspan});
+                            params.push(Param{mode: ParamMode::None, ty, name: pn, name_span: pn_span, span: pspan});
                             parsed = true;
                         } else {
                             self.pos = save;
@@ -1932,7 +2379,7 @@ impl Parser {
                         let (pn, pn_span) = self.parse_ident()?;
                         let any_ty = Type::Any(pn_span);
                         let pspan = Span::new(pn_span.start, pn_span.end);
-                        params.push(Param{ty: any_ty, name: pn, name_span: pn_span, span: pspan});
+                        params.push(Param{mode: ParamMode::None, ty: any_ty, name: pn, name_span: pn_span, span: pspan});
                     }
                     if !self.consume_if(Token::Comma) { break; }
                     if self.peek_token() == Some(&Token::Pipe) { break; }
@@ -2001,8 +2448,10 @@ impl Parser {
             Token::StringLit => {
                 self.advance();
                 let raw = self.slice(st.span);
-                // raw is "\"...\""
-                let inner = if raw.len() >= 2 {
+                // raw is either "\"...\"" or "\"\"\"...\"\"\""
+                let inner = if raw.starts_with("\"\"\"") && raw.ends_with("\"\"\"") && raw.len() >= 6 {
+                    &raw[3..raw.len() - 3]
+                } else if raw.len() >= 2 {
                     &raw[1..raw.len() - 1]
                 } else {
                     ""
@@ -2101,8 +2550,21 @@ impl Parser {
                 self.advance();
                 Ok(Expr{kind: ExprKind::This, span: st.span})
             }
+            Token::Super => {
+                self.advance();
+                Ok(Expr{kind: ExprKind::Super, span: st.span})
+            }
+            Token::SelfType => {
+                self.advance();
+                // `Self` as expression — treat as Ident "Self" for type context, or Super-like
+                Ok(Expr{kind: ExprKind::Ident("Self".to_string()), span: st.span})
+            }
+            Token::Null => {
+                self.advance();
+                Ok(Expr{kind: ExprKind::Null, span: st.span})
+            }
             Token::Dot => {
-                // Enum variant `.Variant` or `.Variant(args)` (Phase 4)
+                // Enum variant `.Variant` or `.Variant(args)` (Phase 4) — args use argument-list (named/out/ref)
                 let dot_span = st.span;
                 self.advance(); // '.'
                 let (vname, vspan) = self.parse_ident()?;
@@ -2110,12 +2572,7 @@ impl Parser {
                 let mut end = vspan.end;
                 if self.peek_token() == Some(&Token::LParen) {
                     self.advance(); // '('
-                    if self.peek_token() != Some(&Token::RParen) {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if self.consume_if(Token::Comma) { continue; } else { break; }
-                        }
-                    }
+                    args = self.parse_call_args()?;
                     let rp = self.expect(Token::RParen, "expected `)` after enum variant args")?;
                     end = rp.span.end;
                 }
@@ -2124,18 +2581,56 @@ impl Parser {
             }
             Token::Ident => {
                 self.advance();
+                let mut name = self.slice(st.span).to_string();
+                let mut end = st.span.end;
+                // qualified-expression: `a::b::c`
+                while self.peek_token() == Some(&Token::ColonColon) {
+                    self.advance(); // ::
+                    let (seg, sspan) = self.parse_ident()?;
+                    name.push_str("::");
+                    name.push_str(&seg);
+                    end = sspan.end;
+                }
+                // Check for qualified enum variant `Enum::Variant` or `a::b::Variant(args)` is handled via Ident + :: + Ident, but if next is `.Variant`? Actually `a::b::c` as qualified expr is just Ident with ::; enum variant with qualified prefix `Option::Some(1)` would be `a::b` + `.Variant`? That is handled via later MemberAccess? For now, treat `a::b` as Ident.
+                // If the qualified name is followed by `.Variant` (enum), it will be handled as MemberAccess in postfix, but we can also handle `a::b::Variant(args)` as EnumVariant with prefix
+                // For `a::b::c` where `c` is variant and next is `(`, we could detect but keep as Ident for now.
+                let span = Span::new(st.span.start, end);
+                // If next tokens are `::` already handled, but if after qualified we have `.` variant, postfix will turn it into MemberAccess/EnumVariant. For now return qualified Ident.
+                // Special: if name contains `::` and next is `::` already consumed, we already have full qualified.
+                // Check for `::Variant` with `::`? Already handled.
                 Ok(Expr {
-                    kind: ExprKind::Ident(self.slice(st.span).to_string()),
-                    span: st.span,
+                    kind: ExprKind::Ident(name),
+                    span,
                 })
             }
             Token::LParen => {
                 self.advance();
-                let inner = self.parse_expr()?;
+                // Check for empty tuple `()`
+                if self.peek_token() == Some(&Token::RParen) {
+                    let end = self.advance().unwrap().span.end;
+                    let span = Span::new(st.span.start, end);
+                    return Ok(Expr{kind: ExprKind::Tuple(vec![]), span});
+                }
+                let first = self.parse_expr()?;
+                if self.consume_if(Token::Comma) {
+                    // Tuple: (first, ...)
+                    let mut exprs = vec![first];
+                    // Handle trailing comma and remaining exprs
+                    while self.peek_token() != Some(&Token::RParen) {
+                        // Allow trailing comma: if next is `)` break
+                        if self.peek_token() == Some(&Token::RParen) { break; }
+                        let e = self.parse_expr()?;
+                        exprs.push(e);
+                        if !self.consume_if(Token::Comma) { break; }
+                    }
+                    let end = self.expect(Token::RParen, "expected `)` after tuple")?.span.end;
+                    let span = Span::new(st.span.start, end);
+                    return Ok(Expr{kind: ExprKind::Tuple(exprs), span});
+                }
                 let end = self.expect(Token::RParen, "expected `)`")?.span.end;
                 let span = Span::new(st.span.start, end);
                 Ok(Expr {
-                    kind: ExprKind::Paren(Box::new(inner)),
+                    kind: ExprKind::Paren(Box::new(first)),
                     span,
                 })
             }

@@ -33,6 +33,7 @@ pub struct Codegen<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     vars: Vec<HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>>,
+    globals: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
     funcs: HashMap<String, (FunctionValue<'ctx>, TyInfo)>,
     struct_types: HashMap<String, StructType<'ctx>>,
     struct_fields: HashMap<String, HashMap<String, u32>>, // struct -> field -> index
@@ -61,6 +62,8 @@ struct PropertyCG<'ctx> {
 struct TyInfo {
     ret: crate::sema::Ty,
     params: Vec<crate::sema::Ty>,
+    param_modes: Vec<ParamMode>,
+    param_names: Vec<String>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -72,6 +75,7 @@ impl<'ctx> Codegen<'ctx> {
             module,
             builder,
             vars: Vec::new(),
+            globals: HashMap::new(),
             funcs: HashMap::new(),
             struct_types: HashMap::new(),
             struct_fields: HashMap::new(),
@@ -111,6 +115,7 @@ impl<'ctx> Codegen<'ctx> {
                 Item::Distinct(dd) => self.declare_distinct(dd)?,
                 Item::Extension(ext) => self.declare_extension(ext)?,
                 Item::Extern(ext) => self.declare_extern(ext)?,
+                Item::Const(c) => self.declare_const(c)?,
                 _ => {}
             }
         }
@@ -256,7 +261,7 @@ impl<'ctx> Codegen<'ctx> {
             };
             let mangled = format!("{}__{}", c.name, m.name);
             let func = self.module.add_function(&mangled, fn_ty, None);
-            let tyinfo = TyInfo{ret: ret_ty.clone(), params: param_semas.clone()};
+            let tyinfo = TyInfo{ret: ret_ty.clone(), params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()};
             methods.insert(m.name.clone(), (func, tyinfo));
         }
         self.class_methods.insert(c.name.clone(), methods);
@@ -290,7 +295,7 @@ impl<'ctx> Codegen<'ctx> {
             };
             let mangled = format!("{}__op_{}", c.name, op_mangled);
             let func = self.module.add_function(&mangled, fn_ty, None);
-            ops.insert(op.op.clone(), (func, TyInfo{ret: ret_ty.clone(), params: param_semas}));
+            ops.insert(op.op.clone(), (func, TyInfo{ret: ret_ty.clone(), params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()}));
         }
         if !ops.is_empty() { self.class_operators.insert(c.name.clone(), ops); }
         // Inherit parent methods for extends (static dispatch)
@@ -323,7 +328,7 @@ impl<'ctx> Codegen<'ctx> {
             let fn_ty = self.context.void_type().fn_type(&param_llvm, false);
             let mangled = format!("{}__ctor{}", c.name, if c.constructors.len()>1 { format!("{}", idx)} else {"".to_string()});
             let func = self.module.add_function(&mangled, fn_ty, None);
-            ctors.push((func, TyInfo{ret: crate::sema::Ty::Void, params: param_semas}));
+            ctors.push((func, TyInfo{ret: crate::sema::Ty::Void, params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()}));
         }
         if !ctors.is_empty() { self.class_constructors.insert(c.name.clone(), ctors); }
         // Declare properties: getter/setter — allow separate declarations that merge
@@ -348,7 +353,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.module.add_function(&mangled, fn_ty, None)
                 };
                 let mut params = vec![crate::sema::Ty::Struct(c.name.clone())];
-                pg = Some((func, TyInfo{ret: prop_ty.clone(), params}));
+                pg = Some((func, TyInfo{ret: prop_ty.clone(), params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new()}));
             }
             if let Some((ref param,_)) = prop.setter {
                 let setter_ty_raw: crate::sema::Ty = (&param.ty).into();
@@ -363,7 +368,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.module.add_function(&mangled, fn_ty, None)
                 };
                 let mut params = vec![crate::sema::Ty::Struct(c.name.clone()), setter_ty.clone()];
-                ps = Some((func, TyInfo{ret: crate::sema::Ty::Void, params}));
+                ps = Some((func, TyInfo{ret: crate::sema::Ty::Void, params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new()}));
             }
             if let Some(existing) = props.get(&prop.name).cloned() {
                 let mut merged_getter = existing.getter;
@@ -487,7 +492,7 @@ impl<'ctx> Codegen<'ctx> {
                 let mangled = format!("{}__{}", target, f.name);
                 let func = self.module.add_function(&mangled, fn_ty, None);
                 let entry = self.class_methods.entry(target.clone()).or_insert_with(std::collections::HashMap::new);
-                entry.insert(f.name.clone(), (func, TyInfo{ret: ret_ty, params: param_semas}));
+                entry.insert(f.name.clone(), (func, TyInfo{ret: ret_ty, params: param_semas.clone(), param_modes: vec![ParamMode::None; param_semas.len()], param_names: Vec::new()}));
             }
         }
         Ok(())
@@ -515,6 +520,39 @@ impl<'ctx> Codegen<'ctx> {
                 self.module.add_function(name, fn_ty, None);
             }
         }
+        Ok(())
+    }
+
+    fn declare_const(&mut self, c: &ConstDecl) -> Result<(), CodegenError> {
+        let ty = if let Some(t) = &c.ty {
+            self.llvm_ty_for(t)
+        } else {
+            // infer from init: simple for int/bool/string
+            match &c.init.kind {
+                ExprKind::IntLit(_) => self.context.i64_type().into(),
+                ExprKind::BoolLit(_) => self.context.bool_type().into(),
+                ExprKind::StringLit(_) => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                ExprKind::CharLit(_) => self.context.i32_type().into(),
+                ExprKind::FloatLit(_) => self.context.f64_type().into(),
+                _ => self.context.i64_type().into(),
+            }
+        };
+        let global = self.module.add_global(ty, None, &c.name);
+        global.set_constant(true);
+        // For simple literals, set initializer directly; for complex, initializer will be set at runtime via holt.init (deferred)
+        let init_val = match &c.init.kind {
+            ExprKind::IntLit(v) => self.context.i64_type().const_int(*v as u64, true).into(),
+            ExprKind::BoolLit(b) => self.context.bool_type().const_int(if *b {1} else {0}, false).into(),
+            ExprKind::StringLit(_) => ty.const_zero(),
+            ExprKind::CharLit(ch) => self.context.i32_type().const_int(*ch as u64, false).into(),
+            _ => ty.const_zero(),
+        };
+        if global.get_initializer().is_none() {
+            global.set_initializer(&init_val);
+        }
+        global.set_linkage(inkwell::module::Linkage::External);
+        let ptr = global.as_pointer_value();
+        self.globals.insert(c.name.clone(), (ptr, ty));
         Ok(())
     }
 
@@ -593,24 +631,26 @@ impl<'ctx> Codegen<'ctx> {
                 panic!("void not a first-class type in llvm_ty_for")
             }
             Type::Named(n, _) => {
-                if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                let lookup = n.rsplit("::").next().unwrap_or(n);
+                if lookup.len() == 1 && lookup.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                     return self.context.i64_type().into();
                 }
-                if let Some(st) = self.struct_types.get(n) {
+                if let Some(st) = self.struct_types.get(lookup) {
                     st.as_basic_type_enum().into()
-                } else if let Some(et) = self.enum_types.get(n) {
+                } else if let Some(et) = self.enum_types.get(lookup) {
                     et.as_basic_type_enum().into()
                 } else {
                     panic!("unknown struct/enum type {n}")
                 }
             }
             Type::Generic(n, args, _) => {
-                if let Some(st) = self.struct_types.get(n) {
+                let lookup = n.rsplit("::").next().unwrap_or(n);
+                if let Some(st) = self.struct_types.get(lookup) {
                     st.as_basic_type_enum().into()
-                } else if let Some(et) = self.enum_types.get(n) {
+                } else if let Some(et) = self.enum_types.get(lookup) {
                     et.as_basic_type_enum().into()
                 } else {
-                    let key = format!("{}<{}>", n, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(","));
+                    let key = format!("{}<{}>", lookup, args.iter().map(|a| a.name()).collect::<Vec<_>>().join(","));
                     if let Some(st) = self.struct_types.get(&key) {
                         st.as_basic_type_enum().into()
                     } else {
@@ -656,12 +696,13 @@ impl<'ctx> Codegen<'ctx> {
             ),
             crate::sema::Ty::Void => None,
             crate::sema::Ty::Struct(n) => {
-                if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                let lookup = n.rsplit("::").next().unwrap_or(n);
+                if lookup.len() == 1 && lookup.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                     return Some(self.context.i64_type().into());
                 }
-                if let Some(st) = self.struct_types.get(n) {
+                if let Some(st) = self.struct_types.get(lookup) {
                     Some(st.as_basic_type_enum().into())
-                } else if let Some(et) = self.enum_types.get(n) {
+                } else if let Some(et) = self.enum_types.get(lookup) {
                     Some(et.as_basic_type_enum().into())
                 } else {
                     panic!("unknown struct {n} in llvm_ty_for_sema")
@@ -670,12 +711,13 @@ impl<'ctx> Codegen<'ctx> {
             crate::sema::Ty::Float => Some(self.context.f32_type().into()),
             crate::sema::Ty::Double => Some(self.context.f64_type().into()),
             crate::sema::Ty::Generic(n, args) => {
-                if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
+                let lookup = n.rsplit("::").next().unwrap_or(n);
+                if lookup.len() == 1 && lookup.chars().next().unwrap().is_ascii_uppercase() {
                     if !args.is_empty() { return self.llvm_ty_for_sema(&args[0]); }
                     return Some(self.context.i64_type().into());
                 }
-                if let Some(st) = self.struct_types.get(n) { Some(st.as_basic_type_enum().into()) }
-                else if let Some(et) = self.enum_types.get(n) { Some(et.as_basic_type_enum().into()) }
+                if let Some(st) = self.struct_types.get(lookup) { Some(st.as_basic_type_enum().into()) }
+                else if let Some(et) = self.enum_types.get(lookup) { Some(et.as_basic_type_enum().into()) }
                 else { Some(self.context.ptr_type(inkwell::AddressSpace::default()).into()) }
             }
             crate::sema::Ty::Tuple(tys) => {
@@ -704,7 +746,8 @@ impl<'ctx> Codegen<'ctx> {
                 )
             }
             crate::sema::Ty::Enum(n) => {
-                let et = self.enum_types.get(n).unwrap_or_else(|| panic!("unknown enum {n} in llvm_ty_for_sema"));
+                let lookup = n.rsplit("::").next().unwrap_or(n);
+                let et = self.enum_types.get(lookup).unwrap_or_else(|| panic!("unknown enum {n} in llvm_ty_for_sema"));
                 Some(et.as_basic_type_enum().into())
             }
         }
@@ -723,12 +766,21 @@ impl<'ctx> Codegen<'ctx> {
         let param_semas_raw: Vec<crate::sema::Ty> =
             f.params.iter().map(|p| (&p.ty).into()).collect();
         let param_semas: Vec<crate::sema::Ty> = param_semas_raw.iter().map(|t| self.resolve_ty_for_codegen(t)).collect();
+        let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
 
-        let param_types: Vec<inkwell::types::BasicMetadataTypeEnum> =
-            param_semas
-                .iter()
-                .filter_map(|t| self.llvm_ty_for_sema(t).map(|bt| bt.into()))
-                .collect();
+        let param_types: Vec<inkwell::types::BasicMetadataTypeEnum> = f
+            .params
+            .iter()
+            .map(|p| {
+                if p.mode != ParamMode::None {
+                    self.context.ptr_type(inkwell::AddressSpace::default()).into()
+                } else {
+                    let t: crate::sema::Ty = (&p.ty).into();
+                    let rt = self.resolve_ty_for_codegen(&t);
+                    self.llvm_ty_for_sema(&rt).map(|bt| bt.into()).unwrap()
+                }
+            })
+            .collect();
 
         // Special ABI for `main`: C `int main()` is always i32
         let fn_ty = if f.name == "main" {
@@ -803,6 +855,8 @@ impl<'ctx> Codegen<'ctx> {
                 TyInfo {
                     ret: ret_sema,
                     params: param_semas,
+                    param_modes,
+                    param_names: f.params.iter().map(|p| p.name.clone()).collect(),
                 },
             ),
         );
@@ -908,6 +962,21 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
+    fn codegen_call_arg(&mut self, arg: &CallArg) -> Result<BasicValueEnum<'ctx>, CodegenError> {
+        match arg {
+            CallArg::Expr(e) => self.codegen_expr(e),
+            CallArg::Named { value, .. } => self.codegen_expr(value),
+            CallArg::Out { name, name_span, .. } => {
+                let (ptr, _) = self.lookup_var(name).ok_or(CodegenError { message: format!("undefined variable `{}` for `out`", name), span: *name_span })?;
+                Ok(ptr.into())
+            }
+            CallArg::Ref { expr, .. } => {
+                let ptr = self.codegen_as_ptr(expr)?;
+                Ok(ptr.into())
+            }
+        }
+    }
+
     fn codegen_function(&mut self, f: &Function) -> Result<(), CodegenError> {
         let (func, info) =
             self.funcs.get(&f.name).cloned().ok_or(CodegenError {
@@ -925,14 +994,18 @@ impl<'ctx> Codegen<'ctx> {
 
         self.vars.push(HashMap::new());
         for (i, param) in f.params.iter().enumerate() {
-            let llvm_ty = self.llvm_ty_for(&param.ty);
-            let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
             let param_val = func.get_nth_param(i as u32).unwrap();
-            self.builder.build_store(alloca, param_val).unwrap();
-            self.vars
-                .last_mut()
-                .unwrap()
-                .insert(param.name.clone(), (alloca, llvm_ty));
+            if param.mode != ParamMode::None {
+                // out/ref: incoming is ptr to caller's storage
+                let inner_ty = self.llvm_ty_for(&param.ty);
+                let ptr = param_val.into_pointer_value();
+                self.vars.last_mut().unwrap().insert(param.name.clone(), (ptr, inner_ty));
+            } else {
+                let llvm_ty = self.llvm_ty_for(&param.ty);
+                let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
+                self.builder.build_store(alloca, param_val).unwrap();
+                self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+            }
         }
 
         let always_returns = self.codegen_block(&f.body)?;
@@ -1453,6 +1526,29 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 Ok(false)
             }
+            Stmt::Const(c) => {
+                let ty = if let Some(t) = &c.ty {
+                    self.llvm_ty_for(t)
+                } else {
+                    // infer from init via sema type? For MVP, assume int
+                    // Try to infer by codegen init first to get type, then alloca
+                    // Simplify: assume int for now, will be corrected after init codegen
+                    self.context.i64_type().into()
+                };
+                // If ty was inferred as int placeholder but init is string, we need correct ty
+                // For `const x = "hello"` with no type, ty should be string (ptr)
+                // We can codegen init first to get its type, then create alloca with that type if ty was None
+                let init_val = self.codegen_expr(&c.init)?;
+                let actual_ty = if c.ty.is_none() {
+                    init_val.get_type()
+                } else {
+                    ty
+                };
+                let alloca = self.create_entry_block_alloca(&c.name, actual_ty);
+                self.vars.last_mut().unwrap().insert(c.name.clone(), (alloca, actual_ty));
+                self.builder.build_store(alloca, init_val).unwrap();
+                Ok(false)
+            }
             Stmt::Expr(e) => {
                 let _ = self.codegen_expr(&e.expr)?;
                 Ok(false)
@@ -1740,12 +1836,14 @@ impl<'ctx> Codegen<'ctx> {
                 .bool_type()
                 .const_int(if *b { 1 } else { 0 }, false)
                 .into()),
+            ExprKind::CharLit(c) => Ok(self.context.i32_type().const_int(*c as u64, false).into()),
             ExprKind::Ident(name) => {
-                let (ptr, ty) = self.lookup_var(name).ok_or(CodegenError {
+                let lookup = name.rsplit("::").next().unwrap_or(name);
+                let (ptr, ty) = self.lookup_var(name).or_else(|| self.lookup_var(lookup)).ok_or(CodegenError {
                     message: format!("undefined var {name}"),
                     span: expr.span,
                 })?;
-                Ok(self.builder.build_load(ty, ptr, name).unwrap())
+                Ok(self.builder.build_load(ty, ptr, lookup).unwrap())
             }
             ExprKind::This => {
                 let (ptr, ty) = self.lookup_var("this").ok_or(CodegenError{message: "`this` outside method".into(), span: expr.span})?;
@@ -1789,7 +1887,7 @@ impl<'ctx> Codegen<'ctx> {
                 let (func, _info) = methods.get(method).cloned().ok_or(CodegenError{message: format!("unknown method {method} for class {cls_name}"), span: expr.span})?;
                 let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = vec![this_ptr.into()];
                 for a in args {
-                    let v = self.codegen_expr(a)?;
+                    let v = self.codegen_call_arg(a)?;
                     arg_vals.push(v.into());
                 }
                 let call = self.builder.build_call(func, &arg_vals, "call").unwrap();
@@ -1825,7 +1923,37 @@ impl<'ctx> Codegen<'ctx> {
                             .into())
                     }
                     UnaryOp::Pos => Ok(v),
+                    UnaryOp::BitNot => {
+                        let i = v.into_int_value();
+                        Ok(self.builder.build_not(i, "bitnot").unwrap().into())
+                    }
+                    UnaryOp::Inc => {
+                        // Prefix ++ : increment lvalue and return new value
+                        let ptr = self.codegen_as_ptr(inner)?;
+                        let cur = self.builder.build_load(self.context.i64_type(), ptr, "inc.load").unwrap().into_int_value();
+                        let nxt = self.builder.build_int_add(cur, self.context.i64_type().const_int(1,false), "inc").unwrap();
+                        self.builder.build_store(ptr, nxt).unwrap();
+                        Ok(nxt.into())
+                    }
+                    UnaryOp::Dec => {
+                        let ptr = self.codegen_as_ptr(inner)?;
+                        let cur = self.builder.build_load(self.context.i64_type(), ptr, "dec.load").unwrap().into_int_value();
+                        let nxt = self.builder.build_int_sub(cur, self.context.i64_type().const_int(1,false), "dec").unwrap();
+                        self.builder.build_store(ptr, nxt).unwrap();
+                        Ok(nxt.into())
+                    }
                 }
+            }
+            ExprKind::Postfix { op, expr: inner } => {
+                let ptr = self.codegen_as_ptr(inner)?;
+                let cur = self.builder.build_load(self.context.i64_type(), ptr, "post.load").unwrap().into_int_value();
+                let nxt = match op {
+                    UnaryOp::Inc => self.builder.build_int_add(cur, self.context.i64_type().const_int(1,false), "post.inc").unwrap(),
+                    UnaryOp::Dec => self.builder.build_int_sub(cur, self.context.i64_type().const_int(1,false), "post.dec").unwrap(),
+                    _ => cur,
+                };
+                self.builder.build_store(ptr, nxt).unwrap();
+                Ok(cur.into())
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 // Check for operator overloading
@@ -1845,22 +1973,33 @@ impl<'ctx> Codegen<'ctx> {
                             BinOp::IsNot => "is not",
                             BinOp::And => "and",
                             BinOp::Or => "or",
+                            BinOp::BitAnd => "&",
+                            BinOp::BitOr => "|",
+                            BinOp::BitXor => "^",
+                            BinOp::Shl => "<<",
+                            BinOp::Shr => ">>",
+                            BinOp::NullCoalesce => "??",
+                            BinOp::Range => "..",
+                            BinOp::RangeInclusive => "..=",
+                            _ => "",
                         };
-                        if let Some((func,_)) = op_map.get(op_str) {
-                            // operator call: this is left operand pointer, arg is right
-                            let this_ptr = match self.codegen_as_ptr(lhs) {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    // fallback: if lhs is not addressable, allocate temp
-                                    let val = self.codegen_expr(lhs)?;
-                                    let tmp = self.builder.build_alloca(val.get_type(), "op.lhs.tmp").unwrap();
-                                    self.builder.build_store(tmp, val).unwrap();
-                                    tmp
-                                }
-                            };
-                            let r_val = self.codegen_expr(rhs)?;
-                            let call = self.builder.build_call(*func, &[this_ptr.into(), r_val.into()], "op.call").unwrap();
-                            if let Some(v) = call.try_as_basic_value().basic() { return Ok(v); } else { return Ok(self.context.i64_type().const_int(0,false).into()); }
+                        if !op_str.is_empty() {
+                            if let Some((func,_)) = op_map.get(op_str) {
+                                // operator call: this is left operand pointer, arg is right
+                                let this_ptr = match self.codegen_as_ptr(lhs) {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        // fallback: if lhs is not addressable, allocate temp
+                                        let val = self.codegen_expr(lhs)?;
+                                        let tmp = self.builder.build_alloca(val.get_type(), "op.lhs.tmp").unwrap();
+                                        self.builder.build_store(tmp, val).unwrap();
+                                        tmp
+                                    }
+                                };
+                                let r_val = self.codegen_expr(rhs)?;
+                                let call = self.builder.build_call(*func, &[this_ptr.into(), r_val.into()], "op.call").unwrap();
+                                if let Some(v) = call.try_as_basic_value().basic() { return Ok(v); } else { return Ok(self.context.i64_type().const_int(0,false).into()); }
+                            }
                         }
                     }
                 }
@@ -1986,7 +2125,124 @@ impl<'ctx> Codegen<'ctx> {
                         .build_or(l.into_int_value(), r.into_int_value(), "or")
                         .unwrap()
                         .into(),
+                    BinOp::BitAnd => self.builder.build_and(l.into_int_value(), r.into_int_value(), "bitand").unwrap().into(),
+                    BinOp::BitOr => self.builder.build_or(l.into_int_value(), r.into_int_value(), "bitor").unwrap().into(),
+                    BinOp::BitXor => self.builder.build_xor(l.into_int_value(), r.into_int_value(), "bitxor").unwrap().into(),
+                    BinOp::Shl => self.builder.build_left_shift(l.into_int_value(), r.into_int_value(), "shl").unwrap().into(),
+                    BinOp::Shr => self.builder.build_right_shift(l.into_int_value(), r.into_int_value(), false, "shr").unwrap().into(),
+                    BinOp::NullCoalesce => {
+                        // a ?? b : if a is Optional, return a if not null else b; for MVP treat as l if not zero
+                        let is_null = if l.is_pointer_value() {
+                            self.builder.build_is_null(l.into_pointer_value(), "isnull").unwrap()
+                        } else {
+                            self.builder.build_int_compare(inkwell::IntPredicate::EQ, l.into_int_value(), self.context.i64_type().const_int(0,false), "isnull").unwrap()
+                        };
+                        // For now, just return l if not zero else r
+                        let cond = is_null;
+                        // Use select
+                        self.builder.build_select(cond, r, l, "coalesce").unwrap().into()
+                    },
+                    BinOp::Range | BinOp::RangeInclusive => {
+                        // For MVP, range as array of two ints [start, end] stored as struct {i64,i64} or just return l
+                        // Create struct {i64,i64}
+                        let struct_ty = self.context.struct_type(&[self.context.i64_type().into(), self.context.i64_type().into()], false);
+                        let mut agg: BasicValueEnum = struct_ty.get_undef().into();
+                        let tmp = self.builder.build_insert_value(agg.into_struct_value(), l, 0, "range.start").unwrap();
+                        agg = tmp.as_basic_value_enum();
+                        let tmp2 = self.builder.build_insert_value(agg.into_struct_value(), r, 1, "range.end").unwrap();
+                        agg = tmp2.as_basic_value_enum();
+                        agg.into()
+                    },
+                    BinOp::CompoundAdd | BinOp::CompoundSub | BinOp::CompoundMul | BinOp::CompoundDiv | BinOp::CompoundMod | BinOp::CompoundBitAnd | BinOp::CompoundBitOr | BinOp::CompoundBitXor | BinOp::CompoundShl | BinOp::CompoundShr => {
+                        // Should not reach here as compound is CompoundAssign, not Binary
+                        l
+                    },
                 })
+            }
+            ExprKind::Conditional { cond, then_branch, else_branch } => {
+                let cond_val = self.codegen_expr(cond)?.into_int_value();
+                let func = self.cur_fn.unwrap();
+                // Allocate result slot in entry block before branching
+                let result_ty = self.context.i64_type();
+                let result_ptr = self.create_entry_block_alloca("cond.result", result_ty.into());
+                let then_bb = self.context.append_basic_block(func, "cond.then");
+                let else_bb = self.context.append_basic_block(func, "cond.else");
+                let merge_bb = self.context.append_basic_block(func, "cond.merge");
+                self.builder.build_conditional_branch(cond_val, then_bb, else_bb).unwrap();
+                self.builder.position_at_end(then_bb);
+                let then_val = self.codegen_expr(then_branch)?;
+                self.builder.build_store(result_ptr, then_val).unwrap();
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(else_bb);
+                let else_val = self.codegen_expr(else_branch)?;
+                self.builder.build_store(result_ptr, else_val).unwrap();
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(merge_bb);
+                Ok(self.builder.build_load(result_ty, result_ptr, "cond.result.load").unwrap())
+            }
+            ExprKind::Range { start, end, inclusive } => {
+                // For `a..b` or `a..=b` or `..b` etc. Return struct {start,end} or array
+                let start_val = if let Some(s) = start { self.codegen_expr(s)? } else { self.context.i64_type().const_int(0,false).into() };
+                let end_val = if let Some(e) = end { self.codegen_expr(e)? } else { self.context.i64_type().const_int(0,false).into() };
+                let struct_ty = self.context.struct_type(&[self.context.i64_type().into(), self.context.i64_type().into(), self.context.bool_type().into()], false);
+                let mut agg: BasicValueEnum = struct_ty.get_undef().into();
+                let tmp = self.builder.build_insert_value(agg.into_struct_value(), start_val, 0, "range.start").unwrap();
+                agg = tmp.as_basic_value_enum();
+                let tmp2 = self.builder.build_insert_value(agg.into_struct_value(), end_val, 1, "range.end").unwrap();
+                agg = tmp2.as_basic_value_enum();
+                let inc = self.context.bool_type().const_int(if *inclusive { 1 } else { 0 }, false);
+                let tmp3 = self.builder.build_insert_value(agg.into_struct_value(), inc, 2, "range.inclusive").unwrap();
+                Ok(tmp3.as_basic_value_enum())
+            }
+            ExprKind::CompoundAssign { op, lhs, value } => {
+                let rhs = self.codegen_expr(value)?;
+                let ptr = self.codegen_as_ptr(lhs)?;
+                let lhs_val = self.builder.build_load(self.context.i64_type(), ptr, "compound.load").unwrap().into_int_value();
+                let rhs_val = rhs.into_int_value();
+                let res = match op {
+                    BinOp::CompoundAdd => self.builder.build_int_add(lhs_val, rhs_val, "compound.add").unwrap(),
+                    BinOp::CompoundSub => self.builder.build_int_sub(lhs_val, rhs_val, "compound.sub").unwrap(),
+                    BinOp::CompoundMul => self.builder.build_int_mul(lhs_val, rhs_val, "compound.mul").unwrap(),
+                    BinOp::CompoundDiv => self.builder.build_int_signed_div(lhs_val, rhs_val, "compound.div").unwrap(),
+                    BinOp::CompoundMod => self.builder.build_int_signed_rem(lhs_val, rhs_val, "compound.mod").unwrap(),
+                    BinOp::CompoundBitAnd => self.builder.build_and(lhs_val, rhs_val, "compound.and").unwrap(),
+                    BinOp::CompoundBitOr => self.builder.build_or(lhs_val, rhs_val, "compound.or").unwrap(),
+                    BinOp::CompoundBitXor => self.builder.build_xor(lhs_val, rhs_val, "compound.xor").unwrap(),
+                    BinOp::CompoundShl => self.builder.build_left_shift(lhs_val, rhs_val, "compound.shl").unwrap(),
+                    BinOp::CompoundShr => self.builder.build_right_shift(lhs_val, rhs_val, false, "compound.shr").unwrap(),
+                    _ => lhs_val,
+                };
+                self.builder.build_store(ptr, res).unwrap();
+                Ok(res.into())
+            }
+            ExprKind::NullableMemberAccess { object, field, field_span: _ } => {
+                // For `a?.b`, if a is null (0), return null/zero, else normal member access
+                let obj_val = self.codegen_expr(object)?;
+                // Check if object is pointer and null
+                if obj_val.is_pointer_value() {
+                    let is_null = self.builder.build_is_null(obj_val.into_pointer_value(), "isnull").unwrap();
+                    let func = self.cur_fn.unwrap();
+                    let then_bb = self.context.append_basic_block(func, "nullable.then");
+                    let else_bb = self.context.append_basic_block(func, "nullable.else");
+                    let merge_bb = self.context.append_basic_block(func, "nullable.merge");
+                    self.builder.build_conditional_branch(is_null, else_bb, then_bb).unwrap();
+                    self.builder.position_at_end(then_bb);
+                    // Normal access: need field pointer
+                    let field_ptr = self.codegen_field_ptr(object, field).unwrap();
+                    let field_val = self.builder.build_load(self.context.i64_type(), field_ptr, "nullable.field").unwrap();
+                    self.builder.build_unconditional_branch(merge_bb).unwrap();
+                    self.builder.position_at_end(else_bb);
+                    let null_val = self.context.i64_type().const_int(0,false);
+                    self.builder.build_unconditional_branch(merge_bb).unwrap();
+                    self.builder.position_at_end(merge_bb);
+                    let phi = self.builder.build_phi(self.context.i64_type(), "nullable.result").unwrap();
+                    phi.add_incoming(&[(&field_val, then_bb), (&null_val, else_bb)]);
+                    Ok(phi.as_basic_value())
+                } else {
+                    // For non-pointer, just normal access
+                    let field_ptr = self.codegen_field_ptr(object, field)?;
+                    Ok(self.builder.build_load(self.context.i64_type(), field_ptr, field).unwrap())
+                }
             }
             ExprKind::Assign { lhs, value } => {
                 let val = self.codegen_expr(value)?;
@@ -2088,7 +2344,7 @@ impl<'ctx> Codegen<'ctx> {
                 // stdlib io intrinsics: print, println, printInt, putChar
                 if Self::is_stdlib_io_intrinsic(callee) {
                     if callee == "print" && args.len()==1 {
-                        let v = self.codegen_expr(&args[0])?;
+                        let v = self.codegen_call_arg(&args[0])?;
                         if v.is_pointer_value() {
                             let puts = self.get_or_declare_puts();
                             // Use printf for no newline to avoid puts newline
@@ -2097,17 +2353,17 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         return Ok(self.context.i64_type().const_int(0,false).into());
                     } else if callee == "println" && args.len()==1 {
-                        let v = self.codegen_expr(&args[0])?;
+                        let v = self.codegen_call_arg(&args[0])?;
                         let puts = self.get_or_declare_puts();
                         self.builder.build_call(puts, &[v.into()], "puts").unwrap();
                         return Ok(self.context.i64_type().const_int(0,false).into());
                     } else if callee == "printInt" && args.len()==1 {
-                        let v = self.codegen_expr(&args[0])?;
+                        let v = self.codegen_call_arg(&args[0])?;
                         let fmt = self.builder.build_global_string_ptr("%ld\n", "fmt_ld").unwrap();
                         self.builder.build_call(self.get_or_declare_printf(), &[fmt.as_pointer_value().into(), v.into()], "printf").unwrap();
                         return Ok(self.context.i64_type().const_int(0,false).into());
                     } else if callee == "putChar" && args.len()==1 {
-                        let v = self.codegen_expr(&args[0])?;
+                        let v = self.codegen_call_arg(&args[0])?;
                         let putchar = self.get_or_declare_putchar();
                         let c = if v.is_int_value() && v.into_int_value().get_type().get_bit_width()!=32 { self.builder.build_int_z_extend_or_bit_cast(v.into_int_value(), self.context.i32_type(), "c_ext").unwrap().into() } else { v };
                         self.builder.build_call(putchar, &[c.into()], "putchar").unwrap();
@@ -2129,7 +2385,7 @@ impl<'ctx> Codegen<'ctx> {
                     let tmp = self.builder.build_alloca(st, "ctor.tmp").unwrap();
                     let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = vec![tmp.into()];
                     for a in args {
-                        let v = self.codegen_expr(a)?;
+                        let v = self.codegen_call_arg(a)?;
                         arg_vals.push(v.into());
                     }
                     self.builder.build_call(ctor_func, &arg_vals, "ctor.call").unwrap();
@@ -2137,16 +2393,38 @@ impl<'ctx> Codegen<'ctx> {
                     return Ok(loaded);
                 }
                 // Try direct function, extern, or variable function pointer
-                if let Some((func,_info)) = self.funcs.get(callee).cloned() {
+                if let Some((func, info)) = self.funcs.get(callee).cloned() {
                     let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-                    for a in args { let v = self.codegen_expr(a)?; arg_vals.push(v.into()); }
+                    let has_named = args.iter().any(|a| matches!(a, CallArg::Named{..}));
+                    if has_named && !info.param_names.is_empty() {
+                        let mut map: std::collections::HashMap<String, &CallArg> = std::collections::HashMap::new();
+                        for a in args {
+                            if let CallArg::Named { name, .. } = a {
+                                map.insert(name.clone(), a);
+                            }
+                        }
+                        for pname in &info.param_names {
+                            if let Some(arg) = map.get(pname) {
+                                let v = self.codegen_call_arg(arg)?;
+                                arg_vals.push(v.into());
+                            } else {
+                                // fallback: try positional (should not happen for all-named)
+                                // find positional arg at same index if exists
+                                // For now, push zero
+                                arg_vals.push(self.context.i64_type().const_int(0,false).into());
+                            }
+                        }
+                        // If there are positional args mixed, they are ignored in this path (MVP: require all named if any named)
+                    } else {
+                        for a in args { let v = self.codegen_call_arg(a)?; arg_vals.push(v.into()); }
+                    }
                     let call = self.builder.build_call(func, &arg_vals, "call").unwrap();
                     let vk = call.try_as_basic_value();
                     if vk.is_basic() { return Ok(vk.basic().unwrap()); } else { return Ok(self.context.i64_type().const_int(0,false).into()); }
                 }
                 if let Some(f) = self.module.get_function(callee) {
                     let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
-                    for a in args { let v = self.codegen_expr(a)?; arg_vals.push(v.into()); }
+                    for a in args { let v = self.codegen_call_arg(a)?; arg_vals.push(v.into()); }
                     let call = self.builder.build_call(f, &arg_vals, "call").unwrap();
                     let vk = call.try_as_basic_value();
                     if vk.is_basic() { return Ok(vk.basic().unwrap()); } else { return Ok(self.context.i64_type().const_int(0,false).into()); }
@@ -2156,7 +2434,7 @@ impl<'ctx> Codegen<'ctx> {
                     let mut arg_vals: Vec<inkwell::values::BasicMetadataValueEnum> = Vec::new();
                     let mut param_tys: Vec<inkwell::types::BasicMetadataTypeEnum> = Vec::new();
                     for a in args {
-                        let v = self.codegen_expr(a)?;
+                        let v = self.codegen_call_arg(a)?;
                         param_tys.push(v.get_type().into());
                         arg_vals.push(v.into());
                     }
@@ -2276,6 +2554,13 @@ impl<'ctx> Codegen<'ctx> {
                 // For Phase 2, support a[i] where a is array variable; for other cases, error
                 return Err(CodegenError{message: "unsupported indexing base; only direct array variable indexing supported in Phase 2".into(), span: expr.span});
             }
+            ExprKind::Slice { object, start, end, inclusive: _ } => {
+                // MVP: evaluate bounds for side effects, return object value (slice as identity)
+                // Proper slicing (copy subarray, bounds checks) deferred
+                if let Some(s) = start { let _ = self.codegen_expr(s)?; }
+                if let Some(e) = end { let _ = self.codegen_expr(e)?; }
+                self.codegen_expr(object)
+            }
             ExprKind::StringLit(s) => {
                 // Create global string pointer: build_global_string_ptr returns i8* to null-terminated string
                 let ptr =
@@ -2344,7 +2629,7 @@ impl<'ctx> Codegen<'ctx> {
                 let tmp = self.builder.build_insert_value(agg.into_struct_value(), tag_val, 0, "enum.tag").unwrap();
                 agg = tmp.as_basic_value_enum();
                 if !args.is_empty() {
-                    let payload_val = self.codegen_expr(&args[0])?;
+                    let payload_val = self.codegen_call_arg(&args[0])?;
                     let tmp2 = self.builder.build_insert_value(agg.into_struct_value(), payload_val, 1, "enum.payload").unwrap();
                     agg = tmp2.as_basic_value_enum();
                 }
@@ -2732,13 +3017,14 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<(PointerValue<'ctx>, String), CodegenError> {
         match &object.kind {
             ExprKind::Ident(name) => {
-                let (ptr, ty) = self.lookup_var(name).ok_or(CodegenError{message: format!("undefined var {name}"), span: object.span})?;
+                let lookup = name.rsplit("::").next().unwrap_or(name);
+                let (ptr, ty) = self.lookup_var(name).or_else(|| self.lookup_var(lookup)).ok_or(CodegenError{message: format!("undefined var {name}"), span: object.span})?;
                 let sname = self.ty_to_struct_name(&ty)?;
                 Ok((ptr, sname))
             }
-            ExprKind::This => {
-                let (ptr, ty) = self.lookup_var("this").ok_or(CodegenError{message: "`this` outside method".into(), span: object.span})?;
-                let sname = self.cur_class.clone().ok_or(CodegenError{message: "`this` outside method".into(), span: object.span})?;
+            ExprKind::This | ExprKind::Super => {
+                let (ptr, ty) = self.lookup_var("this").ok_or(CodegenError{message: "`this`/`super` outside method".into(), span: object.span})?;
+                let sname = self.cur_class.clone().ok_or(CodegenError{message: "`this`/`super` outside method".into(), span: object.span})?;
                 let instance_ptr = self.builder.build_load(ty, ptr, "this.load").unwrap().into_pointer_value();
                 Ok((instance_ptr, sname))
             }
@@ -2827,8 +3113,9 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<crate::sema::Ty, CodegenError> {
         match &expr.kind {
             ExprKind::Ident(name) => {
+                let lookup = name.rsplit("::").next().unwrap_or(name);
                 for scope in self.vars.iter().rev() {
-                    if let Some((_, ty)) = scope.get(name) {
+                    if let Some((_, ty)) = scope.get(name).or_else(|| scope.get(lookup)) {
                         if ty.is_struct_type() {
                             let sname = self.ty_to_struct_name(ty).unwrap();
                             if self.enum_types.contains_key(&sname) {
@@ -2847,9 +3134,9 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 Err(CodegenError{message: format!("cannot infer type of {name}"), span: expr.span})
             }
-            ExprKind::This => {
+            ExprKind::This | ExprKind::Super => {
                 if let Some(cls) = &self.cur_class { return Ok(crate::sema::Ty::Struct(cls.clone())); }
-                Err(CodegenError{message: "`this` outside method".into(), span: expr.span})
+                Err(CodegenError{message: "`this`/`super` outside method".into(), span: expr.span})
             }
             ExprKind::MemberAccess { object, field, .. } => {
                 let obj_ty = self.infer_expr_ty(object)?;
@@ -2879,6 +3166,20 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Option<(PointerValue<'ctx>, BasicTypeEnum<'ctx>)> {
         for scope in self.vars.iter().rev() {
             if let Some(v) = scope.get(name) {
+                return Some(*v);
+            }
+        }
+        if let Some(v) = self.globals.get(name) {
+            return Some(*v);
+        }
+        let lookup = name.rsplit("::").next().unwrap_or(name);
+        if lookup != name {
+            for scope in self.vars.iter().rev() {
+                if let Some(v) = scope.get(lookup) {
+                    return Some(*v);
+                }
+            }
+            if let Some(v) = self.globals.get(lookup) {
                 return Some(*v);
             }
         }

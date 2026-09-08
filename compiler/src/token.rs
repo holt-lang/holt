@@ -38,6 +38,33 @@ fn newline_callback(lex: &mut logos::Lexer<Token>) -> bool {
     true
 }
 
+fn multiline_string_callback(lex: &mut logos::Lexer<Token>) -> bool {
+    // Opening `"""` already matched; scan for closing `"""`
+    let src = lex.source();
+    let start = lex.span().start;
+    let rest = &src[start + 3..];
+    if let Some(end) = rest.find("\"\"\"") {
+        lex.bump(end + 3);
+        true
+    } else {
+        false
+    }
+}
+
+fn float_callback(lex: &mut logos::Lexer<Token>) -> bool {
+    let slice = lex.slice();
+    // Reject `1.` when followed by `.` (i.e. `1..` range) so that `1..2` lexes as `1` `..` `2`
+    // `1.` as float should not consume the first `.` of `..`
+    if slice.ends_with('.') {
+        let end = lex.span().end;
+        let src = lex.source();
+        if end < src.len() && src[end..].starts_with('.') {
+            return false;
+        }
+    }
+    true
+}
+
 /// All Holt tokens. Keywords are matched before `Ident` via `#[token]` priority.
 #[derive(Logos, Debug, Clone, PartialEq, Eq, Hash)]
 #[logos(skip r"[ \t\f]+")] // whitespace except newline; newlines are significant
@@ -291,18 +318,16 @@ pub enum Token {
     HexInt,
     #[regex(r"0b[01_]+")]
     BinInt,
-    #[regex(r"[0-9][0-9_]*\.[0-9_]*([eE][+-]?[0-9_]+)?|\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?|[0-9][0-9_]*[eE][+-]?[0-9_]+")]
+    #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?|\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?|[0-9][0-9_]*[eE][+-]?[0-9_]+", float_callback)]
     FloatLit,
     #[regex(r"[0-9][0-9_]*")]
     IntLit,
 
-    // Strings: Phase 0 treats interpolation `{ expr }` as plain text inside the literal.
-    // Full parser-phase splitting happens in parse/, not the lexer (per SKILL.md).
+    // Strings: normal `"..."` and multiline `"""..."""` (both with interpolation handled in parser)
+    // Multiline must come before normal to prefer `"""` over `""` — priority 2 ensures `"""` wins
+    #[regex("\"\"\"", multiline_string_callback, priority = 2)]
     #[regex(r#""([^"\\\n]|\\.)*""#)]
     StringLit,
-    #[regex(r#"""""#)]
-    // placeholder — multiline handled as separate below when content present
-    TripleQuote,
     #[regex(r#"'([^'\\\n]|\\.)*'"#)]
     CharLit,
     // Raw string r"..." — no escapes, no interpolation
@@ -439,7 +464,6 @@ impl std::fmt::Display for Token {
             Self::FloatLit => "<float>",
             Self::IntLit => "<int>",
             Self::StringLit => "<string>",
-            Self::TripleQuote => "\"\"\"",
             Self::CharLit => "<char>",
             Self::RawStringLit => "<raw string>",
             Self::Ident => "<ident>",

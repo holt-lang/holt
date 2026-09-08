@@ -41,8 +41,14 @@ impl From<&Type> for Ty {
             Type::Char(_) => Ty::Char,
             Type::Float(_) => Ty::Float,
             Type::Double(_) => Ty::Double,
-            Type::Named(n, _) => Ty::Struct(n.clone()),
-            Type::Generic(n, args, _) => Ty::Generic(n.clone(), args.iter().map(|a| Ty::from(a)).collect()),
+            Type::Named(n, _) => {
+                let base = n.rsplit("::").next().unwrap_or(n).to_string();
+                Ty::Struct(base)
+            },
+            Type::Generic(n, args, _) => {
+                let base = n.rsplit("::").next().unwrap_or(n).to_string();
+                Ty::Generic(base, args.iter().map(|a| Ty::from(a)).collect())
+            },
             Type::FunctionType(ret, args, _) => Ty::Function(Box::new(Ty::from(ret.as_ref())), args.iter().map(|a| Ty::from(a)).collect()),
             Type::Tuple(tys, _) => Ty::Tuple(tys.iter().map(|t| Ty::from(t)).collect()),
             Type::Any(_) => Ty::Any,
@@ -83,6 +89,8 @@ impl std::fmt::Display for Ty {
 struct FuncSig {
     ret: Ty,
     params: Vec<Ty>,
+    param_modes: Vec<ParamMode>,
+    param_names: Vec<String>,
     span: Span,
 }
 
@@ -136,6 +144,7 @@ pub struct Checker {
     enums: HashMap<String, EnumInfo>,
     traits: HashMap<String, TraitInfo>,
     scopes: Vec<HashMap<String, Ty>>,
+    const_scopes: Vec<HashSet<String>>,
     errors: Vec<SemError>,
     cur_ret: Option<Ty>,
     cur_class: Option<String>,
@@ -167,6 +176,7 @@ impl Checker {
             enums: HashMap::new(),
             traits: HashMap::new(),
             scopes: Vec::new(),
+            const_scopes: Vec::new(),
             errors: Vec::new(),
             cur_ret: None,
             cur_class: None,
@@ -178,9 +188,11 @@ impl Checker {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.const_scopes.push(HashSet::new());
     }
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.const_scopes.pop();
     }
 
     fn declare_var(&mut self, name: &str, ty: Ty, span: Span) -> bool {
@@ -198,6 +210,32 @@ impl Checker {
             false
         }
     }
+    fn declare_const(&mut self, name: &str, ty: Ty, span: Span) -> bool {
+        if let Some(scope) = self.scopes.last_mut() {
+            if scope.contains_key(name) {
+                self.errors.push(SemError {
+                    message: format!("redefinition of `{name}`"),
+                    span,
+                });
+                return false;
+            }
+            scope.insert(name.to_string(), ty);
+            if let Some(cset) = self.const_scopes.last_mut() {
+                cset.insert(name.to_string());
+            }
+            true
+        } else {
+            false
+        }
+    }
+    fn is_const(&self, name: &str) -> bool {
+        for cset in self.const_scopes.iter().rev() {
+            if cset.contains(name) {
+                return true;
+            }
+        }
+        false
+    }
     fn lookup_var(&self, name: &str) -> Option<Ty> {
         for scope in self.scopes.iter().rev() {
             if let Some(ty) = scope.get(name) {
@@ -211,18 +249,19 @@ impl Checker {
         let mut t = Ty::from(ty);
         // Handle generic type params: if t is Struct with name that is a generic param, treat as Generic
         if let Ty::Struct(ref n) = t {
+            let lookup = n.rsplit("::").next().unwrap_or(n);
             // Check if it's a generic param for current function/class
             // For minimal, check if it's a single uppercase letter like T, U, V
-            if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
+            if lookup.len() == 1 && lookup.chars().next().unwrap().is_ascii_uppercase() {
                 // Consider it as generic if not known struct/class/enum
-                if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
-                    t = Ty::Generic(n.clone(), vec![]);
+                if !self.structs.contains_key(lookup) && !self.classes.contains_key(lookup) && !self.enums.contains_key(lookup) {
+                    t = Ty::Generic(lookup.to_string(), vec![]);
                     return t;
                 }
             }
-            if self.enums.contains_key(n) {
-                t = Ty::Enum(n.clone());
-            } else if !self.structs.contains_key(n) && !self.classes.contains_key(n) {
+            if self.enums.contains_key(lookup) {
+                t = Ty::Enum(lookup.to_string());
+            } else if !self.structs.contains_key(lookup) && !self.classes.contains_key(lookup) {
                 // Check if it's generic param (single uppercase)
                 if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
                     t = Ty::Generic(n.clone(), vec![]);
@@ -272,6 +311,7 @@ impl Checker {
     }
 
     pub fn check_program(&mut self, prog: &Program) -> Vec<SemError> {
+        self.push_scope(); // global scope for top-level consts/vars
         // Unwrap attributed items for struct/class/enum/trait/typedef/distinct
         let mut unwrapped: Vec<&Item> = Vec::new();
         for it in &prog.items {
@@ -351,8 +391,9 @@ impl Checker {
                                 if ty == Ty::Void { self.errors.push(SemError{message: format!("parameter `{}` cannot be `void`", p.name), span: p.span}); }
                                 ty
                             }).collect();
+                            let param_modes: Vec<ParamMode> = m.params.iter().map(|p| p.mode).collect();
                             let ret_ty = self.resolve_type(&m.ret_ty);
-                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, span: m.name_span});
+                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), span: m.name_span});
                         }
                     }
                     self.traits.insert(t.name.clone(), TraitInfo{name: t.name.clone(), methods, span: t.span});
@@ -425,10 +466,11 @@ impl Checker {
                                 if t == Ty::Void { self.errors.push(SemError{message: format!("parameter `{}` cannot be `void`", p.name), span: p.span}); }
                                 t
                             }).collect();
+                            let param_modes: Vec<ParamMode> = m.params.iter().map(|p| p.mode).collect();
                             let ret_ty = self.resolve_type(&m.ret_ty);
                             let mut pseen = HashSet::new();
                             for p in &m.params { if !pseen.insert(&p.name) { self.errors.push(SemError{message: format!("duplicate param `{}`", p.name), span: p.name_span}); } }
-                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, span: m.name_span});
+                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), span: m.name_span});
                             method_vis.insert(m.name.clone(), m.visibility);
                         }
                     }
@@ -460,8 +502,9 @@ impl Checker {
                             if !pseen.insert(&p.name) { self.errors.push(SemError{message: format!("duplicate param `{}` in constructor", p.name), span: p.name_span}); }
                             param_tys.push(ty);
                         }
+                        let param_modes: Vec<ParamMode> = ctor.params.iter().map(|p| p.mode).collect();
                         // constructors are void return
-                        ctor_sigs.push((FuncSig{ret: Ty::Void, params: param_tys, span: ctor.name_span}, ctor.visibility));
+                        ctor_sigs.push((FuncSig{ret: Ty::Void, params: param_tys, param_modes, param_names: ctor.params.iter().map(|p| p.name.clone()).collect(), span: ctor.name_span}, ctor.visibility));
                     }
                     // Validate destructors: name must match class name
                     for dtor in &c.destructors {
@@ -547,9 +590,10 @@ impl Checker {
                     for op in &c.operators {
                         let mut p_tys = Vec::new();
                         for pp in &op.params { p_tys.push(self.resolve_type(&pp.ty)); }
+                        let p_modes: Vec<ParamMode> = op.params.iter().map(|p| p.mode).collect();
                         // For MVP, assume operator returns int (or struct for + if class)
                         let ret = Ty::Int;
-                        op_map.insert(op.op.clone(), FuncSig{ret: ret.clone(), params: p_tys, span: op.span});
+                        op_map.insert(op.op.clone(), FuncSig{ret: ret.clone(), params: p_tys, param_modes: p_modes, param_names: op.params.iter().map(|p| p.name.clone()).collect(), span: op.span});
                     }
                     let mut conv_vec: Vec<(Ty, Ty, Span)> = Vec::new();
                     for conv in &c.conversions {
@@ -647,7 +691,8 @@ impl Checker {
                     if let crate::ast::ExtensionMember::Function(f) = mem {
                         let ret_ty = self.resolve_type(&f.ret_ty);
                         let param_tys: Vec<Ty> = f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
-                        let sig = FuncSig{ret: ret_ty, params: param_tys, span: f.name_span};
+                        let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
+                        let sig = FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: f.params.iter().map(|p| p.name.clone()).collect(), span: f.name_span};
                         pending_ext.push((f.name.clone(), sig, f.visibility));
                     }
                 }
@@ -664,6 +709,25 @@ impl Checker {
                             _ => {}
                         }
                     }
+                }
+            } else if let Item::Const(c) = item {
+                let decl_ty = if let Some(t) = &c.ty {
+                    self.resolve_type(t)
+                } else {
+                    self.check_expr(&c.init)
+                };
+                if decl_ty == Ty::Void {
+                    self.errors.push(SemError{message: "const cannot have void type".into(), span: c.span});
+                }
+                let init_ty = self.check_expr(&c.init);
+                let is_null = matches!(c.init.kind, ExprKind::Null);
+                if !is_null && init_ty != decl_ty && decl_ty != Ty::Any {
+                    self.errors.push(SemError{message: format!("const initializer mismatch: expected `{}`, found `{}`", decl_ty, init_ty), span: c.init.span});
+                }
+                if self.scopes.last().map(|s| s.contains_key(&c.name)).unwrap_or(false) {
+                    self.errors.push(SemError{message: format!("redefinition of const `{}`", c.name), span: c.name_span});
+                } else {
+                    self.declare_const(&c.name, decl_ty, c.name_span);
                 }
             }
         }
@@ -682,7 +746,8 @@ impl Checker {
                     if let crate::ast::ExternMember::Function{ty, name, name_span, params, ..} = mem {
                         let ret = self.resolve_type(ty);
                         let param_tys: Vec<Ty> = params.iter().map(|p| self.resolve_type(&p.ty)).collect();
-                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, span: *name_span});
+                        let param_modes: Vec<ParamMode> = vec![ParamMode::None; param_tys.len()];
+                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, param_modes, param_names: params.iter().map(|p| p.name.clone()).collect(), span: *name_span});
                     }
                 }
             }
@@ -727,6 +792,7 @@ impl Checker {
                         })
                         .collect();
                     let ret_ty = self.resolve_type(&f.ret_ty);
+                    let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
                     let mut seen = HashSet::new();
                     for p in &f.params {
                         if !seen.insert(&p.name) {
@@ -744,6 +810,8 @@ impl Checker {
                         FuncSig {
                             ret: ret_ty,
                             params: param_tys,
+                            param_modes,
+                            param_names: f.params.iter().map(|p| p.name.clone()).collect(),
                             span: f.name_span,
                         },
                     );
@@ -791,6 +859,7 @@ impl Checker {
                 self.check_property(&cls.name, prop);
             }
         }
+        self.pop_scope(); // global
         std::mem::take(&mut self.errors)
     }
 
@@ -914,11 +983,29 @@ impl Checker {
                 }
                 if let Some(init) = &d.init {
                     let init_ty = self.check_expr(init);
-                    if init_ty != decl_ty && decl_ty != Ty::Void && decl_ty != Ty::Any {
+                    let is_null = matches!(init.kind, ExprKind::Null);
+                    if !is_null && init_ty != decl_ty && decl_ty != Ty::Void && decl_ty != Ty::Any {
                         self.errors.push(SemError{message: format!("type mismatch in initializer: expected `{decl_ty}`, found `{init_ty}`"), span: init.span});
                     }
                 }
                 self.declare_var(&d.name, decl_ty, d.name_span);
+                false
+            }
+            Stmt::Const(c) => {
+                let decl_ty = if let Some(t) = &c.ty {
+                    self.resolve_type(t)
+                } else {
+                    self.check_expr(&c.init)
+                };
+                if decl_ty == Ty::Void {
+                    self.errors.push(SemError { message: "const cannot have `void` type".into(), span: c.span });
+                }
+                let init_ty = self.check_expr(&c.init);
+                let is_null = matches!(c.init.kind, ExprKind::Null);
+                if !is_null && init_ty != decl_ty && decl_ty != Ty::Any {
+                    self.errors.push(SemError { message: format!("const initializer mismatch: expected `{decl_ty}`, found `{init_ty}`"), span: c.init.span });
+                }
+                self.declare_const(&c.name, decl_ty, c.name_span);
                 false
             }
             Stmt::Expr(e) => {
@@ -1037,9 +1124,19 @@ impl Checker {
             ExprKind::FloatLit(_) => Ty::Double,
             ExprKind::BoolLit(_) => Ty::Bool,
             ExprKind::Ident(name) => {
-                if let Some(ty) = self.lookup_var(name) {
+                let lookup = name.rsplit("::").next().unwrap_or(name);
+                if let Some(ty) = self.lookup_var(name).or_else(|| self.lookup_var(lookup)) {
                     ty
                 } else {
+                    if name.contains("::") {
+                        let first = name.split("::").next().unwrap_or(name);
+                        if self.enums.contains_key(first) {
+                            return Ty::Enum(first.to_string());
+                        }
+                        if self.structs.contains_key(first) || self.classes.contains_key(first) {
+                            return Ty::Struct(first.to_string());
+                        }
+                    }
                     self.errors.push(SemError {
                         message: format!("undefined variable `{name}`"),
                         span: expr.span,
@@ -1073,7 +1170,25 @@ impl Checker {
                         }
                         Ty::Int
                     }
+                    UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
+                        if t != Ty::Int {
+                            self.errors.push(SemError {
+                                message: format!(
+                                    "unary `{op:?}` requires `int`, found `{t}`"
+                                ),
+                                span: expr.span,
+                            });
+                        }
+                        Ty::Int
+                    }
                 }
+            }
+            ExprKind::Postfix { op, expr: inner } => {
+                let t = self.check_expr(inner);
+                if t != Ty::Int {
+                    self.errors.push(SemError{message: format!("postfix `{op:?}` requires `int`, found `{t}`"), span: expr.span});
+                }
+                Ty::Int
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let lt = self.check_expr(lhs);
@@ -1095,6 +1210,24 @@ impl Checker {
                             BinOp::IsNot => "is not",
                             BinOp::And => "and",
                             BinOp::Or => "or",
+                            BinOp::BitAnd => "&",
+                            BinOp::BitOr => "|",
+                            BinOp::BitXor => "^",
+                            BinOp::Shl => "<<",
+                            BinOp::Shr => ">>",
+                            BinOp::NullCoalesce => "??",
+                            BinOp::Range => "..",
+                            BinOp::RangeInclusive => "..=",
+                            BinOp::CompoundAdd => "+=",
+                            BinOp::CompoundSub => "-=",
+                            BinOp::CompoundMul => "*=",
+                            BinOp::CompoundDiv => "/=",
+                            BinOp::CompoundMod => "%=",
+                            BinOp::CompoundBitAnd => "&=",
+                            BinOp::CompoundBitOr => "|=",
+                            BinOp::CompoundBitXor => "^=",
+                            BinOp::CompoundShl => "<<=",
+                            BinOp::CompoundShr => ">>=",
                         };
                         if let Some(sig) = cinfo.operators.get(op_str) {
                             if let Some(exp) = sig.params.get(0) {
@@ -1111,9 +1244,14 @@ impl Checker {
                     | BinOp::Sub
                     | BinOp::Mul
                     | BinOp::Div
-                    | BinOp::Mod => {
+                    | BinOp::Mod
+                    | BinOp::BitAnd
+                    | BinOp::BitOr
+                    | BinOp::BitXor
+                    | BinOp::Shl
+                    | BinOp::Shr => {
                         if lt != Ty::Int || rt != Ty::Int {
-                            self.errors.push(SemError{message: format!("arithmetic `{op:?}` requires `int`, found `{lt}` and `{rt}`"), span: expr.span});
+                            self.errors.push(SemError{message: format!("arithmetic/bitwise `{op:?}` requires `int`, found `{lt}` and `{rt}`"), span: expr.span});
                         }
                         Ty::Int
                     }
@@ -1122,6 +1260,16 @@ impl Checker {
                             self.errors.push(SemError{message: format!("comparison `{op:?}` requires `int`, found `{lt}` and `{rt}`"), span: expr.span});
                         }
                         Ty::Bool
+                    }
+                    BinOp::NullCoalesce => {
+                        // a ?? b : if a is Optional, return inner, else return lt
+                        Ty::Int
+                    }
+                    BinOp::Range | BinOp::RangeInclusive => {
+                        if lt != Ty::Int || rt != Ty::Int {
+                            self.errors.push(SemError{message: format!("range `{op:?}` requires `int`, found `{lt}` and `{rt}`"), span: expr.span});
+                        }
+                        Ty::Array(Box::new(Ty::Int))
                     }
                     BinOp::Is | BinOp::IsNot => {
                         if lt != rt {
@@ -1135,15 +1283,87 @@ impl Checker {
                         }
                         Ty::Bool
                     }
+                    BinOp::CompoundAdd
+                    | BinOp::CompoundSub
+                    | BinOp::CompoundMul
+                    | BinOp::CompoundDiv
+                    | BinOp::CompoundMod
+                    | BinOp::CompoundBitAnd
+                    | BinOp::CompoundBitOr
+                    | BinOp::CompoundBitXor
+                    | BinOp::CompoundShl
+                    | BinOp::CompoundShr => {
+                        self.errors.push(SemError{message: format!("compound operator `{op:?}` should not appear in Binary"), span: expr.span});
+                        Ty::Int
+                    }
                 }
             }
             ExprKind::Assign { lhs, value } => {
                 let lhs_ty = self.check_lvalue(lhs);
+                if let ExprKind::Ident(name) = &lhs.kind {
+                    if self.is_const(name) {
+                        self.errors.push(SemError{message: format!("cannot assign to const `{}`", name), span: lhs.span});
+                    }
+                }
                 let rhs_ty = self.check_expr(value);
-                if lhs_ty != rhs_ty {
+                let is_null = matches!(value.kind, ExprKind::Null);
+                if !is_null && lhs_ty != rhs_ty {
                     self.errors.push(SemError{message: format!("assignment type mismatch: expected `{lhs_ty}`, found `{rhs_ty}`"), span: expr.span});
                 }
                 lhs_ty
+            }
+            ExprKind::CompoundAssign { op: _, lhs, value } => {
+                let lhs_ty = self.check_lvalue(lhs);
+                let rhs_ty = self.check_expr(value);
+                if lhs_ty != Ty::Int || rhs_ty != Ty::Int {
+                    self.errors.push(SemError{message: format!("compound assignment requires `int`, found `{lhs_ty}` and `{rhs_ty}`"), span: expr.span});
+                }
+                lhs_ty
+            }
+            ExprKind::Conditional { cond, then_branch, else_branch } => {
+                let ct = self.check_expr(cond);
+                if ct != Ty::Bool {
+                    self.errors.push(SemError{message: format!("conditional cond requires `bool`, found `{ct}`"), span: cond.span});
+                }
+                let tt = self.check_expr(then_branch);
+                let et = self.check_expr(else_branch);
+                if tt != et {
+                    self.errors.push(SemError{message: format!("conditional branches mismatch: `{tt}` vs `{et}`"), span: expr.span});
+                }
+                tt
+            }
+            ExprKind::Range { start, end, inclusive: _ } => {
+                if let Some(s) = start { let st = self.check_expr(s); if st != Ty::Int { self.errors.push(SemError{message: format!("range start requires `int`, found `{st}`"), span: s.span}); } }
+                if let Some(e) = end { let et = self.check_expr(e); if et != Ty::Int { self.errors.push(SemError{message: format!("range end requires `int`, found `{et}`"), span: e.span}); } }
+                Ty::Array(Box::new(Ty::Int))
+            }
+            ExprKind::NullableMemberAccess { object, field, field_span: _ } => {
+                let obj_ty = self.check_expr(object);
+                // For now, treat like normal member access but allow nullable
+                if let Ty::Struct(ref sname) = obj_ty {
+                    if let Some(sinfo) = self.structs.get(sname) {
+                        if let Some((_, fty)) = sinfo.field_map.get(field) {
+                            return fty.clone();
+                        }
+                    }
+                    if let Some(cinfo) = self.classes.get(sname) {
+                        if let Some(prop) = cinfo.properties.get(field) {
+                            return prop.ty.clone();
+                        }
+                    }
+                }
+                // For optional types, unwrap
+                if let Ty::Optional(inner) = obj_ty {
+                    if let Ty::Struct(ref sname) = *inner {
+                        if let Some(sinfo) = self.structs.get(sname) {
+                            if let Some((_, fty)) = sinfo.field_map.get(field) {
+                                return fty.clone();
+                            }
+                        }
+                    }
+                }
+                self.errors.push(SemError{message: format!("unknown field `{field}` for nullable access"), span: expr.span});
+                Ty::Int
             }
             ExprKind::Call {
                 callee,
@@ -1189,11 +1409,14 @@ impl Checker {
                             };
                             // Check args against substituted params
                             for (i, arg) in args.iter().enumerate() {
-                                let aty = self.check_expr(arg);
-                                if let Some(param_ty) = func.params.get(i) {
+                                let aty = self.check_call_arg(arg);
+                                let pidx = if let CallArg::Named { name, .. } = arg {
+                                    func.param_names.iter().position(|n| n == name).unwrap_or(i)
+                                } else { i };
+                                if let Some(param_ty) = func.params.get(pidx) {
                                     let expected = subst_ty(param_ty);
                                     if &aty != &expected {
-                                        self.errors.push(SemError{message: format!("argument {} of `{}`: expected `{}`, found `{}`", i+1, callee, expected, aty), span: arg.span});
+                                        self.errors.push(SemError{message: format!("argument {} of `{}`: expected `{}`, found `{}`", i+1, callee, expected, aty), span: arg.span()});
                                     }
                                 }
                             }
@@ -1233,15 +1456,18 @@ impl Checker {
                                     self.errors.push(SemError{message: format!("constructor for `{callee}` is private"), span: *callee_span});
                                 }
                                 for (i, arg) in args.iter().enumerate() {
-                                    let aty = self.check_expr(arg);
-                                    if &aty != &sig.params[i] {
-                                        self.errors.push(SemError{message: format!("ctor arg {}: expected `{}`, found `{aty}`", i+1, sig.params[i]), span: arg.span});
+                                    let aty = self.check_call_arg(arg);
+                                    let pidx = if let CallArg::Named { name, .. } = arg {
+                                        sig.param_names.iter().position(|n| n == name).unwrap_or(i)
+                                    } else { i };
+                                    if &aty != &sig.params[pidx] && aty != Ty::Any {
+                                        self.errors.push(SemError{message: format!("ctor arg {}: expected `{}`, found `{aty}`", i+1, sig.params[pidx]), span: arg.span()});
                                     }
                                 }
                                 return struct_ty;
                             } else {
                                 self.errors.push(SemError{message: format!("no matching constructor for `{callee}` with {} args", args.len()), span: *callee_span});
-                                for arg in args { let _ = self.check_expr(arg); }
+                                for arg in args { let _ = self.check_call_arg(arg); }
                                 return struct_ty;
                             }
                         }
@@ -1250,21 +1476,21 @@ impl Checker {
                     let field_tys: Vec<Ty> = self.structs.get(callee).map(|s| s.fields.iter().map(|(_,ty)| ty.clone()).collect()).unwrap_or_default();
                     if !field_tys.is_empty() && args.len() == field_tys.len() {
                         for (i, arg) in args.iter().enumerate() {
-                            let aty = self.check_expr(arg);
+                            let aty = self.check_call_arg(arg);
                             let fty = &field_tys[i];
-                            if &aty != fty {
-                                self.errors.push(SemError{message: format!("ctor arg {}: expected `{}`, found `{aty}`", i+1, fty), span: arg.span});
+                            if &aty != fty && aty != Ty::Any {
+                                self.errors.push(SemError{message: format!("ctor arg {}: expected `{}`, found `{aty}`", i+1, fty), span: arg.span()});
                             }
                         }
                         return struct_ty;
                     }
                     // Fallback: just type-check args and return struct
-                    for arg in args { let _ = self.check_expr(arg); }
+                    for arg in args { let _ = self.check_call_arg(arg); }
                     return struct_ty;
                 }
                 // builtin io intrinsics
                 if matches!(callee.as_str(), "print" | "println" | "printInt" | "putChar") {
-                    for arg in args { let _ = self.check_expr(arg); }
+                    for arg in args { let _ = self.check_call_arg(arg); }
                     return Ty::Void;
                 }
                 let sig = self.funcs.get(callee).cloned();
@@ -1280,10 +1506,13 @@ impl Checker {
                         });
                     }
                     for (i, arg) in args.iter().enumerate() {
-                        let aty = self.check_expr(arg);
-                        if let Some(param_ty) = sig.params.get(i) {
-                            if &aty != param_ty {
-                                self.errors.push(SemError{message: format!("argument {} of `{callee}`: expected `{}`, found `{aty}`", i+1, param_ty), span: arg.span});
+                        let aty = self.check_call_arg(arg);
+                        let pidx = if let CallArg::Named { name, .. } = arg {
+                            sig.param_names.iter().position(|n| n == name).unwrap_or(i)
+                        } else { i };
+                        if let Some(param_ty) = sig.params.get(pidx) {
+                            if &aty != param_ty && aty != Ty::Any {
+                                self.errors.push(SemError{message: format!("argument {} of `{callee}`: expected `{}`, found `{aty}`", i+1, param_ty), span: arg.span()});
                             }
                         }
                     }
@@ -1295,16 +1524,16 @@ impl Checker {
                             self.errors.push(SemError{message: format!("function variable `{callee}` expects {} args, found {}", params.len(), args.len()), span: *callee_span});
                         }
                         for (i, arg) in args.iter().enumerate() {
-                            let aty = self.check_expr(arg);
-                            if let Some(pt) = params.get(i) { if &aty != pt { self.errors.push(SemError{message: format!("argument {}: expected `{}`, found `{aty}`", i+1, pt), span: arg.span}); } }
+                            let aty = self.check_call_arg(arg);
+                            if let Some(pt) = params.get(i) { if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("argument {}: expected `{}`, found `{aty}`", i+1, pt), span: arg.span()}); } }
                         }
                         *ret
                     } else if let Ty::Any = var_ty {
-                        for arg in args { let _ = self.check_expr(arg); }
+                        for arg in args { let _ = self.check_call_arg(arg); }
                         Ty::Int
                     } else {
                         self.errors.push(SemError{message: format!("`{callee}` is not a function (found `{var_ty}`)"), span: *callee_span});
-                        for arg in args { let _ = self.check_expr(arg); }
+                        for arg in args { let _ = self.check_call_arg(arg); }
                         Ty::Int
                     }
                 } else {
@@ -1313,7 +1542,7 @@ impl Checker {
                         span: *callee_span,
                     });
                     for arg in args {
-                        let _ = self.check_expr(arg);
+                        let _ = self.check_call_arg(arg);
                     }
                     Ty::Int
                 }
@@ -1475,6 +1704,29 @@ impl Checker {
                     }
                 }
             }
+            ExprKind::Slice { object, start, end, inclusive: _ } => {
+                let obj_ty = self.check_expr(object);
+                if let Some(s) = start {
+                    let st = self.check_expr(s);
+                    if st != Ty::Int {
+                        self.errors.push(SemError { message: format!("slice start must be `int`, found `{st}`"), span: s.span });
+                    }
+                }
+                if let Some(e) = end {
+                    let et = self.check_expr(e);
+                    if et != Ty::Int {
+                        self.errors.push(SemError { message: format!("slice end must be `int`, found `{et}`"), span: e.span });
+                    }
+                }
+                match obj_ty {
+                    Ty::Array(el) => Ty::Array(el.clone()), // slice retains array type
+                    Ty::String => Ty::String, // string slice -> string
+                    _ => {
+                        self.errors.push(SemError { message: format!("cannot slice non-array type `{obj_ty}`"), span: object.span });
+                        Ty::Int
+                    }
+                }
+            }
             ExprKind::This => {
                 if let Some(cls) = &self.cur_class {
                     Ty::Struct(cls.clone())
@@ -1489,7 +1741,7 @@ impl Checker {
                     Ty::Struct(ref n) => n.clone(),
                     _ => {
                         self.errors.push(SemError{message: format!("method call on non-class type `{obj_ty}`"), span: object.span});
-                        for a in args { let _ = self.check_expr(a); }
+                        for a in args { let _ = self.check_call_arg(a); }
                         return Ty::Int;
                     }
                 };
@@ -1508,22 +1760,25 @@ impl Checker {
                             self.errors.push(SemError{message: format!("method `{}` expects {} args, found {}", method, meth.params.len(), args.len()), span: *method_span});
                         }
                         for (i, a) in args.iter().enumerate() {
-                            let aty = self.check_expr(a);
-                            if let Some(pt) = meth.params.get(i) {
-                                if &aty != pt { self.errors.push(SemError{message: format!("arg {} of `{}`: expected `{}`, found `{}`", i+1, method, pt, aty), span: a.span}); }
+                            let aty = self.check_call_arg(a);
+                            let pidx = if let CallArg::Named { name, .. } = a {
+                                meth.param_names.iter().position(|n| n == name).unwrap_or(i)
+                            } else { i };
+                            if let Some(pt) = meth.params.get(pidx) {
+                                if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("arg {} of `{}`: expected `{}`, found `{}`", i+1, method, pt, aty), span: a.span()}); }
                             }
                         }
                         meth.ret.clone()
                     } else {
                         // Also check if class was actually struct with no methods? Then try struct field? but method not found
                         self.errors.push(SemError{message: format!("class `{sname}` has no method `{method}`"), span: *method_span});
-                        for a in args { let _ = self.check_expr(a); }
+                        for a in args { let _ = self.check_call_arg(a); }
                         Ty::Int
                     }
                 } else {
                     // Try structs map for method? For now treat as class not found, check if struct has method? struct has no methods
                     self.errors.push(SemError{message: format!("unknown class `{sname}`"), span: object.span});
-                    for a in args { let _ = self.check_expr(a); }
+                    for a in args { let _ = self.check_call_arg(a); }
                     Ty::Int
                 }
             }
@@ -1559,18 +1814,18 @@ impl Checker {
                             if args.len() != 1 {
                                 self.errors.push(SemError{message: format!("variant `{variant}` expects 1 payload, found {}", args.len()), span: *variant_span});
                             } else {
-                                let aty = self.check_expr(&args[0]);
-                                if &aty != pt { self.errors.push(SemError{message: format!("variant `{variant}` payload: expected `{}`, found `{}`", pt, aty), span: args[0].span}); }
+                                let aty = self.check_call_arg(&args[0]);
+                                if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("variant `{variant}` payload: expected `{}`, found `{}`", pt, aty), span: args[0].span()}); }
                             }
                         } else {
                             if !args.is_empty() {
                                 self.errors.push(SemError{message: format!("variant `{variant}` expects no args"), span: *variant_span});
                             }
-                            for a in args { let _ = self.check_expr(a); }
+                            for a in args { let _ = self.check_call_arg(a); }
                         }
                     }
                 } else {
-                    for a in args { let _ = self.check_expr(a); }
+                    for a in args { let _ = self.check_call_arg(a); }
                 }
                 enum_ty
             }
@@ -1722,7 +1977,7 @@ impl Checker {
                     Ty::Int
                 }
             }
-            ExprKind::Null => Ty::Pointer(Box::new(Ty::Int)),
+            ExprKind::Null => Ty::Any,
             ExprKind::Tuple(exprs) => {
                 let tys: Vec<Ty> = exprs.iter().map(|e| self.check_expr(e)).collect();
                 Ty::Tuple(tys)
@@ -1742,10 +1997,108 @@ impl Checker {
         }
     }
 
+    fn check_call_arg(&mut self, arg: &CallArg) -> Ty {
+        match arg {
+            CallArg::Expr(e) => self.check_expr(e),
+            CallArg::Named { value, .. } => self.check_expr(value),
+            CallArg::Out { name, name_span, ty: opt_ty, .. } => {
+                if let Some(var_ty) = self.lookup_var(name) {
+                    if let Some(t) = opt_ty {
+                        let declared = self.resolve_type(t);
+                        if declared != var_ty {
+                            self.errors.push(SemError { message: format!("out argument `{}` type `{}` does not match variable `{}`", name, declared, var_ty), span: *name_span });
+                        }
+                    }
+                    var_ty
+                } else {
+                    self.errors.push(SemError { message: format!("undefined variable `{}` for `out`", name), span: *name_span });
+                    Ty::Int
+                }
+            }
+            CallArg::Ref { expr, .. } => {
+                let ty = self.check_expr(expr);
+                match &expr.kind {
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Index { .. } | ExprKind::Paren(_) => {},
+                    _ => self.errors.push(SemError { message: "ref argument must be lvalue".into(), span: expr.span }),
+                }
+                ty
+            }
+        }
+    }
+
+    fn check_call_with_sig(&mut self, args: &[CallArg], sig: &FuncSig, callee_span: Span, callee: &str) {
+        if sig.params.len() != args.len() {
+            self.errors.push(SemError { message: format!("`{}` expects {} args, found {}", callee, sig.params.len(), args.len()), span: callee_span });
+        }
+        let has_named = args.iter().any(|a| matches!(a, CallArg::Named{..}));
+        if has_named {
+            // Build param name -> index map
+            let mut param_name_to_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for (idx, pname) in sig.param_names.iter().enumerate() {
+                param_name_to_idx.insert(pname.clone(), idx);
+            }
+            let mut seen = std::collections::HashSet::new();
+            for arg in args {
+                if let CallArg::Named { name, .. } = arg {
+                    if let Some(&pidx) = param_name_to_idx.get(name) {
+                        if !seen.insert(pidx) {
+                            self.errors.push(SemError { message: format!("duplicate named argument `{}` for `{}`", name, callee), span: arg.span() });
+                        }
+                        let aty = self.check_call_arg(arg);
+                        let expected = &sig.params[pidx];
+                        if &aty != expected && aty != Ty::Any {
+                            self.errors.push(SemError { message: format!("named argument `{}` of `{}`: expected `{}`, found `{}`", name, callee, expected, aty), span: arg.span() });
+                        }
+                        if let Some(mode) = sig.param_modes.get(pidx) {
+                            let is_out = matches!(arg, CallArg::Out{..});
+                            let is_ref = matches!(arg, CallArg::Ref{..});
+                            match mode {
+                                ParamMode::Out if !matches!(arg, CallArg::Out{..}) && !matches!(arg, CallArg::Named{..}) => {},
+                                _ => {}
+                            }
+                            // For Named, mode check still relevant if Named was used for out/ref param? But Named is by-value, so if param is Out/Ref, Named should be error
+                            if *mode == ParamMode::Out || *mode == ParamMode::Ref {
+                                self.errors.push(SemError { message: format!("named argument `{}` of `{}` corresponds to `out`/`ref` param, use `out`/`ref` syntax", name, callee), span: arg.span() });
+                            }
+                        }
+                    } else {
+                        self.errors.push(SemError { message: format!("unknown named argument `{}` for `{}`", name, callee), span: arg.span() });
+                        let _ = self.check_call_arg(arg);
+                    }
+                } else {
+                    // positional before named is allowed, but we already handled count; for positional, check via index
+                    let _ = self.check_call_arg(arg);
+                }
+            }
+            // Also check positional args that are not named: they must match remaining params
+            // For simplicity, if has_named, we have already checked named args; remaining positional args are checked elsewhere? We'll just return after handling named
+            return;
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let aty = self.check_call_arg(arg);
+            if let Some(param_ty) = sig.params.get(i) {
+                if &aty != param_ty && aty != Ty::Any {
+                    self.errors.push(SemError { message: format!("argument {} of `{}`: expected `{}`, found `{}`", i + 1, callee, param_ty, aty), span: arg.span() });
+                }
+            }
+            if let Some(mode) = sig.param_modes.get(i) {
+                let is_out = matches!(arg, CallArg::Out{..});
+                let is_ref = matches!(arg, CallArg::Ref{..});
+                match mode {
+                    ParamMode::Out if !is_out => self.errors.push(SemError { message: format!("argument {} of `{}` is `out` param but call uses non-out", i+1, callee), span: arg.span() }),
+                    ParamMode::Ref if !is_ref => self.errors.push(SemError { message: format!("argument {} of `{}` is `ref` param but call uses non-ref", i+1, callee), span: arg.span() }),
+                    ParamMode::None if is_out || is_ref => self.errors.push(SemError { message: format!("argument {} of `{}` is by-value param but call uses `out`/`ref`", i+1, callee), span: arg.span() }),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn check_lvalue(&mut self, expr: &Expr) -> Ty {
         match &expr.kind {
             ExprKind::Ident(name) => {
-                if let Some(ty) = self.lookup_var(name) {
+                let lookup = name.rsplit("::").next().unwrap_or(name);
+                if let Some(ty) = self.lookup_var(name).or_else(|| self.lookup_var(lookup)) {
                     ty
                 } else {
                     self.errors.push(SemError {

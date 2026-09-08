@@ -44,6 +44,7 @@ pub enum Item {
     Extension(ExtensionDecl),
     Extern(ExternDecl),
     Init(Block),
+    Const(ConstDecl),
     Attributed { attrs: Vec<Attribute>, item: Box<Item> },
 }
 
@@ -71,8 +72,16 @@ pub struct Function {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamMode {
+    None,
+    Ref,
+    Out,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
+    pub mode: ParamMode,
     pub ty: Type,
     pub name: String,
     pub name_span: Span,
@@ -377,6 +386,7 @@ pub struct Block {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     VarDecl(VarDecl),
+    Const(ConstDecl),
     If(IfStmt),
     While(WhileStmt),
     Loop(LoopStmt),
@@ -395,6 +405,16 @@ pub struct VarDecl {
     pub name: String,
     pub name_span: Span,
     pub init: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstDecl {
+    pub visibility: Visibility,
+    pub ty: Option<Type>,
+    pub name: String,
+    pub name_span: Span,
+    pub init: Expr,
     pub span: Span,
 }
 
@@ -489,6 +509,25 @@ pub enum ClosureBody {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallArg {
+    Expr(Expr),
+    Named { name: String, name_span: Span, value: Expr, span: Span },
+    Out { ty: Option<Type>, name: String, name_span: Span, span: Span },
+    Ref { expr: Box<Expr>, span: Span },
+}
+
+impl CallArg {
+    pub fn span(&self) -> Span {
+        match self {
+            CallArg::Expr(e) => e.span,
+            CallArg::Named { span, .. } => *span,
+            CallArg::Out { span, .. } => *span,
+            CallArg::Ref { span, .. } => *span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExprKind {
     IntLit(i64),
     FloatLit(String),
@@ -515,17 +554,41 @@ pub enum ExprKind {
         lhs: Box<Expr>,
         value: Box<Expr>,
     },
+    CompoundAssign {
+        op: BinOp,
+        lhs: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Conditional {
+        cond: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
+    Range {
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
+    },
+    Postfix {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    NullableMemberAccess {
+        object: Box<Expr>,
+        field: String,
+        field_span: Span,
+    },
     Call {
         callee: String,
         callee_span: Span,
-        args: Vec<Expr>,
+        args: Vec<CallArg>,
         type_args: Vec<Type>, // Phase 5: generic args like foo<int>(x)
     },
     MethodCall {
         object: Box<Expr>,
         method: String,
         method_span: Span,
-        args: Vec<Expr>,
+        args: Vec<CallArg>,
     },
     MemberAccess {
         object: Box<Expr>,
@@ -536,6 +599,12 @@ pub enum ExprKind {
         object: Box<Expr>,
         index: Box<Expr>,
     }, // a[i] Phase 2
+    Slice {
+        object: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        inclusive: bool,
+    }, // a[l..r] / a[..r] / a[l..] / a[..] per EBNF §8 index-or-range
     StructLit {
         ty: Type,
         fields: Vec<(String, Span, Expr)>,
@@ -544,7 +613,7 @@ pub enum ExprKind {
         enum_name: Option<String>, // qualified prefix if any, e.g. Option in Option.Some
         variant: String,
         variant_span: Span,
-        args: Vec<Expr>,
+        args: Vec<CallArg>,
     },
     Match(MatchExpr),
     Closure {
@@ -559,6 +628,9 @@ pub enum UnaryOp {
     Neg, // -
     Not, // not
     Pos, // + (unary plus, no-op)
+    BitNot, // ~
+    Inc, // ++ prefix/postfix
+    Dec, // -- prefix/postfix
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -576,6 +648,24 @@ pub enum BinOp {
     IsNot, // "is" / "is not"
     And,
     Or,
+    BitAnd, // &
+    BitOr, // |
+    BitXor, // ^
+    Shl, // <<
+    Shr, // >>
+    NullCoalesce, // ??
+    Range, // ..
+    RangeInclusive, // ..=
+    CompoundAdd, // +=
+    CompoundSub, // -=
+    CompoundMul, // *=
+    CompoundDiv, // /=
+    CompoundMod, // %=
+    CompoundBitAnd, // &=
+    CompoundBitOr, // |=
+    CompoundBitXor, // ^=
+    CompoundShl, // <<=
+    CompoundShr, // >>=
 }
 
 // Phase 2: simple match (EBNF §10, §16)
