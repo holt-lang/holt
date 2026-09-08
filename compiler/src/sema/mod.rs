@@ -1051,6 +1051,21 @@ impl Checker {
                 }
                 false
             }
+            Stmt::Assert(a) => {
+                let cond_ty = self.check_expr(&a.cond);
+                if cond_ty != Ty::Bool {
+                    self.errors.push(SemError { message: format!("assert condition must be `bool`, found `{}`", cond_ty), span: a.cond.span });
+                }
+                if let Some(msg) = &a.message {
+                    let msg_ty = self.check_expr(msg);
+                    // message should be string or any, but allow any for now
+                    if msg_ty != Ty::String && msg_ty != Ty::Any {
+                        // allow string literals and string variables
+                        // If msg is not string, still allow but warn? For now allow any
+                    }
+                }
+                false
+            }
             Stmt::Expr(e) => {
                 let _ = self.check_expr(&e.expr);
                 false

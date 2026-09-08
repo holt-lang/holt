@@ -75,8 +75,18 @@
   - `compiler/src/codegen/mod.rs:1529` `Stmt::Destructure` ( `codegen_expr` tuple/array value, `extract_value` per `idx` for `Ident`, `lookup_var` for existing vs `create_entry_block_alloca` for new).
   - **Verify:** `cargo test` 4 passed, `cargo check` 0 errors, `holt build examples/*.hlt` 6 ok, `/tmp/t9_test2.hlt` `a,b=(10,20)`→10/20, `c,d=(5,6)`→5/6, `e,_,f=(7,8,9)`→7/9, `/tmp/t9_arr.hlt` `x,y,_=arr` 100/200.
 
-## Next — T-10
+## T-10 DONE — 2026-09-08 22:xx
 
-- **T-10 Statements: `assert` / `debug_assert expr [,expr];`** — `assert` as statement.
-- Continue `T-10`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `assert` / `debug_assert expr [,expr];` per EBNF §20 `assert-statement`.
+- **Done:**
+  - `compiler/src/ast.rs:388` `Stmt::Assert` + `AssertStmt {is_debug, cond, message, span}`.
+  - `compiler/src/parse/mod.rs:400` `parse_assert` (`assert`/`debug_assert` `cond [,msg]`), `parse_stmt` `Assert` before `Do`.
+  - `compiler/src/sema/mod.rs:1010` `Stmt::Assert` (`cond:bool`, `message` any/string).
+  - `compiler/src/codegen/mod.rs:860` `get_or_declare_abort`, `1529` `Stmt::Assert` ( `cond` `conditional_branch`, `assert.ok`/`fail` blocks, `puts`/`printf` for message, `abort` + `unreachable`).
+  - **Verify:** `cargo test` 4 passed, `cargo check` 0 errors, `holt build examples/*.hlt` 6 ok, `/tmp/t10_test.hlt` `assert x is 5` ok 5, `/tmp/t10_fail.hlt` `assert x is 10` → message `x should be 10` + abort 134, `/tmp/t10_fail2.hlt` `assert false` → `assertion failed` + abort 134.
+
+## Next — T-11
+
+- **T-11 Functions: `ref`/`out` params, `initialize;` for free fns, preserve `generic+where`** — `ref`/`out` already for `T-5`, now `initialize;`.
+- Continue `T-11`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
 

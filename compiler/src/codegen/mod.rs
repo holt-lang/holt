@@ -880,6 +880,11 @@ impl<'ctx> Codegen<'ctx> {
         let fn_ty = self.context.i32_type().fn_type(&[self.context.i32_type().into()], false);
         self.module.add_function("putchar", fn_ty, None)
     }
+    fn get_or_declare_abort(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("abort") { return f; }
+        let fn_ty = self.context.void_type().fn_type(&[], false);
+        self.module.add_function("abort", fn_ty, None)
+    }
     fn get_or_declare_strcpy(&self) -> FunctionValue<'ctx> {
         if let Some(f) = self.module.get_function("strcpy") { return f; }
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -1578,6 +1583,36 @@ impl<'ctx> Codegen<'ctx> {
                         }
                     }
                 }
+                Ok(false)
+            }
+            Stmt::Assert(a) => {
+                let cond_val = self.codegen_expr(&a.cond)?.into_int_value();
+                let cur_fn = self.cur_fn.unwrap();
+                let assert_ok = self.context.append_basic_block(cur_fn, "assert.ok");
+                let assert_fail = self.context.append_basic_block(cur_fn, "assert.fail");
+                self.builder.build_conditional_branch(cond_val, assert_ok, assert_fail).unwrap();
+                self.builder.position_at_end(assert_fail);
+                // print message if provided
+                if let Some(msg) = &a.message {
+                    let msg_val = self.codegen_expr(msg)?;
+                    if msg_val.is_pointer_value() {
+                        let puts = self.get_or_declare_puts();
+                        self.builder.build_call(puts, &[msg_val.into()], "puts_assert").unwrap();
+                    } else {
+                        // for non-string message, try to print as int?
+                        let fmt = self.builder.build_global_string_ptr("assertion failed: %ld\n", "assert_fmt").unwrap();
+                        let printf = self.get_or_declare_printf();
+                        self.builder.build_call(printf, &[fmt.as_pointer_value().into(), msg_val.into()], "printf_assert").unwrap();
+                    }
+                } else {
+                    let default_msg = self.builder.build_global_string_ptr("assertion failed", "assert_default").unwrap();
+                    let puts = self.get_or_declare_puts();
+                    self.builder.build_call(puts, &[default_msg.as_pointer_value().into()], "puts_assert_default").unwrap();
+                }
+                let abort = self.get_or_declare_abort();
+                self.builder.build_call(abort, &[], "abort").unwrap();
+                self.builder.build_unreachable().unwrap();
+                self.builder.position_at_end(assert_ok);
                 Ok(false)
             }
             Stmt::Expr(e) => {

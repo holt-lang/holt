@@ -506,6 +506,25 @@ impl Parser {
         Ok(DestructureStmt { targets, expr, span })
     }
 
+    fn parse_assert(&mut self) -> Result<AssertStmt, ParseError> {
+        let is_debug = self.peek_token() == Some(&Token::DebugAssert);
+        let start = if is_debug {
+            self.expect(Token::DebugAssert, "expected `debug_assert`")?.span.start
+        } else {
+            self.expect(Token::Assert, "expected `assert`")?.span.start
+        };
+        let cond = self.parse_expr()?;
+        let message = if self.consume_if(Token::Comma) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.expect_terminator("assert")?;
+        let end = message.as_ref().map(|m| m.span.end).unwrap_or(cond.span.end);
+        let span = Span::new(start, end);
+        Ok(AssertStmt { is_debug, cond, message, span })
+    }
+
     fn parse_visibility(&mut self) -> Visibility {
         match self.peek_token() {
             Some(Token::Public) => { self.advance(); Visibility::Public },
@@ -1600,6 +1619,10 @@ impl Parser {
             Some(Token::Continue) => {
                 let s = self.parse_continue()?;
                 Ok(Stmt::Continue(s))
+            }
+            Some(Token::Assert) | Some(Token::DebugAssert) => {
+                let a = self.parse_assert()?;
+                Ok(Stmt::Assert(a))
             }
             Some(Token::Do) => {
                 let b = self.parse_block()?;

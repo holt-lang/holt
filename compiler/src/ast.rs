@@ -388,6 +388,7 @@ pub enum Stmt {
     VarDecl(VarDecl),
     Const(ConstDecl),
     Destructure(DestructureStmt),
+    Assert(AssertStmt),
     If(IfStmt),
     While(WhileStmt),
     Loop(LoopStmt),
@@ -411,6 +412,14 @@ pub struct DestructureStmt {
 pub enum DestructureTarget {
     Ident(String, Span),
     Wildcard(Span),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertStmt {
+    pub is_debug: bool,
+    pub cond: Expr,
+    pub message: Option<Expr>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
