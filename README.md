@@ -39,16 +39,17 @@ The driver lexes → parses → resolves imports → type-checks → emits LLVM 
 
 ## Examples
 
-Moved out of `compiler/examples/` into top-level `examples/` — fewer, more comprehensive:
+Moved out of `compiler/examples/` into top-level `examples/` — fewer, more comprehensive (now 7):
 
 | File | Covers |
 |------|--------|
 | `empty.hlt` | Phase 0 empty file |
 | `basics.hlt` | Phase 1: `int`/`bool`/`void`, arithmetic, `and`/`or`/`not`, `if`/`else`, `while`, functions, recursion |
-| `data_control.hlt` | Phase 2–3: `struct` (+ `struct User` with omitted `has` — `User u2 = has … end`), field access, literals, `T[]`, `match`, `string`, `break`/`continue`, `loop`, `for … in`, `defer` |
-| `abstraction.hlt` | Phase 4: `class` + `this`, constructors (`initialize` sugar), `open` (class only, not methods) / `override` / `sealed`, `trait` + `implements` (no `override` needed), `enum` with payloads, `get`/`set` properties (public by default, separate `get`/`set` allowed), `public`/`private` (constructors and accessors public by default) |
+| `data_control.hlt` | Phase 2–3: `struct` (`public`/`private` + `= expr` default, `User u2 = has … end` omitted `Type`), field access, literals, `T[]`, `match` (`|`/`or` + `(a,b)` tuple), `string`, `break`/`continue`, `loop`, `for … in`, `defer` |
+| `abstraction.hlt` | Phase 4: `class` + `this`, constructors (`initialize` sugar), `open` (class only) / `override` / `sealed`, `trait` + `implements`, `enum` with payloads, `get`/`set` properties (public by default, separate allowed), `public`/`private` |
 | `hello_io.hlt` | `import std::io` (`print`/`println`/`printInt`/`putChar`) |
-| `advanced.hlt` | Phase 5: `distinct`/`typedef`, `extend` (`open class` + `extend`), `init`, `extern`, generics + `where`, `operator`/`convert`, closures (`‖`), string interpolation (`{expr}`), `float`/`double`, `any`, plus `struct User` omitted `has` and `CounterEx` separate accessors |
+| `advanced.hlt` | Phase 5: `distinct`/`typedef`, `extend` (`open class` + `extend` `field`/`operator`/`property`/`conversion`), `init`, `extern` (`struct`/`enum`/`const` + `extern "c" printf`), generics + `where`, `operator`/`convert`, closures (`\|…\|`), string interpolation (`{expr}`), `float`/`double`, `any`, plus `struct User` omitted `has` and `CounterEx` separate accessors |
+| `variadic.hlt` | T-14: variadic `...` (`...int vda`→`int[]`, `...T vda` `where`, `... vda` derived last, `...string vda, bool cond` middle), generics + `extern` `...` |
 
 ```sh
 cargo run -p holt -- build examples/basics.hlt && ./examples/basics.out; echo $?
@@ -73,4 +74,4 @@ Spec is authoritative: `references/ebnf-0.1.txt`. Phases: `references/phases.md`
 
 ## Status
 
-Phase 5 (Advanced) is complete — all language features lower to LLVM and are exercised by `advanced.hlt` (generics, closures, interpolation, operators, `extern`, `distinct` etc., exit 20). Earlier phases: `abstraction.hlt` (exit 233), `basics.hlt` (exit 230), `data_control.hlt` (exit 72).
+Phase 5 (Advanced) is complete — all language features lower to LLVM and are exercised by `advanced.hlt` (generics, closures, interpolation, operators, `extern` `struct`/`enum`/`const`, `distinct` etc., exit 20), `variadic.hlt` (T-14 `...`), `data_control.hlt` (T-15 `struct` visibility/default, T-17 `match` `|`/`or`/`(a,b)`), `abstraction.hlt` (T-15 `class` fields, T-20 `extend` `field`/`operator`/`property`), `hello_io.hlt` (T-21 `import std::io`), `basics.hlt` (T-1..T-4) and `empty.hlt`. Earlier phases: `abstraction.hlt` (exit 233), `basics.hlt` (exit 230), `data_control.hlt` (exit 72), `variadic.hlt` (exit 0), `hello_io.hlt` (exit 0).

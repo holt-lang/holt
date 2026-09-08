@@ -3,7 +3,7 @@
 **Workspace:** `holt-rs` — crates `holt` (main `holt build` CLI, `indicatif` spinner) + `compiler` (library + legacy `holtc` bin) — `inkwell 0.10 llvm21-1`, `logos 0.15`, `miette 7`.
 
 **Date:** 2026-09-09
-**EBNF:** `references/ebnf-0.1.txt` Draft 0.2 (updated for `get`/`set` public default + separate merge, `open` class-only, `[type] has` omitted, variadic `...` `T-14`, struct `T-15`, match `|`/`or`+`(a,b)` `T-17`, top-level `var` + `main(string[] args)` `T-18`)
+**EBNF:** `references/ebnf-0.1.txt` Draft 0.2 (updated for `get`/`set` public default + separate merge, `open` class-only, `[type] has` omitted, variadic `...` `T-14`, struct `T-15`, match `|`/`or`+`(a,b)` `T-17`, top-level `var` + `main(string[] args)` `T-18`, extern `struct`/`enum`/`const` `T-19`, `extend` `field`/`operator`/`property`/`conversion` `T-20`, README `T-21`)
 **Mode switch:** `plan → build` at 2026-09-08 03:xx (user: "save todo and progress next to skill file").
 
 ## Done
@@ -170,8 +170,24 @@
   - `compiler/src/codegen/mod.rs:649` `declare_extern` `Struct` opaque `set_body`/`Enum` `opaque {i32,i64}`/`Const` `External` `const_zero` + `infer_expr_ty` `Ident` `MyEnum`→`Enum` + `MemberAccess` `Enum` `MyEnum.A` → `EnumVariant` `insert_value` tag.
   - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_extern3.hlt` `MyStruct has x=1 y=2` `MyEnum.A`, `/tmp/test_extern_all.hlt` `OpaqueStruct` (no `has`) as `[]` + `MyEnum` + `MY_CONST` not used.
 
-## Next — T-20
+## T-20 DONE — 2026-09-09 (extend `field`/`operator`/`property`/`conversion`)
 
-- **T-20 Extensions: `field`/`operator`/`property`/`conversion` members (only `Function` now)** — remaining.
-- Continue `T-20`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `extension-member = field-declaration | function-declaration | operator-declaration | property-declaration | conversion-declaration` per EBNF §31 `extension-declaration` (previously only `Function`).
+- **Done:**
+  - `compiler/src/parse/mod.rs:1156` `parse_extension_decl` now `Field` `[vis] type ident [= expr]` + `Operator` `[vis] [static] operator sym (params) [where] block` + `Property` `[vis] [type] ident get/set` + `Conversion` `[vis] [explicit] convert Type to Type block` + `Function`.
+  - `compiler/src/sema/mod.rs:815` `Extension` `Field` → `StructInfo`/`ClassInfo` `field_map`/`field_vis`/`field_defaults` + `Operator` → `operators` + `Property` `get`/`set` merging + `Conversion` + `Field` for `struct` via `ClassInfo` creation + `MemberAccess` `struct` `Default=public` fix + `Binary` `+` via `class_operators` + `p.w` via `class_properties`.
+  - `compiler/src/codegen/mod.rs:566` `declare_extension` `Field` `opaque set_body`/`Operator` `__op_`/`Property` `__get_`/`__set_` merging + `Conversion` + `codegen_extension` `Field` no-op/`Operator`/`Property`/`Conversion` + `MemberAccess` `Enum` `MyEnum.A` → `EnumVariant`.
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_extend2.hlt` `Point` `x=1 y=2` `extra()`→`3` `w`→`3` `w=10`→`12` `p+p2`→`13` (`operator +`), `extern struct`/`enum`/`const` still ok.
+
+## T-21 DONE — 2026-09-09 (README/examples sync + `hello_io.out` removed)
+
+- **Goal:** `README` `Build & Run` + `Examples` table + `Status` in sync with `examples/*.hlt` (7) + `.gitignore` `*.out` + `rm` `hello_io.out`.
+- **Done:**
+  - `README.md:07` `Layout` `holt`/`compiler`/`examples`/`stdlib`/`references` + `24` `Build & Run` (`cargo run -p holt -- build examples/hello_io.hlt` + `abstraction` `--emit-llvm` + `empty` `--help` + `compiler` legacy) + `40` `Examples` table now 7 (`empty` `basics` `data_control` `abstraction` `hello_io` `advanced` `variadic`) + `60` `Language Notes` + `74` `Status` (all 7 `exit` codes: `advanced` 20, `abstraction` 233, `basics` 230, `data_control` 72, `variadic` 0, `hello_io` 0, `empty` 0).
+  - `.gitignore:2` `*.out` + `rm examples/*.out` (`hello_io.out` + `abstraction.out` etc. removed, now ignored) + `git status` clean (only `*.out` ignored).
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `examples/` now `7` `.hlt` only, `README` `Build & Run` + `Examples` + `Status` in sync.
+
+## Next — Done (T-1..T-21 all green)
+
+- All `TODO.md` `T-1`..`T-21` `DONE`, `holt build` + `cargo test` per item verified, `references/ebnf-0.1.txt` Draft 0.2 + `T-14` `T-15` `T-17` `T-18` `T-19` `T-20` `T-21` in sync, `examples/` 7 `.hlt` + `README` + `.gitignore` clean.
 

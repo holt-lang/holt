@@ -816,26 +816,144 @@ impl Checker {
                 let target_name = match &ext.ty { Type::Named(n, _) => n.clone(), Type::Generic(n, _, _) => n.clone(), _ => "".to_string() };
                 let ext_members = ext.members.clone();
                 let mut pending_ext: Vec<(String, FuncSig, crate::ast::Visibility)> = Vec::new();
+                let mut pending_fields: Vec<(String, Ty, crate::ast::Visibility, Option<Expr>)> = Vec::new();
+                let mut pending_ops: Vec<(String, FuncSig, crate::ast::Visibility)> = Vec::new();
+                let mut pending_props: Vec<(String, PropertyInfo)> = Vec::new();
+                let mut pending_convs: Vec<(Ty, Ty, Span)> = Vec::new();
                 for mem in &ext_members {
-                    if let crate::ast::ExtensionMember::Function(f) = mem {
-                        let ret_ty = self.resolve_type(&f.ret_ty);
-                        let param_tys: Vec<Ty> = f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
-                        let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
-                        let sig = FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: f.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: f.params.iter().map(|p| p.is_variadic).collect(), generic_params: f.generic_params.clone(), where_clause: f.where_clause.clone(), span: f.name_span};
-                        pending_ext.push((f.name.clone(), sig, f.visibility));
+                    match mem {
+                        crate::ast::ExtensionMember::Function(f) => {
+                            let ret_ty = self.resolve_type(&f.ret_ty);
+                            let param_tys: Vec<Ty> = f.params.iter().enumerate().map(|(idx, p)| {
+                                let mut ty = self.resolve_type(&p.ty);
+                                if p.is_variadic {
+                                    if p.ty.name() == "__derived__" {
+                                        if idx == 0 { self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: p.span}); } else { let prev_t = self.resolve_type(&f.params[idx-1].ty); ty = Ty::Array(Box::new(prev_t)); }
+                                    } else { ty = Ty::Array(Box::new(ty)); }
+                                    if p.ty.name() == "__derived__" && idx + 1 != f.params.len() { self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: p.span}); }
+                                }
+                                if ty == Ty::Void { self.errors.push(SemError{message: format!("parameter `{}` cannot be `void`", p.name), span: p.span}); }
+                                ty
+                            }).collect();
+                            let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
+                            let sig = FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: f.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: f.params.iter().map(|p| p.is_variadic).collect(), generic_params: f.generic_params.clone(), where_clause: f.where_clause.clone(), span: f.name_span};
+                            pending_ext.push((f.name.clone(), sig, f.visibility));
+                        }
+                        crate::ast::ExtensionMember::Field(field) => {
+                            let fty = self.resolve_type(&field.ty);
+                            if fty == Ty::Void { self.errors.push(SemError{message: format!("field `{}` cannot be `void`", field.name), span: field.span}); }
+                            if let Some(def) = &field.default {
+                                let dty = self.check_expr(def);
+                                if dty != fty && dty != Ty::Any { self.errors.push(SemError{message: format!("default for field `{}`: expected `{}`, found `{}`", field.name, fty, dty), span: def.span}); }
+                            }
+                            pending_fields.push((field.name.clone(), fty, field.visibility, field.default.clone()));
+                        }
+                        crate::ast::ExtensionMember::Operator(op) => {
+                            let mut p_tys = Vec::new();
+                            for (idx, pp) in op.params.iter().enumerate() {
+                                let mut ty = self.resolve_type(&pp.ty);
+                                if pp.is_variadic {
+                                    if pp.ty.name() == "__derived__" {
+                                        if idx == 0 { self.errors.push(SemError{message: "variadic `... vda` without previous type must not be first param".into(), span: pp.span}); } else { let prev_t = self.resolve_type(&op.params[idx-1].ty); ty = Ty::Array(Box::new(prev_t)); }
+                                    } else { ty = Ty::Array(Box::new(ty)); }
+                                    if pp.ty.name() == "__derived__" && idx + 1 != op.params.len() { self.errors.push(SemError{message: "derived variadic `... vda` must be last".into(), span: pp.span}); }
+                                }
+                                p_tys.push(ty);
+                            }
+                            let ret = Ty::Int;
+                            let sig = FuncSig{ret: ret.clone(), params: p_tys, param_modes: op.params.iter().map(|p| p.mode).collect(), param_names: op.params.iter().map(|p| p.name.clone()).collect(), param_is_variadic: op.params.iter().map(|p| p.is_variadic).collect(), generic_params: Vec::new(), where_clause: op.where_clause.clone(), span: op.span};
+                            pending_ops.push((op.op.clone(), sig, op.visibility));
+                        }
+                        crate::ast::ExtensionMember::Property(prop) => {
+                            let prop_ty = if let Some(ref t) = prop.ty { self.resolve_type(t) } else if let Some((p,_)) = prop.setter.as_ref() { self.resolve_type(&p.ty) } else { Ty::Void };
+                            pending_props.push((prop.name.clone(), PropertyInfo{ty: prop_ty, has_get: prop.getter.is_some(), has_set: prop.setter.is_some(), visibility: prop.visibility, span: prop.span}));
+                        }
+                        crate::ast::ExtensionMember::Conversion(conv) => {
+                            let from = self.resolve_type(&conv.from_ty);
+                            let to = self.resolve_type(&conv.to_ty);
+                            pending_convs.push((from, to, conv.span));
+                        }
                     }
                 }
+                // For class target, add to class; for struct target, add to struct
                 if let Some(cls) = self.classes.get_mut(&target_name) {
                     for (name, sig, vis) in pending_ext {
                         cls.methods.insert(name.clone(), sig);
                         cls.method_vis.insert(name, vis);
                     }
-                    for mem in &ext_members {
-                        match mem {
-                            crate::ast::ExtensionMember::Function(f) => {
-                                // already handled
+                    for (fname, fty, vis, def) in pending_fields {
+                        if cls.fields.iter().any(|(n,_)| n == &fname) {
+                            self.errors.push(SemError{message: format!("duplicate field `{}` in `extend {}`", fname, target_name), span: Span::new(0,0)});
+                        } else {
+                            let idx = cls.fields.len();
+                            cls.fields.push((fname.clone(), fty.clone()));
+                            cls.field_map.insert(fname.clone(), (idx, fty.clone()));
+                            cls.field_vis.insert(fname.clone(), vis);
+                            // also update structs map for field access
+                            if let Some(sinfo) = self.structs.get_mut(&target_name) {
+                                sinfo.fields.push((fname.clone(), fty.clone()));
+                                sinfo.field_map.insert(fname.clone(), (idx, fty.clone()));
+                                sinfo.field_vis.insert(fname.clone(), vis);
+                                sinfo.field_defaults.insert(fname.clone(), def);
                             }
-                            _ => {}
+                        }
+                    }
+                    for (op_str, sig, vis) in pending_ops {
+                        cls.operators.insert(op_str, sig);
+                    }
+                    for (pname, pinfo) in pending_props {
+                        if let Some(existing) = cls.properties.get(&pname).cloned() {
+                            let merged_has_get = existing.has_get || pinfo.has_get;
+                            let merged_has_set = existing.has_set || pinfo.has_set;
+                            let merged_ty = if existing.ty != Ty::Void { existing.ty.clone() } else { pinfo.ty.clone() };
+                            let merged_vis = existing.visibility;
+                            cls.properties.insert(pname.clone(), PropertyInfo{ty: merged_ty, has_get: merged_has_get, has_set: merged_has_set, visibility: merged_vis, span: pinfo.span});
+                        } else {
+                            cls.properties.insert(pname, pinfo);
+                        }
+                    }
+                    for (from, to, _) in pending_convs {
+                        cls.conversions.push((from, to, Span::new(0,0)));
+                    }
+                } else if let Some(sinfo) = self.structs.get_mut(&target_name) {
+                    for (fname, fty, vis, def) in pending_fields {
+                        if sinfo.fields.iter().any(|(n,_)| n == &fname) {
+                            self.errors.push(SemError{message: format!("duplicate field `{}` in `extend {}`", fname, target_name), span: Span::new(0,0)});
+                        } else {
+                            let idx = sinfo.fields.len();
+                            sinfo.fields.push((fname.clone(), fty.clone()));
+                            sinfo.field_map.insert(fname.clone(), (idx, fty.clone()));
+                            sinfo.field_vis.insert(fname.clone(), vis);
+                            sinfo.field_defaults.insert(fname.clone(), def);
+                        }
+                    }
+                    // For struct, also handle operators/properties/conversions via class maps (create ClassInfo if needed)
+                    if !pending_ops.is_empty() || !pending_props.is_empty() || !pending_convs.is_empty() || !pending_ext.is_empty() {
+                        let cls = self.classes.entry(target_name.clone()).or_insert_with(|| ClassInfo{
+                            name: target_name.clone(), fields: vec![], field_map: HashMap::new(), field_vis: HashMap::new(),
+                            methods: HashMap::new(), method_vis: HashMap::new(), constructors: vec![], properties: HashMap::new(),
+                            operators: HashMap::new(), conversions: vec![], is_open: false, is_sealed: false, extends: None, implements: vec![], span: Span::new(0,0)
+                        });
+                        for (name, sig, vis) in pending_ext {
+                            let vis_pub = if vis == crate::ast::Visibility::Default { crate::ast::Visibility::Public } else { vis };
+                            cls.methods.insert(name.clone(), sig);
+                            cls.method_vis.insert(name, vis_pub);
+                        }
+                        for (op_str, sig, _) in pending_ops {
+                            cls.operators.insert(op_str, sig);
+                        }
+                        for (pname, pinfo) in pending_props {
+                            if let Some(existing) = cls.properties.get(&pname).cloned() {
+                                let merged_has_get = existing.has_get || pinfo.has_get;
+                                let merged_has_set = existing.has_set || pinfo.has_set;
+                                let merged_ty = if existing.ty != Ty::Void { existing.ty.clone() } else { pinfo.ty.clone() };
+                                cls.properties.insert(pname.clone(), PropertyInfo{ty: merged_ty, has_get: merged_has_get, has_set: merged_has_set, visibility: existing.visibility, span: pinfo.span});
+                            } else {
+                                cls.properties.insert(pname, pinfo);
+                            }
+                        }
+                        for (from, to, _) in pending_convs {
+                            cls.conversions.push((from, to, Span::new(0,0)));
                         }
                     }
                 }
@@ -1925,16 +2043,17 @@ impl Checker {
                 if let Ty::Struct(ref sname) = obj_ty {
                     if let Some(sinfo) = self.structs.get(sname).cloned() {
                         if let Some((_, fty)) = sinfo.field_map.get(field) {
-                            if let Some(cinfo) = self.classes.get(sname) {
+                            if let Some(vis) = sinfo.field_vis.get(field) {
+                                // For struct, Default is public, only Private is private
+                                if *vis == crate::ast::Visibility::Private && self.cur_class.as_deref() != Some(sname.as_str()) {
+                                    self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
+                                }
+                            } else if let Some(cinfo) = self.classes.get(sname) {
                                 if let Some(vis) = cinfo.field_vis.get(field) {
                                     if *vis != crate::ast::Visibility::Public && self.cur_class.as_deref() != Some(sname.as_str()) {
                                         self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
                                     }
                                 } else if self.cur_class.as_deref() != Some(sname.as_str()) {
-                                    self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
-                                }
-                            } else if let Some(vis) = sinfo.field_vis.get(field) {
-                                if *vis == crate::ast::Visibility::Private {
                                     self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
                                 }
                             }

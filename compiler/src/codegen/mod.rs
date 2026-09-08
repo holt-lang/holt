@@ -563,7 +563,7 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
-    fn declare_extension(&mut self, ext: &ExtensionDecl) -> Result<(), CodegenError> {
+     fn declare_extension(&mut self, ext: &ExtensionDecl) -> Result<(), CodegenError> {
         let target = match &ext.ty {
             Type::Named(n, _) => n.clone(),
             Type::Generic(n, _, _) => n.clone(),
@@ -571,76 +571,216 @@ impl<'ctx> Codegen<'ctx> {
         };
         // Ensure target struct exists
         let _ = self.llvm_ty_for(&ext.ty);
-        // For each function member, declare as method of target
+        // Handle field extensions: add to struct type
         for mem in &ext.members {
-            if let crate::ast::ExtensionMember::Function(f) = mem {
-                let ret_ty_raw: crate::sema::Ty = (&f.ret_ty).into();
-                let ret_ty = self.resolve_ty_for_codegen(&ret_ty_raw);
-                let mut param_semas: Vec<crate::sema::Ty> = vec![crate::sema::Ty::Struct(target.clone())];
-                for (idx, pp) in f.params.iter().enumerate() {
-                    let raw: crate::sema::Ty = (&pp.ty).into();
-                    let res = self.resolve_ty_for_codegen(&raw);
-                    let final_ty = if pp.is_variadic {
-                        if pp.ty.name() == "__derived__" {
-                            if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
-                                let prev_raw: crate::sema::Ty = (&f.params[idx-1].ty).into();
-                                crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
-                            }
-                        } else { crate::sema::Ty::Array(Box::new(res)) }
-                    } else { res };
-                    param_semas.push(final_ty);
+            if let crate::ast::ExtensionMember::Field(field) = mem {
+                if let Some(st) = self.struct_types.get(&target).cloned() {
+                    // Need to update struct type to include new field
+                    // Get current field types plus new
+                    let mut field_tys: Vec<BasicTypeEnum<'ctx>> = Vec::new();
+                    let count = st.count_fields();
+                    for i in 0..count {
+                        field_tys.push(st.get_field_type_at_index(i).unwrap());
+                    }
+                    let new_ty = self.llvm_ty_for(&field.ty);
+                    field_tys.push(new_ty);
+                    // Update field map
+                    let field_idx = field_tys.len() as u32 - 1;
+                    self.struct_fields.entry(target.clone()).or_insert_with(HashMap::new).insert(field.name.clone(), field_idx);
+                    // Update defaults
+                    if let Some(def) = &field.default {
+                        self.struct_field_defaults.entry(target.clone()).or_insert_with(HashMap::new).insert(field.name.clone(), def.clone());
+                    }
+                    let _ = st.set_body(&field_tys, false);
                 }
-                let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
-                let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
-                for (idx, pp) in f.params.iter().enumerate() {
-                    let t: crate::sema::Ty = (&pp.ty).into();
-                    let sema_t = if pp.is_variadic {
-                        if pp.ty.name() == "__derived__" {
-                            if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
-                                let prev_raw: crate::sema::Ty = (&f.params[idx-1].ty).into();
-                                crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
-                            }
-                        } else { crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&t))) }
-                    } else { self.resolve_ty_for_codegen(&t) };
-                    if let Some(bt) = self.llvm_ty_for_sema(&sema_t) { param_llvm.push(bt.into()); }
+            }
+        }
+        // For each function/operator/property/conversion member, declare as method of target
+        for mem in &ext.members {
+            match mem {
+                crate::ast::ExtensionMember::Function(f) => {
+                    let ret_ty_raw: crate::sema::Ty = (&f.ret_ty).into();
+                    let ret_ty = self.resolve_ty_for_codegen(&ret_ty_raw);
+                    let mut param_semas: Vec<crate::sema::Ty> = vec![crate::sema::Ty::Struct(target.clone())];
+                    for (idx, pp) in f.params.iter().enumerate() {
+                        let raw: crate::sema::Ty = (&pp.ty).into();
+                        let res = self.resolve_ty_for_codegen(&raw);
+                        let final_ty = if pp.is_variadic {
+                            if pp.ty.name() == "__derived__" {
+                                if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                                    let prev_raw: crate::sema::Ty = (&f.params[idx-1].ty).into();
+                                    crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                                }
+                            } else { crate::sema::Ty::Array(Box::new(res)) }
+                        } else { res };
+                        param_semas.push(final_ty);
+                    }
+                    let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                    let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
+                    for (idx, pp) in f.params.iter().enumerate() {
+                        let t: crate::sema::Ty = (&pp.ty).into();
+                        let sema_t = if pp.is_variadic {
+                            if pp.ty.name() == "__derived__" {
+                                if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                                    let prev_raw: crate::sema::Ty = (&f.params[idx-1].ty).into();
+                                    crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                                }
+                            } else { crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&t))) }
+                        } else { self.resolve_ty_for_codegen(&t) };
+                        if let Some(bt) = self.llvm_ty_for_sema(&sema_t) { param_llvm.push(bt.into()); }
+                    }
+                    let fn_ty = match ret_ty {
+                        crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
+                        crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
+                        crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
+                        crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, false),
+                        crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                        crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_llvm, false),
+                        crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_llvm, false),
+                        crate::sema::Ty::Struct(ref n) => {
+                            let st = self.struct_types.get(n).unwrap();
+                            st.fn_type(&param_llvm, false)
+                        }
+                        crate::sema::Ty::Enum(ref n) => {
+                            let et = self.enum_types.get(n).unwrap();
+                            et.fn_type(&param_llvm, false)
+                        }
+                        crate::sema::Ty::Generic(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                        crate::sema::Ty::Tuple(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                        crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                        crate::sema::Ty::Function(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                        crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).fn_type(&param_llvm, false),
+                        crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
+                        crate::sema::Ty::Optional(ref el) => {
+                            let inner = self.llvm_ty_for_sema(el).unwrap();
+                            self.context.struct_type(&[inner.into(), self.context.bool_type().into()], false).fn_type(&param_llvm, false)
+                        }
+                    };
+                    let mangled = format!("{}__{}", target, f.name);
+                    let func = self.module.add_function(&mangled, fn_ty, None);
+                    let entry = self.class_methods.entry(target.clone()).or_insert_with(std::collections::HashMap::new);
+                    let mut full_names = vec!["this".to_string()];
+                    full_names.extend(f.params.iter().map(|p| p.name.clone()));
+                    let mut full_modes = vec![ParamMode::None];
+                    full_modes.extend(f.params.iter().map(|p| p.mode));
+                    let mut full_variadic = vec![false];
+                    full_variadic.extend(f.params.iter().map(|p| p.is_variadic));
+                    entry.insert(f.name.clone(), (func, TyInfo{ret: ret_ty, params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic}));
                 }
-                let fn_ty = match ret_ty {
-                    crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Float => self.context.f32_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Double => self.context.f64_type().fn_type(&param_llvm, false),
-                    crate::sema::Ty::Struct(ref n) => {
-                        let st = self.struct_types.get(n).unwrap();
-                        st.fn_type(&param_llvm, false)
+                crate::ast::ExtensionMember::Operator(op) => {
+                    let ret_ty = crate::sema::Ty::Int;
+                    let mut param_semas = vec![crate::sema::Ty::Struct(target.clone())];
+                    for (idx, pp) in op.params.iter().enumerate() {
+                        let raw: crate::sema::Ty = (&pp.ty).into();
+                        let res = self.resolve_ty_for_codegen(&raw);
+                        let final_ty = if pp.is_variadic {
+                            if pp.ty.name() == "__derived__" {
+                                if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                                    let prev_raw: crate::sema::Ty = (&op.params[idx-1].ty).into();
+                                    crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                                }
+                            } else { crate::sema::Ty::Array(Box::new(res)) }
+                        } else { res };
+                        param_semas.push(final_ty);
                     }
-                    crate::sema::Ty::Enum(ref n) => {
-                        let et = self.enum_types.get(n).unwrap();
-                        et.fn_type(&param_llvm, false)
+                    let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                    let mut param_llvm: Vec<inkwell::types::BasicMetadataTypeEnum> = vec![this_ty];
+                    for (idx, pp) in op.params.iter().enumerate() {
+                        let t: crate::sema::Ty = (&pp.ty).into();
+                        let sema_t = if pp.is_variadic {
+                            if pp.ty.name() == "__derived__" {
+                                if idx == 0 { crate::sema::Ty::Array(Box::new(crate::sema::Ty::Int)) } else {
+                                    let prev_raw: crate::sema::Ty = (&op.params[idx-1].ty).into();
+                                    crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&prev_raw)))
+                                }
+                            } else { crate::sema::Ty::Array(Box::new(self.resolve_ty_for_codegen(&t))) }
+                        } else { self.resolve_ty_for_codegen(&t) };
+                        if let Some(bt) = self.llvm_ty_for_sema(&sema_t) { param_llvm.push(bt.into()); }
                     }
-                    crate::sema::Ty::Generic(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Tuple(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Function(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
-                    crate::sema::Ty::Optional(ref el) => {
-                        let inner = self.llvm_ty_for_sema(el).unwrap();
-                        self.context.struct_type(&[inner.into(), self.context.bool_type().into()], false).fn_type(&param_llvm, false)
+                    let fn_ty = match ret_ty {
+                        crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
+                        crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
+                        _ => self.context.i64_type().fn_type(&param_llvm, false),
+                    };
+                    let op_mangled = match op.op.as_str() {
+                        "+" => "plus", "-" => "minus", "*" => "star", "/" => "slash", "%" => "percent",
+                        "<" => "lt", "<=" => "le", ">" => "gt", ">=" => "ge",
+                        "is" => "is", "is not" => "is_not",
+                        "&" => "bitand", "|" => "bitor", "^" => "xor", "~" => "tilde",
+                        "<<" => "lshift", ">>" => "rshift", "=" => "assign", "[]" => "index",
+                        "++" => "inc", "--" => "dec",
+                        "+=" => "plus_assign", "-=" => "minus_assign", "*=" => "star_assign", "/=" => "slash_assign", "%=" => "percent_assign",
+                        "&=" => "and_assign", "|=" => "or_assign", "^=" => "xor_assign", "<<=" => "lshift_assign", ">>=" => "rshift_assign",
+                        _ => "op",
+                    };
+                    let mangled = format!("{}__op_{}", target, op_mangled);
+                    let func = self.module.add_function(&mangled, fn_ty, None);
+                    let mut full_names = vec!["this".to_string()];
+                    full_names.extend(op.params.iter().map(|p| p.name.clone()));
+                    let mut full_modes = vec![ParamMode::None];
+                    full_modes.extend(op.params.iter().map(|p| p.mode));
+                    let mut full_variadic = vec![false];
+                    full_variadic.extend(op.params.iter().map(|p| p.is_variadic));
+                    let entry = self.class_operators.entry(target.clone()).or_insert_with(HashMap::new);
+                    entry.insert(op.op.clone(), (func, TyInfo{ret: ret_ty.clone(), params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic}));
+                }
+                crate::ast::ExtensionMember::Property(prop) => {
+                    let prop_ty_raw: crate::sema::Ty = prop.ty.as_ref().map(|t| t.into()).or_else(|| prop.setter.as_ref().map(|(p,_)| (&p.ty).into())).unwrap_or(crate::sema::Ty::Int);
+                    let prop_ty = self.resolve_ty_for_codegen(&prop_ty_raw);
+                    let mut pg = None;
+                    let mut ps = None;
+                    if prop.getter.is_some() {
+                        let ret_llvm = self.llvm_ty_for_sema(&prop_ty).unwrap();
+                        let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                        let fn_ty = match prop_ty {
+                            crate::sema::Ty::Void => self.context.void_type().fn_type(&[this_ty], false),
+                            _ => ret_llvm.fn_type(&[this_ty], false),
+                        };
+                        let mangled = format!("{}__get_{}", target, prop.name);
+                        let func = if let Some(existing) = self.class_properties.get(&target).and_then(|m| m.get(&prop.name)).and_then(|pc| pc.getter.as_ref().map(|(f,_)| *f)) {
+                            existing
+                        } else {
+                            self.module.add_function(&mangled, fn_ty, None)
+                        };
+                        let mut params = vec![crate::sema::Ty::Struct(target.clone())];
+                        pg = Some((func, TyInfo{ret: prop_ty.clone(), params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new(), param_is_variadic: Vec::new()}));
                     }
-                };
-                let mangled = format!("{}__{}", target, f.name);
-                let func = self.module.add_function(&mangled, fn_ty, None);
-                let entry = self.class_methods.entry(target.clone()).or_insert_with(std::collections::HashMap::new);
-                let mut full_names = vec!["this".to_string()];
-                full_names.extend(f.params.iter().map(|p| p.name.clone()));
-                let mut full_modes = vec![ParamMode::None];
-                full_modes.extend(f.params.iter().map(|p| p.mode));
-                let mut full_variadic = vec![false];
-                full_variadic.extend(f.params.iter().map(|p| p.is_variadic));
-                entry.insert(f.name.clone(), (func, TyInfo{ret: ret_ty, params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic}));
+                    if let Some((ref param,_)) = prop.setter {
+                        let setter_ty_raw: crate::sema::Ty = (&param.ty).into();
+                        let setter_ty = self.resolve_ty_for_codegen(&setter_ty_raw);
+                        let this_ty = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                        let val_llvm = self.llvm_ty_for_sema(&setter_ty).unwrap();
+                        let fn_ty = self.context.void_type().fn_type(&[this_ty, val_llvm.into()], false);
+                        let mangled = format!("{}__set_{}", target, prop.name);
+                        let func = if let Some(existing) = self.class_properties.get(&target).and_then(|m| m.get(&prop.name)).and_then(|pc| pc.setter.as_ref().map(|(f,_)| *f)) {
+                            existing
+                        } else {
+                            self.module.add_function(&mangled, fn_ty, None)
+                        };
+                        let mut params = vec![crate::sema::Ty::Struct(target.clone()), setter_ty.clone()];
+                        ps = Some((func, TyInfo{ret: crate::sema::Ty::Void, params: params.clone(), param_modes: vec![ParamMode::None; params.len()], param_names: Vec::new(), param_is_variadic: Vec::new()}));
+                    }
+                    let entry = self.class_properties.entry(target.clone()).or_insert_with(HashMap::new);
+                    if let Some(existing) = entry.get(&prop.name).cloned() {
+                        let mut merged_getter = existing.getter.clone();
+                        let mut merged_setter = existing.setter.clone();
+                        if pg.is_some() && merged_getter.is_none() { merged_getter = pg.clone(); }
+                        if ps.is_some() && merged_setter.is_none() { merged_setter = ps.clone(); }
+                        let merged_ty = if existing.ty != crate::sema::Ty::Int { existing.ty.clone() } else { prop_ty.clone() };
+                        entry.insert(prop.name.clone(), PropertyCG{ty: merged_ty, getter: merged_getter, setter: merged_setter});
+                    } else {
+                        entry.insert(prop.name.clone(), PropertyCG{ty: prop_ty, getter: pg, setter: ps});
+                    }
+                }
+                crate::ast::ExtensionMember::Conversion(conv) => {
+                    let from_ty: crate::sema::Ty = (&conv.from_ty).into();
+                    let to_ty: crate::sema::Ty = (&conv.to_ty).into();
+                    // For MVP, just create a placeholder function for conversion
+                    let _ = self.resolve_ty_for_codegen(&from_ty);
+                    let _ = self.resolve_ty_for_codegen(&to_ty);
+                    // No need to declare function now, will be handled in codegen_conversion via mangled name
+                }
+                crate::ast::ExtensionMember::Field(_) => {} // already handled above
             }
         }
         Ok(())
@@ -831,36 +971,152 @@ impl<'ctx> Codegen<'ctx> {
             _ => return Ok(()),
         };
         for mem in &ext.members {
-            if let crate::ast::ExtensionMember::Function(f) = mem {
-                // Codegen as class method with this
-                let mangled = format!("{}__{}", target, f.name);
-                let func = self.module.get_function(&mangled).ok_or(CodegenError{message: format!("extension func not declared {}", mangled), span: f.span})?;
-                self.cur_fn = Some(func);
-                self.cur_class = Some(target.clone());
-                let entry = self.context.append_basic_block(func, "entry");
-                self.builder.position_at_end(entry);
-                self.vars.push(std::collections::HashMap::new());
-                let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
-                let this_param = func.get_nth_param(0).unwrap();
-                let this_alloca = self.create_entry_block_alloca("this", this_ty);
-                self.builder.build_store(this_alloca, this_param).unwrap();
-                self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
-                for (i, param) in f.params.iter().enumerate() {
-                    let llvm_ty = self.llvm_ty_for(&param.ty);
-                    let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
-                    let val = func.get_nth_param((i+1) as u32).unwrap();
-                    self.builder.build_store(alloca, val).unwrap();
-                    self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+            match mem {
+                crate::ast::ExtensionMember::Function(f) => {
+                    let mangled = format!("{}__{}", target, f.name);
+                    let func = self.module.get_function(&mangled).ok_or(CodegenError{message: format!("extension func not declared {}", mangled), span: f.span})?;
+                    self.cur_fn = Some(func);
+                    self.cur_class = Some(target.clone());
+                    let entry = self.context.append_basic_block(func, "entry");
+                    self.builder.position_at_end(entry);
+                    self.vars.push(std::collections::HashMap::new());
+                    let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                    let this_param = func.get_nth_param(0).unwrap();
+                    let this_alloca = self.create_entry_block_alloca("this", this_ty);
+                    self.builder.build_store(this_alloca, this_param).unwrap();
+                    self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
+                    for (i, param) in f.params.iter().enumerate() {
+                        let llvm_ty = self.llvm_ty_for(&param.ty);
+                        let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
+                        let val = func.get_nth_param((i+1) as u32).unwrap();
+                        self.builder.build_store(alloca, val).unwrap();
+                        self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                    }
+                    let _ = self.codegen_block(&f.body)?;
+                    if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                        self.builder.build_return(Some(&self.context.i64_type().const_int(0,false))).unwrap();
+                    }
+                    self.vars.pop();
+                    self.cur_fn = None;
+                    self.cur_class = None;
+                    if !func.verify(true) { return Err(CodegenError{message: format!("extension {}::{} verify failed", target, f.name), span: f.span}); }
                 }
-                let _ = self.codegen_block(&f.body)?;
-                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
-                    // default return
-                    self.builder.build_return(Some(&self.context.i64_type().const_int(0,false))).unwrap();
+                crate::ast::ExtensionMember::Operator(op) => {
+                    let op_mangled = match op.op.as_str() {
+                        "+" => "plus", "-" => "minus", "*" => "star", "/" => "slash", "%" => "percent",
+                        "<" => "lt", "<=" => "le", ">" => "gt", ">=" => "ge",
+                        "is" => "is", "is not" => "is_not",
+                        "&" => "bitand", "|" => "bitor", "^" => "xor", "~" => "tilde",
+                        "<<" => "lshift", ">>" => "rshift", "=" => "assign", "[]" => "index",
+                        "++" => "inc", "--" => "dec",
+                        "+=" => "plus_assign", "-=" => "minus_assign", "*=" => "star_assign", "/=" => "slash_assign", "%=" => "percent_assign",
+                        "&=" => "and_assign", "|=" => "or_assign", "^=" => "xor_assign", "<<=" => "lshift_assign", ">>=" => "rshift_assign",
+                        _ => "op",
+                    };
+                    let mangled = format!("{}__op_{}", target, op_mangled);
+                    let func = self.module.get_function(&mangled).ok_or(CodegenError{message: format!("extension op {} not declared {}", op.op, mangled), span: op.span})?;
+                    self.cur_fn = Some(func);
+                    self.cur_class = Some(target.clone());
+                    let entry = self.context.append_basic_block(func, "entry");
+                    self.builder.position_at_end(entry);
+                    self.vars.push(HashMap::new());
+                    let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                    let this_param = func.get_nth_param(0).unwrap();
+                    let this_alloca = self.create_entry_block_alloca("this", this_ty);
+                    self.builder.build_store(this_alloca, this_param).unwrap();
+                    self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
+                    for (i, param) in op.params.iter().enumerate() {
+                        let llvm_ty = self.llvm_ty_for(&param.ty);
+                        let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
+                        let val = func.get_nth_param((i+1) as u32).unwrap();
+                        self.builder.build_store(alloca, val).unwrap();
+                        self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                    }
+                    let _ = self.codegen_block(&op.body)?;
+                    if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                        self.builder.build_return(Some(&self.context.i64_type().const_int(0,false))).unwrap();
+                    }
+                    self.vars.pop();
+                    self.cur_fn = None;
+                    self.cur_class = None;
+                    if !func.verify(true) { return Err(CodegenError{message: format!("extension op {} failed verify", op.op), span: op.span}); }
                 }
-                self.vars.pop();
-                self.cur_fn = None;
-                self.cur_class = None;
-                if !func.verify(true) { return Err(CodegenError{message: format!("extension {}::{} verify failed", target, f.name), span: f.span}); }
+                crate::ast::ExtensionMember::Property(prop) => {
+                    if let Some(getter) = &prop.getter {
+                        let mangled = format!("{}__get_{}", target, prop.name);
+                        let func = self.module.get_function(&mangled).ok_or(CodegenError{message: format!("extension getter not declared {}", mangled), span: prop.span})?;
+                        self.cur_fn = Some(func);
+                        self.cur_class = Some(target.clone());
+                        let entry = self.context.append_basic_block(func, "entry");
+                        self.builder.position_at_end(entry);
+                        self.vars.push(HashMap::new());
+                        let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                        let this_param = func.get_nth_param(0).unwrap();
+                        let this_alloca = self.create_entry_block_alloca("this", this_ty);
+                        self.builder.build_store(this_alloca, this_param).unwrap();
+                        self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
+                        let _ = self.codegen_block(getter)?;
+                        if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                            if let Some(pty) = &prop.ty {
+                                let _ty = self.llvm_ty_for(pty);
+                                let zero: BasicValueEnum<'ctx> = match pty { Type::Int(_) => self.context.i64_type().const_int(0,false).into(), Type::Bool(_) => self.context.bool_type().const_int(0,false).into(), _ => self.context.i64_type().const_int(0,false).into() };
+                                self.builder.build_return(Some(&zero)).unwrap();
+                            } else { self.builder.build_return(None).unwrap(); }
+                        }
+                        self.vars.pop();
+                        self.cur_fn = None;
+                        self.cur_class = None;
+                        if !func.verify(true) { return Err(CodegenError{message: format!("extension getter {} failed verify", mangled), span: prop.span}); }
+                    }
+                    if let Some((param, body)) = &prop.setter {
+                        let mangled = format!("{}__set_{}", target, prop.name);
+                        let func = self.module.get_function(&mangled).ok_or(CodegenError{message: format!("extension setter not declared {}", mangled), span: prop.span})?;
+                        self.cur_fn = Some(func);
+                        self.cur_class = Some(target.clone());
+                        let entry = self.context.append_basic_block(func, "entry");
+                        self.builder.position_at_end(entry);
+                        self.vars.push(HashMap::new());
+                        let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                        let this_param = func.get_nth_param(0).unwrap();
+                        let this_alloca = self.create_entry_block_alloca("this", this_ty);
+                        self.builder.build_store(this_alloca, this_param).unwrap();
+                        self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
+                        let llvm_ty = self.llvm_ty_for(&param.ty);
+                        let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
+                        let val = func.get_nth_param(1).unwrap();
+                        self.builder.build_store(alloca, val).unwrap();
+                        self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        let _ = self.codegen_block(body)?;
+                        if self.builder.get_insert_block().unwrap().get_terminator().is_none() { self.builder.build_return(None).unwrap(); }
+                        self.vars.pop();
+                        self.cur_fn = None;
+                        self.cur_class = None;
+                        if !func.verify(true) { return Err(CodegenError{message: format!("extension setter {} failed verify", mangled), span: prop.span}); }
+                    }
+                }
+                crate::ast::ExtensionMember::Conversion(conv) => {
+                    let mangled = format!("{}__conv_{}_to_{}", target, conv.from_ty.name().replace("<","_").replace(">","_").replace(",","_"), conv.to_ty.name().replace("<","_").replace(">","_").replace(",","_"));
+                    let func = self.module.get_function(&mangled).unwrap_or_else(|| {
+                        let fn_ty = self.context.i64_type().fn_type(&[self.context.ptr_type(inkwell::AddressSpace::default()).into()], false);
+                        self.module.add_function(&mangled, fn_ty, None)
+                    });
+                    self.cur_fn = Some(func);
+                    self.cur_class = Some(target.clone());
+                    let entry = self.context.append_basic_block(func, "entry");
+                    self.builder.position_at_end(entry);
+                    self.vars.push(HashMap::new());
+                    let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+                    let this_param = func.get_nth_param(0).unwrap();
+                    let this_alloca = self.create_entry_block_alloca("this", this_ty);
+                    self.builder.build_store(this_alloca, this_param).unwrap();
+                    self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
+                    let _ = self.codegen_block(&conv.body)?;
+                    if self.builder.get_insert_block().unwrap().get_terminator().is_none() { self.builder.build_return(Some(&self.context.i64_type().const_int(0,false))).unwrap(); }
+                    self.vars.pop();
+                    self.cur_fn = None;
+                    self.cur_class = None;
+                }
+                crate::ast::ExtensionMember::Field(_) => {} // already handled in declare
             }
         }
         Ok(())

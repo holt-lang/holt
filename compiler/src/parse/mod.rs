@@ -1161,7 +1161,188 @@ impl Parser {
         let mut members = Vec::new();
         while !self.is_eof() && self.peek_token() != Some(&Token::End) {
             if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            // Try field: [vis] type ident [= expr] terminator
             let save = self.pos;
+            // Try operator: [vis] [static] operator <symbol> "(" ... ")" [where] block
+            // Try property: [vis] [type] ident get/set ...
+            // Try conversion: [vis] [explicit] convert Type to Type block
+            // Try field and function with lookahead
+            // Use helper to detect field vs function vs operator vs property vs conversion
+            let vis = self.parse_visibility();
+            let mut is_static = false;
+            let mut save_static = self.pos;
+            // Check for operator first (needs `operator` keyword)
+            if self.peek_token() == Some(&Token::OperatorKw) {
+                self.pos = save;
+                // Parse operator as in class
+                let op_vis = self.parse_visibility();
+                let mut op_static = false;
+                if self.peek_token() == Some(&Token::Static) { op_static = true; self.advance(); }
+                if self.peek_token() == Some(&Token::OperatorKw) {
+                    let op_start = self.advance().unwrap().span.start;
+                    let op_tok = self.advance().ok_or(ParseError{message: "expected operator symbol".into(), span: self.peek_span()})?;
+                    let op_str = match op_tok.token {
+                        Token::Plus => "+".to_string(), Token::Minus => "-".to_string(), Token::Star => "*".to_string(),
+                        Token::Slash => "/".to_string(), Token::Percent => "%".to_string(), Token::Lt => "<".to_string(),
+                        Token::LtEq => "<=".to_string(), Token::Gt => ">".to_string(), Token::GtEq => ">=".to_string(),
+                        Token::Is => { if self.peek_token() == Some(&Token::Not) { self.advance(); "is not".to_string() } else { "is".to_string() } },
+                        Token::Ampersand => "&".to_string(), Token::Pipe => "|".to_string(), Token::Caret => "^".to_string(),
+                        Token::Tilde => "~".to_string(), Token::LShift => "<<".to_string(), Token::RShift => ">>".to_string(),
+                        Token::Eq => "=".to_string(), Token::PlusAssign => "+=".to_string(), Token::MinusAssign => "-=".to_string(),
+                        Token::StarAssign => "*=".to_string(), Token::SlashAssign => "/=".to_string(), Token::PercentAssign => "%=".to_string(),
+                        Token::AndAssign => "&=".to_string(), Token::OrAssign => "|=".to_string(), Token::XorAssign => "^=".to_string(),
+                        Token::LShiftAssign => "<<=".to_string(), Token::RShiftAssign => ">>=".to_string(),
+                        Token::PlusPlus => "++".to_string(), Token::MinusMinus => "--".to_string(),
+                        Token::LBracket => { self.expect(Token::RBracket, "expected `]` for operator `[]`")?; "[]".to_string() },
+                        _ => self.slice(op_tok.span).to_string(),
+                    };
+                    let op_span = op_tok.span;
+                    self.expect(Token::LParen, "expected `(` after operator")?;
+                    let mut params = Vec::new();
+                    if self.peek_token() != Some(&Token::RParen) {
+                        loop { let p = self.parse_param()?; params.push(p); if !self.consume_if(Token::Comma) { break; } }
+                    }
+                    self.expect(Token::RParen, "expected `)` after operator params")?;
+                    let where_clause = if self.peek_token()==Some(&Token::Where) { self.parse_where_clause_opt() } else { None };
+                    let body = self.parse_block()?;
+                    let span = Span::new(op_start, body.span.end);
+                    members.push(ExtensionMember::Operator(OperatorDecl{visibility: op_vis, is_static: op_static, op: op_str, op_span, params, body, where_clause, span}));
+                    self.consume_newlines();
+                    continue;
+                }
+                self.pos = save;
+            }
+            // Check for conversion: [vis] [explicit] convert
+            if self.peek_token() == Some(&Token::Convert) || (vis != crate::ast::Visibility::Default && self.peek_token() == Some(&Token::Explicit)) {
+                self.pos = save;
+                let cvis = self.parse_visibility();
+                let is_explicit = if self.peek_token() == Some(&Token::Explicit) { self.advance(); true } else { false };
+                if self.peek_token() == Some(&Token::Convert) {
+                    let cstart = self.advance().unwrap().span.start;
+                    let from_ty = self.parse_type()?;
+                    self.expect(Token::To, "expected `to` after convert source type")?;
+                    let to_ty = self.parse_type()?;
+                    let body = self.parse_block()?;
+                    let span = Span::new(cstart, body.span.end);
+                    members.push(ExtensionMember::Conversion(ConversionDecl{visibility: cvis, is_explicit, from_ty, to_ty, body, span}));
+                    self.consume_newlines();
+                    continue;
+                }
+                self.pos = save;
+            }
+            // Check for property: [type] ident get/set
+            // Use save and try to detect property
+            self.pos = save;
+            let is_property = {
+                let save2 = self.pos;
+                let mut is_prop = false;
+                if let Ok(_) = self.parse_type() {
+                    if self.peek_token() == Some(&Token::Ident) {
+                        let _ = self.parse_ident();
+                        if matches!(self.peek_token(), Some(Token::Get) | Some(Token::Set)) { is_prop = true; }
+                    }
+                }
+                if !is_prop {
+                    self.pos = save2;
+                    if self.peek_token() == Some(&Token::Ident) {
+                        let _ = self.parse_ident();
+                        if self.peek_token() == Some(&Token::Set) { is_prop = true; }
+                    }
+                }
+                self.pos = save2;
+                is_prop
+            };
+            if is_property {
+                self.pos = save;
+                let pvis = self.parse_visibility();
+                let prop_vis = if pvis == crate::ast::Visibility::Default { crate::ast::Visibility::Public } else { pvis };
+                let save3 = self.pos;
+                let mut ty_opt = None;
+                let mut pname = String::new();
+                let mut pspan = Span::new(0,0);
+                let mut parsed_with_type = false;
+                if let Ok(t) = self.parse_type() {
+                    if let Ok((n,s)) = self.parse_ident() {
+                        if matches!(self.peek_token(), Some(Token::Get) | Some(Token::Set)) {
+                            ty_opt = Some(t); pname = n; pspan = s; parsed_with_type = true;
+                        }
+                    }
+                }
+                if !parsed_with_type {
+                    self.pos = save3;
+                    let (n,s) = self.parse_ident()?;
+                    pname = n; pspan = s; ty_opt = None;
+                }
+                let mut getter = None;
+                let mut setter = None;
+                if self.peek_token() == Some(&Token::Get) {
+                    self.advance();
+                    getter = Some(self.parse_block()?);
+                    self.consume_newlines();
+                    if self.peek_token() == Some(&Token::Set) {
+                        self.advance();
+                        self.expect(Token::LParen, "expected `(` for property setter")?;
+                        let pty = self.parse_type()?;
+                        let (pn, pn_span) = self.parse_ident()?;
+                        let pspan = Span::new(pty.span().start, pn_span.end);
+                        let param = Param{is_variadic: false, mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan};
+                        self.expect(Token::RParen, "expected `)` after setter param")?;
+                        let body = self.parse_block()?;
+                        setter = Some((param, body));
+                    }
+                } else if self.peek_token() == Some(&Token::Set) {
+                    self.advance();
+                    self.expect(Token::LParen, "expected `(` for property setter")?;
+                    let pty = self.parse_type()?;
+                    let (pn, pn_span) = self.parse_ident()?;
+                    let pspan = Span::new(pty.span().start, pn_span.end);
+                    let param = Param{is_variadic: false, mode: ParamMode::None, ty: pty, name: pn, name_span: pn_span, span: pspan};
+                    self.expect(Token::RParen, "expected `)` after setter param")?;
+                    let body = self.parse_block()?;
+                    setter = Some((param, body));
+                    self.consume_newlines();
+                    if self.peek_token() == Some(&Token::Get) {
+                        self.advance();
+                        getter = Some(self.parse_block()?);
+                    }
+                } else {
+                    return Err(ParseError{message: "expected `get` or `set` for property".into(), span: self.peek_span()});
+                }
+                let end = setter.as_ref().map(|(_,b)| b.span.end).or(getter.as_ref().map(|b| b.span.end)).unwrap_or(pspan.end);
+                members.push(ExtensionMember::Property(PropertyDecl{ty: ty_opt, name: pname, name_span: pspan, visibility: prop_vis, getter, setter, span: Span::new(pspan.start, end)}));
+                self.consume_newlines();
+                continue;
+            }
+            // Try field: [vis] type ident [= expr] terminator
+            self.pos = save;
+            let fvis = self.parse_visibility();
+            let save4 = self.pos;
+            if let Ok(fty) = self.parse_type() {
+                if let Ok((fname, fspan)) = self.parse_ident() {
+                    let is_func = self.peek_token() == Some(&Token::LParen);
+                    if !is_func {
+                        let fend = fspan.end;
+                        let default = if self.consume_if(Token::Eq) { Some(self.parse_expr()?) } else { None };
+                        // Check terminator: must be newline/; or `end` (if not, it's not a field)
+                        let next = self.peek_token().cloned();
+                        if matches!(next, Some(Token::Newline) | Some(Token::Semicolon) | Some(Token::End) | None) || self.consume_if(Token::Eq) {
+                            // Actually we already consumed default if any, so check terminator
+                            // For field, we expect terminator
+                            let save5 = self.pos;
+                            if self.expect_terminator("field").is_ok() {
+                                let span = Span::new(fty.span().start, fend);
+                                members.push(ExtensionMember::Field(StructField{ty: fty, name: fname, name_span: fspan, visibility: fvis, default, span}));
+                                self.consume_newlines();
+                                continue;
+                            } else {
+                                self.pos = save5;
+                            }
+                        }
+                    }
+                }
+            }
+            self.pos = save;
+            // Try function
             match self.parse_function() {
                 Ok(func) => {
                     members.push(ExtensionMember::Function(func));
@@ -1170,7 +1351,6 @@ impl Parser {
                 }
                 Err(_) => {
                     self.pos = save;
-                    // Skip one token and continue (handles unknown member types)
                     self.advance();
                 }
             }
