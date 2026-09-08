@@ -20,6 +20,10 @@ extern "c" from "m" do
     double sqrt(double x)
 end
 
+extern "c" from "libc" do
+    int printf(string arg, ...)
+end
+
 @inline
 T foo<T>(T x) where T: int do
     return x
@@ -109,6 +113,8 @@ int main() do
 
     // use u1/u2 to avoid unused warnings (and show omitted Type worked)
     int aged = u1.age + u2.age // 45, not used in return to keep exit 20 stable
+
+    printf("Hello from %s!\n", "printf")
 
     return b + y + sum
 end
