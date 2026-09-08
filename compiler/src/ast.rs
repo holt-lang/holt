@@ -190,6 +190,7 @@ pub struct StructField {
     pub name: String,
     pub name_span: Span,
     pub visibility: Visibility,
+    pub default: Option<Expr>,
     pub span: Span,
 }
 

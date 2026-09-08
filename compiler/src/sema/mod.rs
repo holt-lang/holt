@@ -108,6 +108,8 @@ struct StructInfo {
     name: String,
     fields: Vec<(String, Ty)>, // ordered
     field_map: HashMap<String, (usize, Ty)>,
+    field_vis: HashMap<String, crate::ast::Visibility>,
+    field_defaults: HashMap<String, Option<Expr>>,
     span: Span,
 }
 
@@ -353,6 +355,8 @@ impl Checker {
                     let mut seen = HashSet::new();
                     let mut fields = Vec::new();
                     let mut fmap = HashMap::new();
+                    let mut fvis = HashMap::new();
+                    let mut fdefaults = HashMap::new();
                     for (idx, f) in s.fields.iter().enumerate() {
                         if !seen.insert(&f.name) {
                             self.errors.push(SemError {
@@ -373,7 +377,18 @@ impl Checker {
                                 span: f.span,
                             });
                         }
+                        if let Some(def) = &f.default {
+                            let dty = self.check_expr(def);
+                            if dty != fty && dty != Ty::Any {
+                                self.errors.push(SemError {
+                                    message: format!("default for field `{}`: expected `{}`, found `{}`", f.name, fty, dty),
+                                    span: def.span,
+                                });
+                            }
+                        }
                         fmap.insert(f.name.clone(), (idx, fty.clone()));
+                        fvis.insert(f.name.clone(), f.visibility);
+                        fdefaults.insert(f.name.clone(), f.default.clone());
                         fields.push((f.name.clone(), fty));
                     }
                     self.structs.insert(
@@ -382,6 +397,8 @@ impl Checker {
                             name: s.name.clone(),
                             fields,
                             field_map: fmap,
+                            field_vis: fvis,
+                            field_defaults: fdefaults,
                             span: s.span,
                         },
                     );
@@ -449,6 +466,7 @@ impl Checker {
                     let mut fields = Vec::new();
                     let mut fmap = HashMap::new();
                     let mut fvis = HashMap::new();
+                    let mut fdefaults = HashMap::new();
                     // Inherit parent fields if extends
                     if let Some(ref parent) = extends_name {
                         if let Some(pinfo) = self.classes.get(parent).cloned() {
@@ -456,13 +474,15 @@ impl Checker {
                                 fmap.insert(fname.clone(), (idx, fty.clone()));
                                 if let Some(v) = pinfo.field_vis.get(fname) { fvis.insert(fname.clone(), *v); }
                                 else { fvis.insert(fname.clone(), crate::ast::Visibility::Default); }
+                                fdefaults.insert(fname.clone(), None);
                                 fields.push((fname.clone(), fty.clone()));
                                 seen.insert(fname.clone());
                             }
                         } else if let Some(sinfo) = self.structs.get(parent).cloned() {
                             for (idx, (fname, fty)) in sinfo.fields.iter().enumerate() {
                                 fmap.insert(fname.clone(), (idx, fty.clone()));
-                                fvis.insert(fname.clone(), crate::ast::Visibility::Default);
+                                if let Some(v) = sinfo.field_vis.get(fname) { fvis.insert(fname.clone(), *v); } else { fvis.insert(fname.clone(), crate::ast::Visibility::Default); }
+                                fdefaults.insert(fname.clone(), sinfo.field_defaults.get(fname).cloned().unwrap_or(None));
                                 fields.push((fname.clone(), fty.clone()));
                                 seen.insert(fname.clone());
                             }
@@ -475,13 +495,20 @@ impl Checker {
                         }
                         let fty = self.resolve_type(&f.ty);
                         if fty == Ty::Void { self.errors.push(SemError{message: format!("field `{}` cannot be `void`", f.name), span: f.span}); }
+                        if let Some(def) = &f.default {
+                            let dty = self.check_expr(def);
+                            if dty != fty && dty != Ty::Any {
+                                self.errors.push(SemError{message: format!("default for field `{}`: expected `{}`, found `{}`", f.name, fty, dty), span: def.span});
+                            }
+                        }
                         let real_idx = offset + idx;
                         fmap.insert(f.name.clone(), (real_idx, fty.clone()));
                         fvis.insert(f.name.clone(), f.visibility);
+                        fdefaults.insert(f.name.clone(), f.default.clone());
                         fields.push((f.name.clone(), fty));
                     }
                     // Also insert class layout into structs map for field access / instantiation
-                    self.structs.insert(c.name.clone(), StructInfo{name: c.name.clone(), fields: fields.clone(), field_map: fmap.clone(), span: c.span});
+                    self.structs.insert(c.name.clone(), StructInfo{name: c.name.clone(), fields: fields.clone(), field_map: fmap.clone(), field_vis: fvis.clone(), field_defaults: fdefaults.clone(), span: c.span});
                     // Collect methods
                     let mut methods = HashMap::new();
                     let mut method_vis: HashMap<String, crate::ast::Visibility> = HashMap::new();
@@ -773,10 +800,18 @@ impl Checker {
         for item in &prog.items {
             if let Item::Typedef(td) = item {
                 let ty = self.resolve_type(&td.ty);
-                self.structs.insert(td.name.clone(), StructInfo{name: td.name.clone(), fields: vec![("value".to_string(), ty.clone())], field_map: [(String::from("value"), (0, ty.clone()))].into_iter().collect(), span: td.span});
+                let mut fvis = HashMap::new();
+                fvis.insert("value".to_string(), Visibility::Public);
+                let mut fdefs = HashMap::new();
+                fdefs.insert("value".to_string(), None);
+                self.structs.insert(td.name.clone(), StructInfo{name: td.name.clone(), fields: vec![("value".to_string(), ty.clone())], field_map: [(String::from("value"), (0, ty.clone()))].into_iter().collect(), field_vis: fvis, field_defaults: fdefs, span: td.span});
             } else if let Item::Distinct(dd) = item {
                 let ty = self.resolve_type(&dd.ty);
-                self.structs.insert(dd.name.clone(), StructInfo{name: dd.name.clone(), fields: vec![("value".to_string(), ty.clone())], field_map: [(String::from("value"), (0, ty.clone()))].into_iter().collect(), span: dd.span});
+                let mut fvis = HashMap::new();
+                fvis.insert("value".to_string(), Visibility::Public);
+                let mut fdefs = HashMap::new();
+                fdefs.insert("value".to_string(), None);
+                self.structs.insert(dd.name.clone(), StructInfo{name: dd.name.clone(), fields: vec![("value".to_string(), ty.clone())], field_map: [(String::from("value"), (0, ty.clone()))].into_iter().collect(), field_vis: fvis, field_defaults: fdefs, span: dd.span});
             } else if let Item::Extension(ext) = item {
                 let target_name = match &ext.ty { Type::Named(n, _) => n.clone(), Type::Generic(n, _, _) => n.clone(), _ => "".to_string() };
                 let ext_members = ext.members.clone();
@@ -1799,6 +1834,13 @@ impl Checker {
                                     }
                                 }
                                 // also check if property overrides field? already handled
+                            } else {
+                                // pure struct: Default is public, only explicit `private` is private
+                                if let Some(vis) = sinfo.field_vis.get(field) {
+                                    if *vis == crate::ast::Visibility::Private {
+                                        self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
+                                    }
+                                }
                             }
                             // also check property getter if shadows field? prefer field
                             fty.clone()
@@ -1894,15 +1936,18 @@ impl Checker {
                         let _ = self.check_expr(fexpr);
                     }
                 }
-                // Check missing fields
+                // Check missing fields — allow if field has default `= expr`
                 for (fname, _) in &sinfo.fields {
                     if !seen.contains(fname) {
-                        self.errors.push(SemError {
-                            message: format!(
-                                "missing field `{fname}` in `{sname}` literal"
-                            ),
-                            span: expr.span,
-                        });
+                        let has_default = sinfo.field_defaults.get(fname).and_then(|o| o.as_ref()).is_some();
+                        if !has_default {
+                            self.errors.push(SemError {
+                                message: format!(
+                                    "missing field `{fname}` in `{sname}` literal"
+                                ),
+                                span: expr.span,
+                            });
+                        }
                     }
                 }
                 Ty::Struct(sname)
@@ -2531,6 +2576,12 @@ impl Checker {
                                     }
                                 } else if self.cur_class.as_deref() != Some(sname.as_str()) {
                                     self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
+                                }
+                            } else {
+                                if let Some(vis) = sinfo.field_vis.get(field) {
+                                    if *vis == crate::ast::Visibility::Private {
+                                        self.errors.push(SemError{message: format!("field `{field}` is private"), span: *field_span});
+                                    }
                                 }
                             }
                             fty.clone()

@@ -2,8 +2,8 @@
 
 **Workspace:** `holt-rs` — crates `holt` (main `holt build` CLI, `indicatif` spinner) + `compiler` (library + legacy `holtc` bin) — `inkwell 0.10 llvm21-1`, `logos 0.15`, `miette 7`.
 
-**Date:** 2026-09-08
-**EBNF:** `references/ebnf-0.1.txt` Draft 0.2 (updated for `get`/`set` public default + separate merge, `open` class-only, `[type] has` omitted)
+**Date:** 2026-09-09
+**EBNF:** `references/ebnf-0.1.txt` Draft 0.2 (updated for `get`/`set` public default + separate merge, `open` class-only, `[type] has` omitted, variadic `...` `T-14`, struct `T-15`)
 **Mode switch:** `plan → build` at 2026-09-08 03:xx (user: "save todo and progress next to skill file").
 
 ## Done
@@ -101,7 +101,7 @@
   - `compiler/src/sema/mod.rs:88` `FuncSig` `generic_params`+`where_clause` for trait methods (`TraitInfo`), `resolve_type` now includes `traits` for `unknown type` check.
   - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 6 ok, trait `Container<T>` / `where T: Drawable` parsed.
 
-## T-15 DONE — 2026-09-08 22:xx (where bounds)
+## T-16 DONE — 2026-09-08 22:xx (where bounds)
 
 - **Goal:** Enforce `where`/`generic` bounds (`where T: Trait`, `T: int`) per EBNF §7 `where-clause`/`generic-parameter`.
 - **Done:**
@@ -128,10 +128,20 @@
   - `compiler/src/sema/mod.rs:88` `FuncSig.param_is_variadic`, `465` class methods/`390` trait/`639` operator/`722` extension + `808` free fn `Array` wrapping (`__derived__` → `prev_type[]`), derived-must-be-last + not-first, `1503` `Call`/`1969` `MethodCall` via `check_call_with_sig` (middle variadic `vda_count = args.len()-params.len()+1`, generic `...T` `where` via `check_generic_bounds`), `55` `Ty::Display` `Generic` `T<>` fix.
   - `compiler/src/codegen/mod.rs:900` `declare_function`/`214` `declare_class`/`500` `declare_extension`/`626` `declare_extern` (`...` alone `is_c_varargs` vs `...T vda`) `TyInfo` `Array` + `llvm_ty_for`/`llvm_ty_for_sema` element-aware `[16 x T]` (`string`→`ptr`, `int`→`i64`), `2746` `Call`/`2154` `MethodCall` array building (`[16 x T]` `insert_value` + middle variadic), `extern "c" printf(string)` → variadic `i32 (ptr, ...)` for `printInt`.
   - `examples/variadic.hlt` demonstrates `...int`/`...string`/`...T where T: int`/`... vda` derived/`...string vda, bool cond` middle.
-- **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok (incl. `variadic.hlt` `42 hi`/`10`/`a1`/`aab`), `/tmp/test_variadic1` derived-not-last → error, `/tmp/test_variadic3` derived-first → error, class `Logger.log`/`logDerived` ok, `extern printf(string)` still links.
+ - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok (incl. `variadic.hlt` `42 hi`/`10`/`a1`/`aab`), `/tmp/test_variadic1` derived-not-last → error, `/tmp/test_variadic3` derived-first → error, class `Logger.log`/`logDerived` ok, `extern printf(string)` still links.
 
-## Next — T-15
+## T-15 DONE — 2026-09-09 (structs visibility + default)
 
-- **T-15 Structs: field visibility + default `= expr`** — `struct` `field` `visibility` + `= expr`.
-- Continue `T-15`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `struct-member = [visibility] type ident ["=" expression]` per EBNF §24 `struct-declaration`.
+- **Done:**
+  - `compiler/src/ast.rs:188` `StructField {visibility, default: Option<Expr>}`.
+  - `compiler/src/parse/mod.rs:315` `parse_struct_decl` (`[vis] type ident [= expr]` via `parse_visibility` + `Eq` `parse_expr`) + `536` `parse_class_decl` class fields (`vis` `default`).
+  - `compiler/src/sema/mod.rs:106` `StructInfo {field_vis, field_defaults}` + `336` struct `fvis`/`fdefaults` + default type check + `448` class `fvis`/`fdefaults` + `800` `Typedef`/`Distinct` `value: public`; `1895` `StructLit` missing allowed if `field_defaults` has `Some` + `1815`/`2548` `MemberAccess`/`check_lvalue` private check (`struct` Default=public vs `class` Default=private) + `1924` literal private check.
+  - `compiler/src/codegen/mod.rs:31` `struct_field_defaults` + `161` `declare_struct`/`190` `declare_class` fill `defaults` + `3093` `StructLit` zero-init + `insert_value` for defaults.
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 7 ok, `/tmp/test_struct2.hlt` `User has name="alice"` → `age=30`/`score=100` defaults, `u2` override `25`/`200`, `/tmp/test_struct_private.hlt` `age private` → error `field is private`, missing without default → `missing field` error.
+
+## Next — T-17
+
+- **T-17 Match: `or` alternative chains, tuple-pattern `(a,b)`** — remaining.
+- Continue `T-17`..`T-21` per `TODO.md`, `holt build` + `cargo test` per item.
 

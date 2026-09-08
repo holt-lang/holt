@@ -330,20 +330,23 @@ impl Parser {
                 self.advance();
                 continue;
             }
+            let vis = self.parse_visibility();
             let ty = self.parse_type()?;
             let (fname, fspan) = self.parse_ident()?;
             let fend = fspan.end;
-            // optional initializer ignored for Phase 2 (not stored) — but consume if present
-            if self.consume_if(Token::Eq) {
-                let _ = self.parse_expr()?; // ignore default value for now
-            }
+            let default = if self.consume_if(Token::Eq) {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
             self.expect_terminator("struct field")?;
             let span = Span::new(ty.span().start, fend);
             fields.push(StructField {
                 ty,
                 name: fname,
                 name_span: fspan,
-                visibility: Visibility::Default,
+                visibility: vis,
+                default,
                 span,
             });
             self.consume_newlines();
@@ -884,10 +887,14 @@ impl Parser {
                 let ty = self.parse_type()?;
                 let (fname, fspan) = self.parse_ident()?;
                 let fend = fspan.end;
-                if self.consume_if(Token::Eq) { let _ = self.parse_expr()?; }
+                let default = if self.consume_if(Token::Eq) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
                 self.expect_terminator("class field")?;
                 let span = Span::new(ty.span().start, fend);
-                fields.push(StructField{ty, name: fname, name_span: fspan, visibility: vis, span});
+                fields.push(StructField{ty, name: fname, name_span: fspan, visibility: vis, default, span});
             }
             self.consume_newlines();
         }

@@ -37,6 +37,7 @@ pub struct Codegen<'ctx> {
     funcs: HashMap<String, (FunctionValue<'ctx>, TyInfo)>,
     struct_types: HashMap<String, StructType<'ctx>>,
     struct_fields: HashMap<String, HashMap<String, u32>>, // struct -> field -> index
+    struct_field_defaults: HashMap<String, HashMap<String, Expr>>, // struct -> field -> default expr (if any)
     enum_types: HashMap<String, StructType<'ctx>>,
     enum_variant_tags: HashMap<String, HashMap<String, u32>>,
     class_methods: HashMap<String, HashMap<String, (FunctionValue<'ctx>, TyInfo)>>,
@@ -77,6 +78,7 @@ impl<'ctx> Codegen<'ctx> {
             builder,
             vars: Vec::new(),
             globals: HashMap::new(),
+            struct_field_defaults: HashMap::new(),
             funcs: HashMap::new(),
             struct_types: HashMap::new(),
             struct_fields: HashMap::new(),
@@ -169,13 +171,18 @@ impl<'ctx> Codegen<'ctx> {
         // Collect field LLVM types
         let mut field_map = HashMap::new();
         let mut field_tys: Vec<BasicTypeEnum<'ctx>> = Vec::new();
+        let mut field_defaults = HashMap::new();
         for (idx, f) in s.fields.iter().enumerate() {
             let lty = self.llvm_ty_for(&f.ty);
             field_map.insert(f.name.clone(), idx as u32);
             field_tys.push(lty);
+            if let Some(def) = &f.default {
+                field_defaults.insert(f.name.clone(), def.clone());
+            }
         }
         opaque.set_body(&field_tys, false);
         self.struct_fields.insert(s.name.clone(), field_map);
+        self.struct_field_defaults.insert(s.name.clone(), field_defaults);
         Ok(())
     }
 
@@ -208,13 +215,28 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
         }
+        let mut field_defaults = HashMap::new();
+        // For extends, also copy parent defaults if any
+        if let Some(ref parent_ty) = c.extends {
+            if let Type::Named(pname, _) = parent_ty {
+                if let Some(parent_defaults) = self.struct_field_defaults.get(pname).cloned() {
+                    for (k, v) in parent_defaults {
+                        field_defaults.insert(k, v);
+                    }
+                }
+            }
+        }
         for f in c.fields.iter() {
             let lty = self.llvm_ty_for(&f.ty);
             field_map.insert(f.name.clone(), field_tys.len() as u32);
             field_tys.push(lty);
+            if let Some(def) = &f.default {
+                field_defaults.insert(f.name.clone(), def.clone());
+            }
         }
         opaque.set_body(&field_tys, false);
         self.struct_fields.insert(c.name.clone(), field_map);
+        self.struct_field_defaults.insert(c.name.clone(), field_defaults);
         // Declare methods
         let mut methods = HashMap::new();
         for m in &c.methods {
@@ -3088,6 +3110,8 @@ impl<'ctx> Codegen<'ctx> {
                 // Allocate temp struct on stack, fill fields, load aggregate value
                 let tmp =
                     self.builder.build_alloca(st, "struct.lit.tmp").unwrap();
+                // Zero-initialize to handle missing fields without default (undef would be bad)
+                self.builder.build_store(tmp, st.const_zero()).unwrap();
                 for (fname, _fspan, fexpr) in fields {
                     let idx = *field_map.get(fname).ok_or(CodegenError {
                         message: format!("unknown field {fname}"),
@@ -3099,6 +3123,20 @@ impl<'ctx> Codegen<'ctx> {
                         .build_struct_gep(st, tmp, idx, &format!("s.{}", fname))
                         .unwrap();
                     self.builder.build_store(field_ptr, val).unwrap();
+                }
+                // Fill missing fields with defaults if any
+                let provided: std::collections::HashSet<String> = fields.iter().map(|(n, _, _)| n.clone()).collect();
+                let defaults_opt = self.struct_field_defaults.get(&sname).cloned();
+                if let Some(defaults) = defaults_opt {
+                    for (fname, idx) in field_map.iter() {
+                        if !provided.contains(fname) {
+                            if let Some(def_expr) = defaults.get(fname) {
+                                let val = self.codegen_expr(def_expr)?;
+                                let field_ptr = self.builder.build_struct_gep(st, tmp, *idx, &format!("s.{}_default", fname)).unwrap();
+                                self.builder.build_store(field_ptr, val).unwrap();
+                            }
+                        }
+                    }
                 }
                 let loaded = self
                     .builder
