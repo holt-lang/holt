@@ -91,6 +91,8 @@ struct FuncSig {
     params: Vec<Ty>,
     param_modes: Vec<ParamMode>,
     param_names: Vec<String>,
+    generic_params: Vec<GenericParam>,
+    where_clause: Option<WhereClause>,
     span: Span,
 }
 
@@ -261,7 +263,7 @@ impl Checker {
             }
             if self.enums.contains_key(lookup) {
                 t = Ty::Enum(lookup.to_string());
-            } else if !self.structs.contains_key(lookup) && !self.classes.contains_key(lookup) {
+            } else if !self.structs.contains_key(lookup) && !self.classes.contains_key(lookup) && !self.traits.contains_key(lookup) {
                 // Check if it's generic param (single uppercase)
                 if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
                     t = Ty::Generic(n.clone(), vec![]);
@@ -273,7 +275,7 @@ impl Checker {
         // Handle Generic type
         if let Ty::Generic(ref n, ref args) = t {
             // Check base exists
-            if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+            if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
                 // Could be generic param itself, not base
                 if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
                     // Generic param, ok
@@ -286,7 +288,7 @@ impl Checker {
         match &t {
             Ty::Array(el) | Ty::Pointer(el) | Ty::Optional(el) => {
                 if let Ty::Struct(ref n) = **el {
-                    if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+                    if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
                         self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
                     }
                 }
@@ -294,13 +296,13 @@ impl Checker {
                     if !self.enums.contains_key(n) { self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()}); }
                 }
                 if let Ty::Generic(ref n, _) = **el {
-                    if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+                    if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
                         self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
                     }
                 }
             }
             Ty::Generic(n, args) => {
-                if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) {
+                if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
                     self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
                 }
                 for a in args { if let Ty::Struct(sn) = a { if !self.structs.contains_key(sn) && !self.classes.contains_key(sn) && !self.enums.contains_key(sn) { self.errors.push(SemError{message: format!("unknown type `{sn}`"), span: ty.span()}); } } }
@@ -393,7 +395,7 @@ impl Checker {
                             }).collect();
                             let param_modes: Vec<ParamMode> = m.params.iter().map(|p| p.mode).collect();
                             let ret_ty = self.resolve_type(&m.ret_ty);
-                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), span: m.name_span});
+                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), generic_params: m.generic_params.clone(), where_clause: m.where_clause.clone(), span: m.name_span});
                         }
                     }
                     self.traits.insert(t.name.clone(), TraitInfo{name: t.name.clone(), methods, span: t.span});
@@ -470,7 +472,7 @@ impl Checker {
                             let ret_ty = self.resolve_type(&m.ret_ty);
                             let mut pseen = HashSet::new();
                             for p in &m.params { if !pseen.insert(&p.name) { self.errors.push(SemError{message: format!("duplicate param `{}`", p.name), span: p.name_span}); } }
-                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), span: m.name_span});
+                            methods.insert(m.name.clone(), FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: m.params.iter().map(|p| p.name.clone()).collect(), generic_params: m.generic_params.clone(), where_clause: m.where_clause.clone(), span: m.name_span});
                             method_vis.insert(m.name.clone(), m.visibility);
                         }
                     }
@@ -504,7 +506,7 @@ impl Checker {
                         }
                         let param_modes: Vec<ParamMode> = ctor.params.iter().map(|p| p.mode).collect();
                         // constructors are void return
-                        ctor_sigs.push((FuncSig{ret: Ty::Void, params: param_tys, param_modes, param_names: ctor.params.iter().map(|p| p.name.clone()).collect(), span: ctor.name_span}, ctor.visibility));
+                        ctor_sigs.push((FuncSig{ret: Ty::Void, params: param_tys, param_modes, param_names: ctor.params.iter().map(|p| p.name.clone()).collect(), generic_params: Vec::new(), where_clause: None, span: ctor.name_span}, ctor.visibility));
                     }
                     // Validate destructors: name must match class name
                     for dtor in &c.destructors {
@@ -593,7 +595,7 @@ impl Checker {
                         let p_modes: Vec<ParamMode> = op.params.iter().map(|p| p.mode).collect();
                         // For MVP, assume operator returns int (or struct for + if class)
                         let ret = Ty::Int;
-                        op_map.insert(op.op.clone(), FuncSig{ret: ret.clone(), params: p_tys, param_modes: p_modes, param_names: op.params.iter().map(|p| p.name.clone()).collect(), span: op.span});
+                        op_map.insert(op.op.clone(), FuncSig{ret: ret.clone(), params: p_tys, param_modes: p_modes, param_names: op.params.iter().map(|p| p.name.clone()).collect(), generic_params: Vec::new(), where_clause: op.where_clause.clone(), span: op.span});
                     }
                     let mut conv_vec: Vec<(Ty, Ty, Span)> = Vec::new();
                     for conv in &c.conversions {
@@ -692,7 +694,7 @@ impl Checker {
                         let ret_ty = self.resolve_type(&f.ret_ty);
                         let param_tys: Vec<Ty> = f.params.iter().map(|p| self.resolve_type(&p.ty)).collect();
                         let param_modes: Vec<ParamMode> = f.params.iter().map(|p| p.mode).collect();
-                        let sig = FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: f.params.iter().map(|p| p.name.clone()).collect(), span: f.name_span};
+                        let sig = FuncSig{ret: ret_ty, params: param_tys, param_modes, param_names: f.params.iter().map(|p| p.name.clone()).collect(), generic_params: f.generic_params.clone(), where_clause: f.where_clause.clone(), span: f.name_span};
                         pending_ext.push((f.name.clone(), sig, f.visibility));
                     }
                 }
@@ -747,7 +749,7 @@ impl Checker {
                         let ret = self.resolve_type(ty);
                         let param_tys: Vec<Ty> = params.iter().map(|p| self.resolve_type(&p.ty)).collect();
                         let param_modes: Vec<ParamMode> = vec![ParamMode::None; param_tys.len()];
-                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, param_modes, param_names: params.iter().map(|p| p.name.clone()).collect(), span: *name_span});
+                        self.funcs.insert(name.clone(), FuncSig{ret, params: param_tys, param_modes, param_names: params.iter().map(|p| p.name.clone()).collect(), generic_params: Vec::new(), where_clause: None, span: *name_span});
                     }
                 }
             }
@@ -812,6 +814,8 @@ impl Checker {
                             params: param_tys,
                             param_modes,
                             param_names: f.params.iter().map(|p| p.name.clone()).collect(),
+                            generic_params: f.generic_params.clone(),
+                            where_clause: f.where_clause.clone(),
                             span: f.name_span,
                         },
                     );
@@ -1429,9 +1433,10 @@ impl Checker {
                 args,
                 type_args,
             } => {
-                // Handle generic function calls: substitute type args
+                // Handle generic function calls: substitute type args and check where bounds
                 if !type_args.is_empty() {
                     if let Some(func) = self.funcs.get(callee).cloned() {
+                        self.check_generic_bounds(&func.generic_params, &func.where_clause, type_args, *callee_span);
                         // Check if function has generic params
                         // For now, assume single generic T and single type arg
                         // Find the generic function decl to get its generic params
@@ -2147,6 +2152,83 @@ impl Checker {
                     ParamMode::Ref if !is_ref => self.errors.push(SemError { message: format!("argument {} of `{}` is `ref` param but call uses non-ref", i+1, callee), span: arg.span() }),
                     ParamMode::None if is_out || is_ref => self.errors.push(SemError { message: format!("argument {} of `{}` is by-value param but call uses `out`/`ref`", i+1, callee), span: arg.span() }),
                     _ => {}
+                }
+            }
+        }
+    }
+
+    fn check_generic_bounds(&mut self, generic_params: &[GenericParam], where_clause: &Option<WhereClause>, type_args: &[Type], span: Span) {
+        if generic_params.is_empty() && where_clause.is_none() {
+            if !type_args.is_empty() {
+                self.errors.push(SemError { message: format!("function is not generic but {} type arguments provided", type_args.len()), span });
+            }
+            return;
+        }
+        if generic_params.len() != type_args.len() {
+            if !type_args.is_empty() {
+                self.errors.push(SemError { message: format!("generic arg count mismatch: expected {}, found {}", generic_params.len(), type_args.len()), span });
+            }
+            return;
+        }
+        let mut subst: std::collections::HashMap<String, Ty> = std::collections::HashMap::new();
+        for (gp, ta) in generic_params.iter().zip(type_args.iter()) {
+            let concrete = self.resolve_type(ta);
+            subst.insert(gp.name.clone(), concrete.clone());
+            for bound in &gp.bounds {
+                let bound_ty = self.resolve_type(bound);
+                if let Ty::Struct(ref trait_name) | Ty::Generic(ref trait_name, _) = bound_ty {
+                    let concrete_str = match &concrete {
+                        Ty::Struct(n) | Ty::Enum(n) | Ty::Generic(n, _) => n.clone(),
+                        _ => concrete.to_string(),
+                    };
+                    if let Some(_trait_info) = self.traits.get(trait_name) {
+                        let implements = if let Some(cls) = self.classes.get(&concrete_str) {
+                            &cls.implements
+                        } else {
+                            &Vec::new()
+                        };
+                        if !implements.contains(trait_name) && concrete_str != *trait_name {
+                            self.errors.push(SemError { message: format!("type `{}` does not satisfy bound `{}` for `{}`", concrete, bound_ty, gp.name), span });
+                        }
+                    } else if !self.structs.contains_key(trait_name) && !self.classes.contains_key(trait_name) && !self.enums.contains_key(trait_name) {
+                        self.errors.push(SemError { message: format!("unknown bound `{}` for `{}`", bound_ty, gp.name), span });
+                    }
+                } else if bound_ty != concrete {
+                    self.errors.push(SemError { message: format!("type `{}` does not satisfy bound `{}` for `{}`", concrete, bound_ty, gp.name), span });
+                }
+            }
+        }
+        // Check where clause constraints: `where T: Drawable, U: int`
+        if let Some(wc) = where_clause {
+            for constr in &wc.constraints {
+                let subject_ty = self.resolve_type(&constr.ty);
+                // Resolve subject to concrete if it's a generic param
+                let subject_concrete = match &subject_ty {
+                    Ty::Generic(n, _) | Ty::Struct(n) if subst.contains_key(n) => subst[n].clone(),
+                    other => other.clone(),
+                };
+                for bound in &constr.bounds {
+                    let bound_ty = self.resolve_type(bound);
+                    if let Ty::Struct(ref trait_name) | Ty::Generic(ref trait_name, _) = bound_ty {
+                        if let Some(trait_info) = self.traits.get(trait_name) {
+                            let subject_str = match &subject_concrete {
+                                Ty::Struct(n) | Ty::Enum(n) | Ty::Generic(n, _) => n.clone(),
+                                _ => subject_concrete.to_string(),
+                            };
+                            let implements = if let Some(cls) = self.classes.get(&subject_str) {
+                                &cls.implements
+                            } else {
+                                &Vec::new()
+                            };
+                            if !implements.contains(trait_name) && subject_str != *trait_name {
+                                self.errors.push(SemError { message: format!("where bound failed: `{}` does not satisfy `{}: {}`", subject_concrete, constr.ty.name(), bound_ty), span: constr.span });
+                            }
+                        } else if bound_ty != subject_concrete {
+                            self.errors.push(SemError { message: format!("where bound failed: `{}` does not satisfy `{}: {}`", subject_concrete, constr.ty.name(), bound_ty), span: constr.span });
+                        }
+                    } else if bound_ty != subject_concrete {
+                        self.errors.push(SemError { message: format!("where bound failed: `{}` does not satisfy `{}: {}`", subject_concrete, constr.ty.name(), bound_ty), span: constr.span });
+                    }
                 }
             }
         }

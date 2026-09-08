@@ -260,6 +260,8 @@ pub struct TraitMethod {
     pub name_span: Span,
     pub params: Vec<Param>,
     pub is_sealed: bool,
+    pub generic_params: Vec<GenericParam>,
+    pub where_clause: Option<WhereClause>,
     pub span: Span,
 }
 

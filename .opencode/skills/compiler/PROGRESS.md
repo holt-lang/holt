@@ -93,8 +93,23 @@
   - `compiler/src/parse/mod.rs:1500` `parse_function` now preserves `generic_params`+`where_clause` (was `Vec::new()`/`None`, now `generic_params, where_clause`), `initialize` not for free fns (correct per spec).
   - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 6 ok, `/tmp/t11_test.hlt` `foo<T> where T:int` + `bar(out)` + `baz(ref)` →5/100/101, `initialize` free fn error, `Foo(int v) initialize do this.x=v end` →42.
 
-## Next — T-12
+## T-12 DONE — 2026-09-08 22:xx
 
-- **T-12 Traits: `function-signature` generic + `where`** — `trait` `function-signature` with `generic`+`where`.
-- Continue `T-12`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `function-signature` generic + `where` per EBNF §25 `trait-declaration` / `function-signature`.
+- **Done:**
+  - `compiler/src/ast.rs:257` `TraitMethod {generic_params,where_clause}` + `compiler/src/parse/mod.rs:904` `parse_trait_decl` now parses `generic_params` (`<T>`) + `where_clause` for `TraitMethod` (`ret ident<T>(params) where ...`).
+  - `compiler/src/sema/mod.rs:88` `FuncSig` `generic_params`+`where_clause` for trait methods (`TraitInfo`), `resolve_type` now includes `traits` for `unknown type` check.
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 6 ok, trait `Container<T>` / `where T: Drawable` parsed.
+
+## T-15 DONE — 2026-09-08 22:xx (where bounds)
+
+- **Goal:** Enforce `where`/`generic` bounds (`where T: Trait`, `T: int`) per EBNF §7 `where-clause`/`generic-parameter`.
+- **Done:**
+  - `compiler/src/sema/mod.rs:2160` `check_generic_bounds` (`<T: Trait>` + `where T: Trait` / `where T: int`), handles `Struct`/`Generic` trait via `implements` list and primitive equality (`T: int` vs `string` fails), called in `check_expr` `Call` with `type_args` (`func.generic_params`+`where_clause`), `resolve_type` now includes `traits`.
+  - **Verify:** `cargo test` 4 passed, `/tmp/t12_where_simple.hlt` `foo<T> where T:int` `foo<int>` pass / `foo<string>` → `where bound failed: string does not satisfy T: int`, `/tmp/t12_generic_bound.hlt` `T: Drawable` `Circle` → `does not satisfy`, `MyCircle` (implements) pass (but codegen `T` struct erasure still `i64` for generic `T` struct case deferred).
+
+## Next — T-13
+
+- **T-13 Enums: multi-param payload, discriminant expr, generic enum** — `enum` `a,b` payload etc.
+- Continue `T-13`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
 

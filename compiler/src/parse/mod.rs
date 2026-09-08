@@ -916,6 +916,7 @@ impl Parser {
             if self.peek_token() == Some(&Token::Sealed) { is_sealed = true; self.advance(); }
             let ret_ty = self.parse_type()?;
             let (mname, mspan) = self.parse_ident()?;
+            let generics = self.parse_generic_params_opt();
             self.expect(Token::LParen, "expected `(` for trait method")?;
             let mut params = Vec::new();
             if self.peek_token() != Some(&Token::RParen) {
@@ -928,9 +929,10 @@ impl Parser {
                 }
             }
             self.expect(Token::RParen, "expected `)` after trait params")?;
+            let where_clause = self.parse_where_clause_opt();
             self.expect_terminator("trait method")?;
             let span = Span::new(ret_ty.span().start, mspan.end);
-            methods.push(TraitMethod{ret_ty, name: mname, name_span: mspan, params, is_sealed, span});
+            methods.push(TraitMethod{ret_ty, name: mname, name_span: mspan, params, is_sealed, generic_params: generics, where_clause, span});
             self.consume_newlines();
         }
         let end = self.expect(Token::End, "expected `end` to close trait")?.span.end;
