@@ -22,6 +22,8 @@ struct Cli {
 enum Commands {
     /// Build a .hlt source file (lex → parse → check → codegen → link)
     Build(BuildArgs),
+    /// Build and run a .hlt source file, removing the binary afterwards
+    Run(RunArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -41,7 +43,7 @@ struct BuildArgs {
     #[arg(long, default_value_t = false)]
     keep_obj: bool,
 
-    /// Output executable path (default: <input>.out)
+    /// Output executable path (default: input file with extension stripped)
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -49,35 +51,155 @@ struct BuildArgs {
     #[arg(long, default_value_t = false)]
     print_ast: bool,
 
-    /// Show verbose progress (default: spinner + cargo-like lines)
+    /// Show verbose progress (default: single progress bar + summary lines)
     #[arg(long, default_value_t = false)]
     verbose: bool,
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
+    /// Source file (.hlt) to compile and run
+    file: PathBuf,
+
+    /// Keep object file (don't delete after linking)
+    #[arg(long, default_value_t = false)]
+    keep_obj: bool,
+
+    /// Print AST for debugging
+    #[arg(long, default_value_t = false)]
+    print_ast: bool,
+
+    /// Show verbose progress (default: single progress bar + summary lines)
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
+
+    /// Arguments forwarded to the program (use `--` to separate them)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    program_args: Vec<String>,
+}
+
+/// Shared knobs for the compile pipeline (used by both `build` and `run`).
+struct CompileOptions<'a> {
+    file: &'a Path,
+    emit_llvm: bool,
+    emit_llvm_file: Option<&'a Path>,
+    keep_obj: bool,
+    print_ast: bool,
+    verbose: bool,
+    exe_path: Option<PathBuf>,
 }
 
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Build(args) => run_build(args),
+        Commands::Run(args) => run_run(args),
     }
 }
 
-fn pb_spinner(msg: &str) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
+/// Single progress bar for the whole compile pipeline.
+///
+/// Created once per `build`/`run` invocation and advanced with
+/// `set_message` + `inc(1)` as each phase completes.
+fn new_progress_bar(total_steps: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total_steps);
     pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} {msg}")
-            .unwrap()
-            .tick_strings(&[
-                "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-            ]),
+        ProgressStyle::with_template(
+            "{spinner:.green} [{bar:30.cyan/blue}] {pos}/{len} {msg}",
+        )
+        .unwrap()
+        .tick_strings(&[
+            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+        ])
+        .progress_chars("#>-"),
     );
-    pb.set_message(msg.to_owned());
     pb.enable_steady_tick(Duration::from_millis(80));
     pb
 }
 
+fn fail_progress(pb: &ProgressBar, msg: &str) {
+    pb.abandon_with_message(msg.to_owned());
+}
+
 fn run_build(args: BuildArgs) -> miette::Result<()> {
-    let file = &args.file;
+    let opts = CompileOptions {
+        file: &args.file,
+        emit_llvm: args.emit_llvm,
+        emit_llvm_file: args.emit_llvm_file.as_deref(),
+        keep_obj: args.keep_obj,
+        print_ast: args.print_ast,
+        verbose: args.verbose,
+        exe_path: args.output.clone(),
+    };
+    let _ = compile(opts)?;
+    Ok(())
+}
+
+fn run_run(args: RunArgs) -> miette::Result<()> {
+    // Temp binary next to the source (same filesystem → cheap, executable bit
+    // preserved). Removed after the program finishes, even on failure.
+    let stem = args
+        .file
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "holt-run".to_string());
+    let tmp_exe = args.file.with_file_name(format!(
+        ".{}-run-{}",
+        stem,
+        std::process::id()
+    ));
+
+    let opts = CompileOptions {
+        file: &args.file,
+        emit_llvm: false,
+        emit_llvm_file: None,
+        keep_obj: args.keep_obj,
+        print_ast: args.print_ast,
+        verbose: args.verbose,
+        exe_path: Some(tmp_exe.clone()),
+    };
+    let built = compile(opts)?;
+    let exe = match built {
+        Some(p) => p,
+        None => return Ok(()), // empty program: nothing to run
+    };
+
+    // ── Run ──────────────────────────────────────────────────────────
+    eprintln!(
+        "{:>12} {}",
+        style("Running").green().bold(),
+        exe.display()
+    );
+    let status = Command::new(&exe)
+        .args(&args.program_args)
+        .status()
+        .map_err(|e| miette::miette!("failed to execute {}: {e}", exe.display()))?;
+    // Always clean up the generated binary.
+    let _ = fs::remove_file(&exe);
+
+    // Propagate the program's exit code so `holt run` behaves like the binary.
+    match status.code() {
+        Some(0) | None => {
+            if !status.success() {
+                // Killed by signal (Unix): surface as failure.
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Some(code) => std::process::exit(code),
+    }
+}
+
+/// Full pipeline: read → lex → parse → resolve → check → codegen/link.
+///
+/// Uses ONE progress bar for the whole process. Returns the executable path
+/// when a binary was produced, or `None` for `--emit-llvm` / empty programs.
+fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
+    let file = opts.file;
     let start_all = Instant::now();
+    // read, lex, parse, resolve, check, codegen/emit, link
+    let total_steps: u64 = if opts.emit_llvm { 6 } else { 7 };
+    let pb = new_progress_bar(total_steps);
 
     // Header like cargo: Compiling holt v0.1.0 (file)
     eprintln!(
@@ -89,22 +211,22 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
     );
 
     // ── Read ─────────────────────────────────────────────────────────
-    let pb = pb_spinner(&format!("Reading {}", file.display()));
+    pb.set_message(format!("Reading {}", file.display()));
     let source = fs::read_to_string(file).map_err(|e| {
-        pb.finish_and_clear();
+        fail_progress(&pb, "Reading failed");
         miette::miette!("failed to read {}: {e}", file.display())
     })?;
     let filename = file.display().to_string();
-    pb.finish_and_clear();
-    if args.verbose {
+    pb.inc(1);
+    if opts.verbose {
         eprintln!("{:>12} {} ({} bytes)", style("Reading").green().bold(), file.display(), source.len());
     }
 
     // ── Lex ──────────────────────────────────────────────────────────
-    let pb = pb_spinner("Lexing");
+    pb.set_message("Lexing");
     let t_lex = Instant::now();
     let out = lex(&source);
-    pb.finish_and_clear();
+    pb.inc(1);
     eprintln!(
         "{:>12} {} ({} tokens, {:?})",
         style("Lexing").green().bold(),
@@ -113,6 +235,7 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
         t_lex.elapsed()
     );
     if !out.errors.is_empty() {
+        fail_progress(&pb, "Lexing failed");
         let parts: Vec<(compiler::token::Span, String)> = out
             .errors
             .into_iter()
@@ -131,17 +254,18 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
         matches!(st.token, compiler::token::Token::Newline | compiler::token::Token::Semicolon)
     });
     if is_empty_program && out.tokens.is_empty() {
+        pb.finish_with_message("Finished (empty file)");
         eprintln!("{:>12} empty file", style("Finished").green().bold());
         println!("ok: {} — 0 tokens (empty file)", filename);
-        return Ok(());
+        return Ok(None);
     }
 
     // ── Parse ────────────────────────────────────────────────────────
-    let pb = pb_spinner("Parsing");
+    pb.set_message("Parsing");
     let t_parse = Instant::now();
     let program = match compiler::parse::parse(out.tokens.clone(), source.clone()) {
         Ok(p) => {
-            pb.finish_and_clear();
+            pb.inc(1);
             eprintln!(
                 "{:>12} ({} items, {:?})",
                 style("Parsing").green().bold(),
@@ -151,7 +275,7 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
             p
         }
         Err(e) => {
-            pb.finish_and_clear();
+            fail_progress(&pb, "Parsing failed");
             let diag = compiler::error::SingleDiagnostic::new(
                 filename.clone(),
                 source.clone(),
@@ -164,11 +288,11 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
     };
 
     // ── Import expansion ─────────────────────────────────────────────
-    let pb = pb_spinner("Resolving imports");
+    pb.set_message("Resolving imports");
     let t_import = Instant::now();
     let program = match expand_imports(program, file) {
         Ok(p) => {
-            pb.finish_and_clear();
+            pb.inc(1);
             eprintln!(
                 "{:>12} ({} items, {:?})",
                 style("Resolving").green().bold(),
@@ -178,7 +302,7 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
             p
         }
         Err(e) => {
-            pb.finish_and_clear();
+            fail_progress(&pb, "Resolving failed");
             let diag = compiler::error::SingleDiagnostic::new(
                 filename.clone(),
                 source.clone(),
@@ -189,16 +313,17 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
             std::process::exit(1);
         }
     };
-    if args.print_ast {
+    if opts.print_ast {
         println!("{:#?}", program);
     }
 
     // ── Sema ─────────────────────────────────────────────────────────
-    let pb = pb_spinner("Checking");
+    pb.set_message("Checking");
     let t_check = Instant::now();
     let sema_errors = compiler::sema::check(&program);
-    pb.finish_and_clear();
+    pb.inc(1);
     if !sema_errors.is_empty() {
+        fail_progress(&pb, "Checking failed");
         let parts: Vec<(compiler::token::Span, String)> = sema_errors
             .into_iter()
             .map(|e| (e.span, e.message))
@@ -219,44 +344,47 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
     );
 
     // ── Codegen ──────────────────────────────────────────────────────
-    if args.emit_llvm {
-        let pb = pb_spinner("Emitting LLVM IR");
+    if opts.emit_llvm {
+        pb.set_message("Emitting LLVM IR");
         let t_ir = Instant::now();
-        let ir = generate_ir_string(&program)?;
-        pb.finish_and_clear();
+        let ir = match generate_ir_string(&program) {
+            Ok(ir) => ir,
+            Err(e) => {
+                fail_progress(&pb, "Emitting failed");
+                return Err(e);
+            }
+        };
+        pb.inc(1);
         eprintln!(
             "{:>12} ({:?})",
             style("Emitting").green().bold(),
             t_ir.elapsed()
         );
-        if let Some(path) = &args.emit_llvm_file {
+        if let Some(path) = opts.emit_llvm_file {
             fs::write(path, &ir).map_err(|e| miette::miette!("failed to write IR: {e}"))?;
             eprintln!("{:>12} {}", style("Wrote").green().bold(), path.display());
         } else {
             println!("{ir}");
         }
+        pb.finish_with_message("Finished");
         eprintln!(
             "{:>12} in {:?}",
             style("Finished").green().bold(),
             start_all.elapsed()
         );
-        return Ok(());
+        return Ok(None);
     }
 
-    let obj_path = if let Some(o) = &args.output {
-        let mut p = o.clone();
-        p.set_extension("o");
-        p
-    } else {
-        let mut p = file.clone();
-        p.set_extension("o");
-        p
-    };
+    let exe_path = default_exe_path(file, opts.exe_path.clone());
+    let obj_path = obj_path_for_exe(&exe_path);
 
-    let pb = pb_spinner("Codegen");
+    pb.set_message("Codegen");
     let t_cg = Instant::now();
-    codegen_to_object(&program, &obj_path, &filename, &source)?;
-    pb.finish_and_clear();
+    codegen_to_object(&program, &obj_path, &filename, &source).map_err(|e| {
+        fail_progress(&pb, "Codegen failed");
+        e
+    })?;
+    pb.inc(1);
     eprintln!(
         "{:>12} {} ({:?})",
         style("Codegen").green().bold(),
@@ -265,25 +393,22 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
     );
 
     // ── Link ─────────────────────────────────────────────────────────
-    let exe_path = args.output.clone().unwrap_or_else(|| {
-        let mut p = file.clone();
-        p.set_extension("");
-        let name = p.file_name().unwrap().to_string_lossy().to_string() + ".out";
-        p.with_file_name(name)
-    });
-
-    let pb = pb_spinner(&format!("Linking {}", exe_path.display()));
+    pb.set_message(format!("Linking {}", exe_path.display()));
     let t_link = Instant::now();
     let status = Command::new("clang")
         .arg(&obj_path)
         .arg("-o")
         .arg(&exe_path)
         .status()
-        .map_err(|e| miette::miette!("failed to invoke clang: {e} — is Xcode CLT installed?"))?;
-    pb.finish_and_clear();
+        .map_err(|e| {
+            fail_progress(&pb, "Linking failed");
+            miette::miette!("failed to invoke clang: {e} — is Xcode CLT installed?")
+        })?;
     if !status.success() {
+        fail_progress(&pb, "Linking failed");
         return Err(miette::miette!("linking failed with clang"));
     }
+    pb.inc(1);
     eprintln!(
         "{:>12} {} ({:?})",
         style("Linking").green().bold(),
@@ -291,10 +416,11 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
         t_link.elapsed()
     );
 
-    if !args.keep_obj {
+    if !opts.keep_obj {
         let _ = fs::remove_file(&obj_path);
     }
 
+    pb.finish_with_message("Finished");
     eprintln!(
         "{:>12} {} → {} in {:?}",
         style("Finished").green().bold(),
@@ -302,7 +428,7 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
         exe_path.display(),
         start_all.elapsed()
     );
-    Ok(())
+    Ok(Some(exe_path))
 }
 
 fn generate_ir_string(program: &compiler::ast::Program) -> miette::Result<String> {
@@ -334,9 +460,40 @@ fn codegen_to_object(
             msg,
         );
         eprintln!("{:?}", Report::new(diag));
-        std::process::exit(1);
+        // Return an error (instead of exiting here) so the caller can
+        // abandon the shared progress bar before exiting.
+        return Err(miette::miette!("codegen failed"));
     }
     Ok(())
+}
+
+/// Default executable path: the input file with its extension stripped
+/// (`examples/hello.hlt` → `examples/hello`), i.e. a proper binary with no
+/// `.out` suffix. An explicit `-o/--output` is used verbatim.
+fn default_exe_path(input: &Path, override_: Option<PathBuf>) -> PathBuf {
+    if let Some(o) = override_ {
+        return o;
+    }
+    let mut p = input.to_path_buf();
+    // Strip only a real extension (e.g. `.hlt`); extensionless input stays as-is.
+    if input.extension().is_some() {
+        p.set_extension("");
+    }
+    p
+}
+
+/// Object path derived from the executable path, guaranteed not to collide
+/// with the exe itself (e.g. `-o foo.o` → `foo.obj.o` instead of `foo.o`).
+fn obj_path_for_exe(exe: &Path) -> PathBuf {
+    if exe.extension().is_some_and(|e| e == "o") {
+        let mut p = exe.to_path_buf();
+        p.set_extension("obj.o");
+        p
+    } else {
+        let mut p = exe.to_path_buf();
+        p.set_extension("o");
+        p
+    }
 }
 
 fn find_stdlib_root(start: &Path) -> Option<PathBuf> {
