@@ -85,8 +85,16 @@
   - `compiler/src/codegen/mod.rs:860` `get_or_declare_abort`, `1529` `Stmt::Assert` ( `cond` `conditional_branch`, `assert.ok`/`fail` blocks, `puts`/`printf` for message, `abort` + `unreachable`).
   - **Verify:** `cargo test` 4 passed, `cargo check` 0 errors, `holt build examples/*.hlt` 6 ok, `/tmp/t10_test.hlt` `assert x is 5` ok 5, `/tmp/t10_fail.hlt` `assert x is 10` → message `x should be 10` + abort 134, `/tmp/t10_fail2.hlt` `assert false` → `assertion failed` + abort 134.
 
-## Next — T-11
+## T-11 DONE — 2026-09-08 22:xx (adjusted: `initialize` is constructor-only)
 
-- **T-11 Functions: `ref`/`out` params, `initialize;` for free fns, preserve `generic+where`** — `ref`/`out` already for `T-5`, now `initialize;`.
-- Continue `T-11`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
+- **Goal:** `ref`/`out` params for free fns + preserve `generic+where` for free fns; `initialize` is *only* for `constructor-declaration` per EBNF §21 (`parse_class_decl:457` `initialize` + `ast.rs:207` `ConstructorDecl`), not free `function-declaration` (verified `int foo() initialize;` → `expected do`).
+- **Done:**
+  - `compiler/src/ast.rs:74` `ParamMode` already for `T-5` (`parse_param` + `declare_function` ptr + `codegen_function`).
+  - `compiler/src/parse/mod.rs:1500` `parse_function` now preserves `generic_params`+`where_clause` (was `Vec::new()`/`None`, now `generic_params, where_clause`), `initialize` not for free fns (correct per spec).
+  - **Verify:** `cargo test` 4 passed, `holt build examples/*.hlt` 6 ok, `/tmp/t11_test.hlt` `foo<T> where T:int` + `bar(out)` + `baz(ref)` →5/100/101, `initialize` free fn error, `Foo(int v) initialize do this.x=v end` →42.
+
+## Next — T-12
+
+- **T-12 Traits: `function-signature` generic + `where`** — `trait` `function-signature` with `generic`+`where`.
+- Continue `T-12`..`T-20` per `TODO.md`, `holt build` + `cargo test` per item.
 

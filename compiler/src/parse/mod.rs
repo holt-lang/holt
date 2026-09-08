@@ -1514,7 +1514,7 @@ impl Parser {
         }
         self.expect(Token::RParen, "closing `)`")?;
         let where_clause = self.parse_where_clause_opt();
-        // function body: block (do ... end) or initialize? For free functions only block
+        // function body: block (do ... end) - `initialize` is constructor-only, not free fns
         let body = self.parse_block()?;
         let span = Span::new(start_span.start, body.span.end);
         Ok(Function {
@@ -1528,8 +1528,8 @@ impl Parser {
             is_sealed,
             is_override,
             is_open,
-            generic_params: Vec::new(),
-            where_clause: None,
+            generic_params,
+            where_clause,
             span,
         })
     }
