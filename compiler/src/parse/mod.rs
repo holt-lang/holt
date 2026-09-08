@@ -2926,8 +2926,26 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
-        // Simple Phase 2: `_`, int lit, bool lit
-        // Handle alternative `|`? For now handle single primary, but consume `|` chains by taking first only
+        // pattern-alternative: pattern-primary { ("|" | "or") pattern-primary }
+        let first = self.parse_pattern_primary()?;
+        let mut alts = vec![first];
+        let mut span_start = alts[0].span().start;
+        let mut span_end = alts[0].span().end;
+        while matches!(self.peek_token(), Some(Token::Pipe) | Some(Token::Or)) {
+            self.advance(); // consume `|` or `or`
+            let next = self.parse_pattern_primary()?;
+            span_end = next.span().end;
+            alts.push(next);
+        }
+        if alts.len() == 1 {
+            Ok(alts.into_iter().next().unwrap())
+        } else {
+            let span = Span::new(span_start, span_end);
+            Ok(Pattern::Alternative(alts, span))
+        }
+    }
+
+    fn parse_pattern_primary(&mut self) -> Result<Pattern, ParseError> {
         let st = self.peek().cloned().ok_or(ParseError {
             message: "expected pattern".into(),
             span: Span::new(self.source.len(), self.source.len()),
@@ -2957,7 +2975,55 @@ impl Parser {
                     self.advance();
                     Ok(Pattern::Wildcard(st.span))
                 } else {
+                    // Check for qualified enum pattern `Option.Some` or `a::b::Variant`? For now treat as Var,
+                    // but if next is `.` Variant, handle as enum-pattern with qualified prefix
+                    // Lookahead for qualified `::` or `.` enum pattern
+                    let save = self.pos;
+                    // Try to parse qualified-name "." identifier "(" pattern-list ")"
+                    // We already consumed first ident as potential var, but we can check if next is `::` or `.`
+                    // For simplicity, if next is `::`, treat as qualified var (for now just consume and return Var with qualified name)
+                    // If next is `.` and after that is ident, it's an enum pattern with qualified prefix like `Option.Some`
+                    // We'll handle that here
                     self.advance();
+                    let mut name = s.clone();
+                    let mut end = st.span.end;
+                    // Handle `::` qualified continuation (e.g., `std::io::Var`)
+                    while self.peek_token() == Some(&Token::ColonColon) {
+                        self.advance(); // ::
+                        let (seg, sspan) = self.parse_ident()?;
+                        name.push_str("::");
+                        name.push_str(&seg);
+                        end = sspan.end;
+                    }
+                    // Check for enum pattern `.Variant` with qualified prefix
+                    if self.peek_token() == Some(&Token::Dot) {
+                        self.advance(); // .
+                        let (vname, vspan) = self.parse_ident()?;
+                        let payload = if self.peek_token() == Some(&Token::LParen) {
+                            self.advance();
+                            let mut pats = Vec::new();
+                            if self.peek_token() != Some(&Token::RParen) {
+                                loop {
+                                    pats.push(self.parse_pattern()?);
+                                    if !self.consume_if(Token::Comma) { break; }
+                                    if self.peek_token() == Some(&Token::RParen) { break; }
+                                }
+                            }
+                            self.expect(Token::RParen, "expected `)` after enum payload pattern")?;
+                            if pats.is_empty() { None } else { Some(pats) }
+                        } else { None };
+                        // This is an enum pattern like `Option::Some` or `MyEnum.Variant`; treat as Enum with qualified variant
+                        // For now, store variant as `name.variant`? But Pattern::Enum only has variant, not enum_name.
+                        // We'll store the full qualified variant name as variant and keep original span
+                        let full_variant = format!("{}::{}", name, vname);
+                        // Use the variant's span for now, but keep payload
+                        return Ok(Pattern::Enum{variant: full_variant, variant_span: vspan, payload});
+                    }
+                    // If we consumed `::` qualifiers, return Var with qualified name
+                    if name != s {
+                        let span = Span::new(st.span.start, end);
+                        return Ok(Pattern::Var(name, span));
+                    }
                     Ok(Pattern::Var(s, st.span))
                 }
             }
@@ -2973,6 +3039,39 @@ impl Parser {
             Token::False => {
                 self.advance();
                 Ok(Pattern::LitBool(false, st.span))
+            }
+            Token::LParen => {
+                // tuple-pattern: "(" pattern { "," pattern } [","] ")"
+                let start = st.span.start;
+                self.advance(); // (
+                // Handle empty tuple `()` as Tuple with 0 elements? But EBNF requires at least one pattern for tuple-pattern with parens? For match, `()` could be unit.
+                // If next is `)`, treat as empty tuple
+                if self.peek_token() == Some(&Token::RParen) {
+                    let end = self.advance().unwrap().span.end;
+                    return Ok(Pattern::Tuple(vec![], Span::new(start, end)));
+                }
+                let first = self.parse_pattern()?;
+                let mut pats = vec![first];
+                // Check if this is a tuple (has `,`) or just parenthesized single pattern
+                let mut is_tuple = false;
+                while self.peek_token() == Some(&Token::Comma) {
+                    self.advance(); // ,
+                    is_tuple = true;
+                    if self.peek_token() == Some(&Token::RParen) {
+                        break; // trailing comma
+                    }
+                    pats.push(self.parse_pattern()?);
+                }
+                let end = self.expect(Token::RParen, "expected `)` after tuple pattern")?.span.end;
+                let span = Span::new(start, end);
+                if is_tuple || pats.len() > 1 {
+                    Ok(Pattern::Tuple(pats, span))
+                } else {
+                    // Single pattern in parens without comma: treat as just the inner pattern (parenthesized)
+                    // But to preserve EBNF tuple-pattern with one element and no comma would be `(a)` which is not a tuple, just `a`
+                    // Return the inner pattern directly
+                    Ok(pats.into_iter().next().unwrap())
+                }
             }
             _ => Err(ParseError {
                 message: format!("expected pattern, found `{}`", st.token),

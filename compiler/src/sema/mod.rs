@@ -2115,11 +2115,12 @@ impl Checker {
             }
             ExprKind::Match(m) => {
                 let scrut_ty = self.check_expr(&m.scrutinee);
-                // scrutinee must be int or bool for Phase 2 simple
+                // scrutinee must be int/bool/enum/struct/tuple
                 if scrut_ty != Ty::Int
                     && scrut_ty != Ty::Bool
                     && !matches!(scrut_ty, Ty::Struct(_))
                     && !matches!(scrut_ty, Ty::Enum(_))
+                    && !matches!(scrut_ty, Ty::Tuple(_))
                 {
                     self.errors.push(SemError{message: format!("match scrutinee must be `int`/`bool`/`enum`, found `{scrut_ty}`"), span: m.scrutinee.span});
                 }
@@ -2152,6 +2153,52 @@ impl Checker {
                             }
                         }
                         Pattern::Var(_, _) => { has_wildcard = true; arm_has_wildcard = true; }
+                        Pattern::Alternative(pats, span) => {
+                            // `a | b` or `a or b` : each alternative must match scrutinee type
+                            if pats.is_empty() {
+                                self.errors.push(SemError{message: "empty alternative pattern".into(), span: *span});
+                            }
+                            let mut any_wildcard = false;
+                            for pat in pats {
+                                match pat {
+                                    Pattern::Wildcard(_) => any_wildcard = true,
+                                    Pattern::Var(_, _) => any_wildcard = true,
+                                    Pattern::LitInt(_, s) => if scrut_ty != Ty::Int { self.errors.push(SemError{message: format!("pattern `int` mismatches scrutinee `{scrut_ty}`"), span: *s}); },
+                                    Pattern::LitBool(_, s) => if scrut_ty != Ty::Bool { self.errors.push(SemError{message: format!("pattern `bool` mismatches scrutinee `{scrut_ty}`"), span: *s}); },
+                                    Pattern::Enum{variant, variant_span, ..} => {
+                                        if !matches!(scrut_ty, Ty::Enum(_)) {
+                                            self.errors.push(SemError{message: format!("enum pattern on non-enum scrutinee `{}`", scrut_ty), span: *variant_span});
+                                        }
+                                    }
+                                    Pattern::Tuple(_, s) => {
+                                        if !matches!(scrut_ty, Ty::Tuple(_)) {
+                                            self.errors.push(SemError{message: format!("tuple pattern on non-tuple scrutinee `{}`", scrut_ty), span: *s});
+                                        }
+                                    }
+                                    Pattern::Alternative(_, _) => {},
+                                }
+                            }
+                            if any_wildcard { has_wildcard = true; arm_has_wildcard = true; }
+                        }
+                        Pattern::Tuple(pats, span) => {
+                            if let Ty::Tuple(tys) = &scrut_ty {
+                                if pats.len() != tys.len() {
+                                    self.errors.push(SemError{message: format!("tuple pattern expects {} elements, found {} (scrutinee `{}`)", tys.len(), pats.len(), scrut_ty), span: *span});
+                                } else {
+                                    for (pat, ty) in pats.iter().zip(tys.iter()) {
+                                        match pat {
+                                            Pattern::Wildcard(_) => {},
+                                            Pattern::Var(_, _) => {},
+                                            Pattern::LitInt(_, s) => if *ty != Ty::Int { self.errors.push(SemError{message: format!("tuple element expects `int`, found `{}`", ty), span: *s}); },
+                                            Pattern::LitBool(_, s) => if *ty != Ty::Bool { self.errors.push(SemError{message: format!("tuple element expects `bool`, found `{}`", ty), span: *s}); },
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            } else {
+                                self.errors.push(SemError{message: format!("tuple pattern on non-tuple scrutinee `{}`", scrut_ty), span: *span});
+                            }
+                        }
                         Pattern::Enum{variant, variant_span, payload} => {
                             if let Ty::Enum(ref ename) = scrut_ty {
                                 if let Some(einfo) = self.enums.get(ename).cloned() {
@@ -2204,6 +2251,49 @@ impl Checker {
                         Pattern::Var(name, span) => {
                             self.declare_var(name, scrut_ty.clone(), *span);
                         }
+                        Pattern::Alternative(pats, _) => {
+                            // For `a | b` or `a or b`, bind vars from first Var alternative if any
+                            for pat in pats {
+                                match pat {
+                                    Pattern::Var(name, span) => { self.declare_var(name, scrut_ty.clone(), *span); break; },
+                                    Pattern::Tuple(subs, _) => {
+                                        if let Ty::Tuple(tys) = &scrut_ty {
+                                            for (spat, ty) in subs.iter().zip(tys.iter()) {
+                                                if let Pattern::Var(n, s) = spat { self.declare_var(n, ty.clone(), *s); }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    Pattern::Enum{ payload: Some(subs), variant, ..} => {
+                                        if let Ty::Enum(ref ename) = scrut_ty {
+                                            if let Some(payload_tys) = self.enums.get(ename).and_then(|einfo| einfo.variant_map.get(variant).map(|(_, v)| v.clone())) {
+                                                for (spat, ty) in subs.iter().zip(payload_tys.iter()) {
+                                                    if let Pattern::Var(n, s) = spat { self.declare_var(n, ty.clone(), *s); }
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Pattern::Tuple(pats, _) => {
+                            if let Ty::Tuple(tys) = &scrut_ty {
+                                for (pat, ty) in pats.iter().zip(tys.iter()) {
+                                    if let Pattern::Var(n, s) = pat {
+                                        self.declare_var(n, ty.clone(), *s);
+                                    } else if let Pattern::Tuple(inner, _) = pat {
+                                        // nested tuple like ((a,b), c) - not common, ignore for now
+                                        if let Ty::Tuple(inner_tys) = ty {
+                                            for (ipat, ity) in inner.iter().zip(inner_tys.iter()) {
+                                                if let Pattern::Var(n2, s2) = ipat { self.declare_var(n2, ity.clone(), *s2); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Pattern::Enum{ payload: Some(pats), variant, ..} => {
                             if pats.len() == 1 {
                                 if let Pattern::Var(vname, vspan) = &pats[0] {
@@ -2214,6 +2304,17 @@ impl Checker {
                                             }
                                         }
                                     }
+                                } else if let Pattern::Tuple(subs, _) = &pats[0] {
+                                    // Enum payload is tuple e.g., `MyVariant((a,b))` where payload is one tuple
+                                    if let Ty::Enum(ref ename) = scrut_ty {
+                                        if let Some(payload_tys) = self.enums.get(ename).and_then(|einfo| einfo.variant_map.get(variant).map(|(_, v)| v.clone())) {
+                                            if let Some(Ty::Tuple(tys)) = payload_tys.first() {
+                                                for (spat, ty) in subs.iter().zip(tys.iter()) {
+                                                    if let Pattern::Var(n, s) = spat { self.declare_var(n, ty.clone(), *s); }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
                                 if let Ty::Enum(ref ename) = scrut_ty {
@@ -2221,6 +2322,12 @@ impl Checker {
                                         for (pat, ty) in pats.iter().zip(payload_tys.iter()) {
                                             if let Pattern::Var(vname, vspan) = pat {
                                                 self.declare_var(vname, ty.clone(), *vspan);
+                                            } else if let Pattern::Tuple(subs, _) = pat {
+                                                if let Ty::Tuple(tys) = ty {
+                                                    for (spat, sty) in subs.iter().zip(tys.iter()) {
+                                                        if let Pattern::Var(n, s) = spat { self.declare_var(n, sty.clone(), *s); }
+                                                    }
+                                                }
                                             }
                                         }
                                     }

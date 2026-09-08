@@ -2,7 +2,8 @@
 (* Holt Language Specification                                      *)
 (* Draft 0.2 — updated for Phase 5 fixes: accessors public by       *)
 (* default, separate get/set merging, `open` class-only, omitted    *)
-(* `Type` in `has` literals                                        *)
+(* `Type` in `has` literals, T-17: `|`/`or` alternative chains +    *)
+(* tuple-pattern `(a,b)` in `match`                                *)
 (* ================================================================ *)
 
 (* ---------------------------------------------------------------- *)
@@ -604,7 +605,8 @@ pattern =
     pattern-alternative ;
 
 pattern-alternative =
-    pattern-primary , { "|" , pattern-primary } ;
+    pattern-primary , { ( "|" | "or" ) , pattern-primary } ;
+    (* `or` keyword is an alias for `|` in patterns: `1 | 2` ≡ `1 or 2` *)
 
 pattern-primary =
       "_"

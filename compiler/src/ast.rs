@@ -723,6 +723,22 @@ pub enum Pattern {
         variant_span: Span,
         payload: Option<Vec<Pattern>>,
     },
+    Tuple(Vec<Pattern>, Span), // (a, b, ...)
+    Alternative(Vec<Pattern>, Span), // a | b | c  or  a or b
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Wildcard(s) => *s,
+            Pattern::Var(_, s) => *s,
+            Pattern::LitInt(_, s) => *s,
+            Pattern::LitBool(_, s) => *s,
+            Pattern::Enum{variant_span, ..} => *variant_span,
+            Pattern::Tuple(_, s) => *s,
+            Pattern::Alternative(_, s) => *s,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

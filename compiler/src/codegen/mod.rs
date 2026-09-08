@@ -3303,7 +3303,11 @@ impl<'ctx> Codegen<'ctx> {
             // Emit pattern check in cur_check_bb
             self.builder.position_at_end(cur_check_bb);
             // pattern match value (i1)
-            let pattern_is_wild = matches!(arm.pattern, Pattern::Wildcard(_)) || matches!(arm.pattern, Pattern::Var(_, _));
+            let pattern_is_wild = match &arm.pattern {
+                Pattern::Wildcard(_) | Pattern::Var(_, _) => true,
+                Pattern::Alternative(pats, _) => pats.iter().any(|p| matches!(p, Pattern::Wildcard(_) | Pattern::Var(_, _))),
+                _ => false,
+            };
             let pattern_val: inkwell::values::IntValue<'ctx> =
                 if pattern_is_wild {
                     self.context.bool_type().const_int(1, false)
@@ -3339,6 +3343,131 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Pattern::Wildcard(_) => unreachable!(),
                         Pattern::Var(_, _) => unreachable!(),
+                        Pattern::Alternative(pats, _) => {
+                            // `a | b` or `a or b` : OR of each alternative's check
+                            let mut or_val: Option<inkwell::values::IntValue<'ctx>> = None;
+                            for pat in pats {
+                                let check = match pat {
+                                    Pattern::LitInt(v, _) => {
+                                        let lit = self.context.i64_type().const_int(*v as u64, true);
+                                        self.builder.build_int_compare(IntPredicate::EQ, scrut_val.into_int_value(), lit, "match.alt").unwrap()
+                                    }
+                                    Pattern::LitBool(b, _) => {
+                                        let lit = self.context.bool_type().const_int(if *b {1} else {0}, false);
+                                        self.builder.build_int_compare(IntPredicate::EQ, scrut_val.into_int_value(), lit, "match.alt").unwrap()
+                                    }
+                                    Pattern::Wildcard(_) | Pattern::Var(_, _) => self.context.bool_type().const_int(1, false),
+                                    Pattern::Enum{variant, payload, ..} => {
+                                        let ename = match self.infer_expr_ty(&m.scrutinee).unwrap() {
+                                            crate::sema::Ty::Enum(ref n) => n.clone(),
+                                            _ => panic!("enum pattern on non-enum"),
+                                        };
+                                        let tag_map = self.enum_variant_tags.get(&ename).unwrap();
+                                        let tag = *tag_map.get(variant).unwrap() as u64;
+                                        let tag_lit = self.context.i32_type().const_int(tag, false);
+                                        let enum_tag = self.builder.build_extract_value(scrut_val.into_struct_value(), 0, "enum.tag.alt").unwrap().into_int_value();
+                                        let tag_eq = self.builder.build_int_compare(IntPredicate::EQ, enum_tag, tag_lit, "match.enum.tag.alt").unwrap();
+                                        if let Some(p) = payload {
+                                            if p.len() == 1 {
+                                                let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.alt").unwrap();
+                                                match &p[0] {
+                                                    Pattern::LitInt(v2, _) => {
+                                                        let lit2 = self.context.i64_type().const_int(*v2 as u64, true);
+                                                        let inner = self.builder.build_int_compare(IntPredicate::EQ, payload_val.into_int_value(), lit2, "match.alt.payload").unwrap();
+                                                        self.builder.build_and(tag_eq, inner, "match.alt.and").unwrap()
+                                                    }
+                                                    _ => tag_eq,
+                                                }
+                                            } else { tag_eq }
+                                        } else { tag_eq }
+                                    }
+                                    Pattern::Tuple(subs, _) => {
+                                        // For tuple alternative like `(1,2) | (3,4)`, check each tuple
+                                        if let Ok(tuple_ty) = self.infer_expr_ty(&m.scrutinee) {
+                                            if let crate::sema::Ty::Tuple(tys) = tuple_ty {
+                                                let mut and_val: Option<inkwell::values::IntValue<'ctx>> = None;
+                                                for (i, subpat) in subs.iter().enumerate() {
+                                                    let elem_val = self.builder.build_extract_value(scrut_val.into_struct_value(), i as u32, "tuple.alt.elem").unwrap();
+                                                    let elem_check = match subpat {
+                                                        Pattern::Wildcard(_) | Pattern::Var(_, _) => self.context.bool_type().const_int(1, false),
+                                                        Pattern::LitInt(v2, _) => {
+                                                            let lit2 = self.context.i64_type().const_int(*v2 as u64, true);
+                                                            self.builder.build_int_compare(IntPredicate::EQ, elem_val.into_int_value(), lit2, "tuple.alt.lit").unwrap()
+                                                        }
+                                                        Pattern::LitBool(b2, _) => {
+                                                            let lit2 = self.context.bool_type().const_int(if *b2 {1} else {0}, false);
+                                                            self.builder.build_int_compare(IntPredicate::EQ, elem_val.into_int_value(), lit2, "tuple.alt.lit").unwrap()
+                                                        }
+                                                        _ => self.context.bool_type().const_int(1, false),
+                                                    };
+                                                    and_val = Some(match and_val {
+                                                        Some(prev) => self.builder.build_and(prev, elem_check, "tuple.alt.and").unwrap(),
+                                                        None => elem_check,
+                                                    });
+                                                }
+                                                and_val.unwrap_or_else(|| self.context.bool_type().const_int(1, false))
+                                            } else { self.context.bool_type().const_int(0, false) }
+                                        } else { self.context.bool_type().const_int(0, false) }
+                                    }
+                                    Pattern::Alternative(_, _) => self.context.bool_type().const_int(1, false),
+                                };
+                                or_val = Some(match or_val {
+                                    Some(prev) => self.builder.build_or(prev, check, "match.alt.or").unwrap(),
+                                    None => check,
+                                });
+                            }
+                            or_val.unwrap_or_else(|| self.context.bool_type().const_int(0, false))
+                        }
+                        Pattern::Tuple(pats, _) => {
+                            // `(a, b)` where scrutinee is tuple: AND of each element's check
+                            let mut and_val: Option<inkwell::values::IntValue<'ctx>> = None;
+                            for (i, pat) in pats.iter().enumerate() {
+                                let elem_val = self.builder.build_extract_value(scrut_val.into_struct_value(), i as u32, "tuple.elem").unwrap();
+                                let elem_check = match pat {
+                                    Pattern::Wildcard(_) | Pattern::Var(_, _) => self.context.bool_type().const_int(1, false),
+                                    Pattern::LitInt(v, _) => {
+                                        let lit = self.context.i64_type().const_int(*v as u64, true);
+                                        self.builder.build_int_compare(IntPredicate::EQ, elem_val.into_int_value(), lit, "tuple.pat").unwrap()
+                                    }
+                                    Pattern::LitBool(b, _) => {
+                                        let lit = self.context.bool_type().const_int(if *b {1} else {0}, false);
+                                        self.builder.build_int_compare(IntPredicate::EQ, elem_val.into_int_value(), lit, "tuple.pat").unwrap()
+                                    }
+                                    Pattern::Enum{variant, ..} => {
+                                        // Tuple element is enum: check tag
+                                        if let Ok(crate::sema::Ty::Enum(ref ename)) = self.infer_expr_ty(&crate::ast::Expr{kind: crate::ast::ExprKind::Tuple(vec![]), span: pat.span()}) {
+                                            // Not needed for now, just true
+                                            self.context.bool_type().const_int(1, false)
+                                        } else {
+                                            self.context.bool_type().const_int(1, false)
+                                        }
+                                    }
+                                    Pattern::Tuple(_, _) => self.context.bool_type().const_int(1, false),
+                                    Pattern::Alternative(alts, _) => {
+                                        let mut or2: Option<inkwell::values::IntValue<'ctx>> = None;
+                                        for alt in alts {
+                                            let alt_check = match alt {
+                                                Pattern::LitInt(v2, _) => {
+                                                    let lit2 = self.context.i64_type().const_int(*v2 as u64, true);
+                                                    self.builder.build_int_compare(IntPredicate::EQ, elem_val.into_int_value(), lit2, "tuple.alt").unwrap()
+                                                }
+                                                _ => self.context.bool_type().const_int(1, false),
+                                            };
+                                            or2 = Some(match or2 {
+                                                Some(prev) => self.builder.build_or(prev, alt_check, "tuple.alt.or").unwrap(),
+                                                None => alt_check,
+                                            });
+                                        }
+                                        or2.unwrap_or_else(|| self.context.bool_type().const_int(0, false))
+                                    }
+                                };
+                                and_val = Some(match and_val {
+                                    Some(prev) => self.builder.build_and(prev, elem_check, "tuple.and").unwrap(),
+                                    None => elem_check,
+                                });
+                            }
+                            and_val.unwrap_or_else(|| self.context.bool_type().const_int(1, false))
+                        }
                         Pattern::Enum{variant, payload, ..} => {
                             let ename = match self.infer_expr_ty(&m.scrutinee).unwrap() {
                                 crate::sema::Ty::Enum(ref n) => n.clone(),
@@ -3361,6 +3490,14 @@ impl<'ctx> Codegen<'ctx> {
                                         Pattern::LitBool(b, _) => {
                                             let lit = self.context.bool_type().const_int(if *b {1} else {0}, false);
                                             self.builder.build_int_compare(IntPredicate::EQ, payload_val.into_int_value(), lit, "match.enum.payload").unwrap()
+                                        }
+                                        Pattern::Tuple(subs, _) => {
+                                            // Enum payload is tuple like `MyVariant((a,b))` where payload is one tuple
+                                            if let Ok(crate::sema::Ty::Tuple(tys)) = self.infer_expr_ty(&crate::ast::Expr{kind: crate::ast::ExprKind::Tuple(vec![]), span: pats[0].span()}) {
+                                                self.context.bool_type().const_int(1, false)
+                                            } else {
+                                                self.context.bool_type().const_int(1, false)
+                                            }
                                         }
                                         _ => self.context.bool_type().const_int(1, false),
                                     }
@@ -3405,7 +3542,7 @@ impl<'ctx> Codegen<'ctx> {
             // Emit arm body - bind pattern vars in arm scope
             self.builder.position_at_end(arm_bb);
             self.vars.push(HashMap::new());
-            // Bind pattern variables: Var at top-level or Enum payload Var
+            // Bind pattern variables: Var, Tuple, Enum payload, Alternative
             match &arm.pattern {
                 Pattern::Var(name, _) => {
                     let ty = scrut_val.get_type();
@@ -3413,27 +3550,101 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_store(alloc, scrut_val).unwrap();
                     self.vars.last_mut().unwrap().insert(name.clone(), (alloc, ty));
                 }
+                Pattern::Tuple(pats, _) => {
+                    for (i, pat) in pats.iter().enumerate() {
+                        if let Pattern::Var(vname, _) = pat {
+                            let elem_val = self.builder.build_extract_value(scrut_val.into_struct_value(), i as u32, "tuple.bind").unwrap();
+                            let ty = elem_val.get_type();
+                            let alloc = self.create_entry_block_alloca(vname, ty);
+                            self.builder.build_store(alloc, elem_val).unwrap();
+                            self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                        } else if let Pattern::Tuple(inner, _) = pat {
+                            // Nested tuple like `((a,b), c)` - handle one level
+                            let elem_val = self.builder.build_extract_value(scrut_val.into_struct_value(), i as u32, "tuple.nested").unwrap();
+                            for (j, ipat) in inner.iter().enumerate() {
+                                if let Pattern::Var(n2, _) = ipat {
+                                    let inner_val = self.builder.build_extract_value(elem_val.into_struct_value(), j as u32, "tuple.inner.bind").unwrap();
+                                    let ty2 = inner_val.get_type();
+                                    let alloc2 = self.create_entry_block_alloca(n2, ty2);
+                                    self.builder.build_store(alloc2, inner_val).unwrap();
+                                    self.vars.last_mut().unwrap().insert(n2.clone(), (alloc2, ty2));
+                                }
+                            }
+                        }
+                    }
+                }
+                Pattern::Alternative(pats, _) => {
+                    // `a | b` or `a or b` where `a`/`b` are `Var` or literals: bind first Var if any
+                    for pat in pats {
+                        if let Pattern::Var(name, _) = pat {
+                            let ty = scrut_val.get_type();
+                            let alloc = self.create_entry_block_alloca(name, ty);
+                            self.builder.build_store(alloc, scrut_val).unwrap();
+                            self.vars.last_mut().unwrap().insert(name.clone(), (alloc, ty));
+                            break;
+                        } else if let Pattern::Tuple(subs, _) = pat {
+                            for (i, spat) in subs.iter().enumerate() {
+                                if let Pattern::Var(n, _) = spat {
+                                    let elem_val = self.builder.build_extract_value(scrut_val.into_struct_value(), i as u32, "alt.tuple.bind").unwrap();
+                                    let ty = elem_val.get_type();
+                                    let alloc = self.create_entry_block_alloca(n, ty);
+                                    self.builder.build_store(alloc, elem_val).unwrap();
+                                    self.vars.last_mut().unwrap().insert(n.clone(), (alloc, ty));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
                 Pattern::Enum{ payload: Some(pats), ..} => {
                     if pats.len() == 1 {
-                        if let Pattern::Var(vname, _) = &pats[0] {
-                            let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.bind").unwrap();
-                            let ty = payload_val.get_type();
-                            let alloc = self.create_entry_block_alloca(vname, ty);
-                            self.builder.build_store(alloc, payload_val).unwrap();
-                            self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                        match &pats[0] {
+                            Pattern::Var(vname, _) => {
+                                let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.bind").unwrap();
+                                let ty = payload_val.get_type();
+                                let alloc = self.create_entry_block_alloca(vname, ty);
+                                self.builder.build_store(alloc, payload_val).unwrap();
+                                self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                            }
+                            Pattern::Tuple(subs, _) => {
+                                let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.tuple").unwrap();
+                                for (i, spat) in subs.iter().enumerate() {
+                                    if let Pattern::Var(n, _) = spat {
+                                        let elem_val = self.builder.build_extract_value(payload_val.into_struct_value(), i as u32, "enum.tuple.bind").unwrap();
+                                        let ty = elem_val.get_type();
+                                        let alloc = self.create_entry_block_alloca(n, ty);
+                                        self.builder.build_store(alloc, elem_val).unwrap();
+                                        self.vars.last_mut().unwrap().insert(n.clone(), (alloc, ty));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     } else {
                         for (idx, pat) in pats.iter().enumerate() {
-                            if let Pattern::Var(vname, _) = pat {
-                                // For multi-param, payload_val is still i64 for first; for others, we ignore for MVP and just bind first? For now bind first only
-                                // To handle multi, we would need payload as struct, but we treat payload as i64 for first
-                                if idx == 0 {
-                                    let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.bind").unwrap();
-                                    let ty = payload_val.get_type();
-                                    let alloc = self.create_entry_block_alloca(vname, ty);
-                                    self.builder.build_store(alloc, payload_val).unwrap();
-                                    self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                            match pat {
+                                Pattern::Var(vname, _) => {
+                                    if idx == 0 {
+                                        let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.bind").unwrap();
+                                        let ty = payload_val.get_type();
+                                        let alloc = self.create_entry_block_alloca(vname, ty);
+                                        self.builder.build_store(alloc, payload_val).unwrap();
+                                        self.vars.last_mut().unwrap().insert(vname.clone(), (alloc, ty));
+                                    }
                                 }
+                                Pattern::Tuple(subs, _) => {
+                                    let payload_val = self.builder.build_extract_value(scrut_val.into_struct_value(), 1, "enum.payload.tuple").unwrap();
+                                    for (i, spat) in subs.iter().enumerate() {
+                                        if let Pattern::Var(n, _) = spat {
+                                            let elem_val = self.builder.build_extract_value(payload_val.into_struct_value(), i as u32, "enum.tuple.bind2").unwrap();
+                                            let ty = elem_val.get_type();
+                                            let alloc = self.create_entry_block_alloca(n, ty);
+                                            self.builder.build_store(alloc, elem_val).unwrap();
+                                            self.vars.last_mut().unwrap().insert(n.clone(), (alloc, ty));
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -3710,6 +3921,20 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 Err(CodegenError{message: "member access inference on non-struct".into(), span: expr.span})
             }
+            ExprKind::IntLit(_) => Ok(crate::sema::Ty::Int),
+            ExprKind::FloatLit(_) => Ok(crate::sema::Ty::Double),
+            ExprKind::BoolLit(_) => Ok(crate::sema::Ty::Bool),
+            ExprKind::StringLit(_) => Ok(crate::sema::Ty::String),
+            ExprKind::CharLit(_) => Ok(crate::sema::Ty::Char),
+            ExprKind::Null => Ok(crate::sema::Ty::Any),
+            ExprKind::Tuple(exprs) => {
+                let mut tys = Vec::new();
+                for e in exprs {
+                    tys.push(self.infer_expr_ty(e)?);
+                }
+                Ok(crate::sema::Ty::Tuple(tys))
+            }
+            ExprKind::Paren(inner) => self.infer_expr_ty(inner),
             _ => Err(CodegenError{message: "cannot infer type of this expr for struct GEP".into(), span: expr.span}),
         }
     }
