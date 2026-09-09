@@ -955,8 +955,10 @@ impl<'ctx> Codegen<'ctx> {
                     let global = self.module.add_global(lty, None, name);
                     global.set_constant(true);
                     global.set_linkage(inkwell::module::Linkage::External);
-                    // No initializer for extern const (provided by external library)
-                    global.set_initializer(&lty.const_zero());
+                    // Bare-minimum FFI: a true external declaration must NOT
+                    // carry an initializer. Emitting `= zero` would define the
+                    // symbol locally (e.g. null `stderr`) and shadow libc's,
+                    // so no `set_initializer` call here by design.
                     let ptr = global.as_pointer_value();
                     self.globals.insert(name.clone(), (ptr, lty));
                 }

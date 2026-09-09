@@ -1,4 +1,8 @@
 // variadic.hlt — demonstrates `...` for both extern C varargs and Holt `...T vda` array
+// Holt-side logging helpers use the real stdlib (`import std::io`); the
+// `printf` extern below exercises a user-declared C varargs symbol alongside it.
+import std::io
+
 extern "c" from "stdio.h" do
     int printf(string fmt, ...);
 end
@@ -15,7 +19,10 @@ int logStr(string fmt, ...string vda) do
 end
 
 int logGen<T>(string fmt, ...T vda) where T: int do
-    printInt(vda[0])
+    // `printInt(int)` is typed stdlib: a generic `T` does not coerce.
+    // C varargs leave extras unchecked, and `T` erases to `i64` — same
+    // layout `printInt` itself prints with `%ld`.
+    printf("%ld\n", vda[0])
     return 0
 end
 

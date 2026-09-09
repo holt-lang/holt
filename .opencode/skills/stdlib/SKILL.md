@@ -19,15 +19,19 @@ Guide for building `stdlib` for Holt (EBNF draft 0.1).
 ```
 stdlib/
   std/
-    io.hlt        # print, println, printInt, putChar (pure Holt + extern)
+    io.hlt        # print println printInt putChar eprint eprintln readLine readInt (pure Holt + extern)
+    types.hlt     # doc-only manifest of the implicit environment
   README.md
-runtime/          # optional tiny C/Rust helpers linked via clang (future: when extern §36 lands)
-  io.c            # fallback if Holt cannot directly call libc
+runtime/          # optional tiny C/Rust helpers linked via clang (future: when Holt cannot express an operation)
 compiler/src/
   ast.rs          # Item::Import
   parse/mod.rs    # parse_import
-  main.rs         # resolver: qualified-name → file, inline items before sema
-  codegen/mod.rs  # declare external puts/printf, intrinsify std::io fns or lower extern
+holt/src/main.rs  # resolver: qualified-name → file, inline items before sema
+                  # (selective imports always carry the module's extern blocks)
+compiler/src/codegen/mod.rs  # `declare_extern` lowering only (one decl per libc
+                             # symbol, duplicates skipped); internal
+                             # get_or_declare_* helpers serve compiler lowering
+                             # (assert, interpolation), never user IO names
 ```
 
 ## EBNF §32 Contract
@@ -44,17 +48,30 @@ qualified-name = identifier , { "::" , identifier } ;
 * `import std::io::{print, println}` → selected symbols (resolver filters; sema still sees only selected).
 * Resolver searches `stdlib/<path>.hlt` relative to workspace root, then relative to importer file. No `import "./foo"` custom syntax.
 
-## Current Phase (minimal IO)
+## Current Phase (real stdlib: IO owned by `stdlib/`)
 
-**Shipped (`stdlib/std/io.hlt`):**
-- `void print(string s)` — no newline, via `puts`/`printf`
-- `void println(string s)` — with newline
-- `void printInt(int n)` — decimal, via `printf("%ld")`
-- `void putChar(char c)` — optional, via `putchar`
+**Shipped (`stdlib/std/io.hlt`) — pure Holt, no compiler intrinsics:**
+- `void print(string s)` — no newline, via `extern i32 printf(string fmt, ...)`
+- `void println(string s)` — with newline, via `extern i32 puts(string s)`
+- `void printInt(int n)` — decimal, via `printf("%ld\n", n)`
+- `void putChar(char c)` — single char, via `extern i32 putchar(char c)`
+- `void eprint` / `void eprintln(string s)` — stderr via
+  `extern int write(int fd, string buf, int count)` on fd 2 (no `FILE*`
+  global, portable macOS/Linux)
+- `string readLine()` — stdin line sans newline via `extern string calloc`
+  + `extern int scanf(string fmt, ...)` (`"%255[^\n]%*c"`, 255-byte cap)
+- `int readInt()` — stdin integer via `scanf("%ld%*c", out n)`
 
-**Not yet:** file IO, `readLine`, `eprint`, formatting/interpolation, buffering. Deferred until Phase 5 FFI (`extern "c" from "stdio.h"`) is stable.
+**Not yet:** file IO, formatting/interpolation helpers, buffering.
+See `REAL_STDLIB.md` for the boundary rule.
 
-Implementation note: Holt `string` is currently `ptr (i8*)` null-terminated in `codegen/mod.rs`. Stdlib IO declares `extern` libc `puts`/`printf`/`putchar` when `extern` §36 parser lands; until then codegen intrinsifies `print` family by declaring those symbols as LLVM declarations and emitting calls directly (no Holt `extern` needed for this iteration).
+Implementation note: Holt `string` is `ptr (i8*)` null-terminated in
+`codegen/mod.rs`. `extern` §36 is stable, so stdlib declares libc directly and
+the compiler lowers ordinary calls (plus `module.get_function` fallback for
+`extern` callees). Sema has no `print`-family shortcut: without
+`import std::io` these names are `undefined function` by design. See
+complementary skill `holt-stdlib-real` (`REAL_STDLIB.md`) for the full
+compiler-owns vs stdlib-owns contract.
 
 ## Workflow When Extending Stdlib
 
@@ -81,7 +98,9 @@ Implementation note: Holt `string` is currently `ptr (i8*)` null-terminated in `
 
 - Module resolver: caching, cycle detection, visibility `public`/`private` enforcement.
 - String ABI switch to `{ptr,i64}` length struct (breaks current `ptr`).
-- `extern` FFI (§36) → remove intrinsification, stdlib calls libc directly via `extern` decls.
+- `extern` FFI (§36) → DONE for IO: stdlib declares libc directly via
+  `extern` blocks; compiler only lowers them (no intrinsification).
+  Remaining: `FILE*`/stderr plumbing for `eprint`, string-buffer append for `readLine`.
 - Generics → `std::vec`, `std::option`, `std::result`.
 - Traits / extensions → `extend string do … end` helpers.
 

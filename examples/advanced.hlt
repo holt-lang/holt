@@ -1,6 +1,9 @@
 // advanced.hlt — Phase 5: generics, closures, interpolation, operators, FFI, distinct, extensions, etc.
 // Demonstrates all four recent fixes:
 // 1) getters/setters public by default, 2) separate getter/setter, 3) `open` only on class, 4) omitted Type in `has`
+// IO (`println`/`printInt`) comes from the real stdlib — no compiler intrinsics.
+
+import std::io
 
 distinct MyInt = int
 typedef Alias = int

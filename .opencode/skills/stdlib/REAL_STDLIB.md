@@ -43,9 +43,9 @@ function name in sema or codegen.
 ## Stdlib owns (pure Holt under `stdlib/`)
 
 - **`std::io`** (`stdlib/std/io.hlt`) — `print`, `println`, `printInt`,
-  `putChar`, plus `eprint`/`eprintln` (stderr via `printf`-style `eputs`? —
-  currently via libc `fprintf`-equivalent extern), `readLine` (via `getchar`
-  loop), `printBool`. All thin wrappers over the `extern` block. No compiler
+  `putChar`, `eprint`/`eprintln` (stderr via `write(2, …)` — no `FILE*`
+  global), `readLine` (`calloc` + `scanf` scanset), `readInt`
+  (`scanf` + `out` arg). All thin wrappers over the `extern` block. No compiler
   intrinsic: sema resolves them as ordinary functions from the import; codegen
   lowers ordinary calls (including calls into `extern` fns).
 - **`std::types`** (`stdlib/std/types.hlt`) — doc-only manifest of the

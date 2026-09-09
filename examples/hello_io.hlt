@@ -1,5 +1,6 @@
 // hello_io.hlt — stdlib import and IO (Phase 1 + stdlib)
-// Demonstrates `import std::io` and the intrinsified print functions.
+// Demonstrates `import std::io`: `print`-family calls resolve to pure Holt
+// wrappers in `stdlib/std/io.hlt` over `extern "c"` libc declarations.
 
 import std::io
 

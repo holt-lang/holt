@@ -1,5 +1,8 @@
 // abstraction.hlt — Phase 4: classes, traits, enums, properties, constructors, visibility, inheritance
 // A single well-rounded program exercising the entire abstraction layer.
+// `draw()` writes via the real stdlib (`import std::io`).
+
+import std::io
 
 trait Drawable has
     void draw()
