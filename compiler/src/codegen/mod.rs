@@ -58,6 +58,10 @@ pub struct Codegen<'ctx> {
     /// Variables holding maps (`K:V` or `any m = has ... end`). LLVM type is
     /// the map struct `{ [16 x K], [16 x V], i64 len }`.
     map_vars: HashSet<String>,
+    /// Variables holding strings (`string s = ...`). LLVM type is `ptr`;
+    /// tracked so `len()`/`is_empty()` lower instead of falling through to
+    /// class-method resolution.
+    string_vars: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +108,7 @@ impl<'ctx> Codegen<'ctx> {
             cur_class: None,
             vec_vars: HashSet::new(),
             map_vars: HashSet::new(),
+            string_vars: HashSet::new(),
         }
     }
 
@@ -866,10 +871,17 @@ impl<'ctx> Codegen<'ctx> {
         for mem in &ext.members {
             match mem {
                 crate::ast::ExternMember::Function{ty, name, params, ..} => {
+                    // Real stdlib: the same libc symbol may be declared both by
+                    // `stdlib/std/*.hlt` and by user code (e.g. `printf` in
+                    // `advanced.hlt`). LLVM requires one declaration, so reuse
+                    // the existing one when the name is already declared.
+                    if self.module.get_function(name).is_some() {
+                        continue;
+                    }
                     let ret_ty: crate::sema::Ty = ty.into();
                     let mut is_c_varargs = params.iter().any(|p| p.is_variadic && p.name.is_empty());
-                    // Special: `extern "c" from "libc" do int printf(string arg) end` in advanced.hlt declares `printf` with one `string` param
-                    // but real C `printf` is variadic `int printf(const char*, ...)`. For `printInt` intrinsic we need variadic `i32 (ptr, ...)`.
+                    // Special: `extern "c" from "libc" do int printf(string arg) end` declares `printf` with one `string` param
+                    // but real C `printf` is variadic `int printf(const char*, ...)`.
                     // If user declares `printf` with single `string` param and non-variadic, treat it as variadic C `printf`.
                     if name == "printf" && params.len() == 1 && !is_c_varargs {
                         if let Some(p) = params.first() {
@@ -1017,6 +1029,9 @@ impl<'ctx> Codegen<'ctx> {
         global.set_linkage(inkwell::module::Linkage::External);
         let ptr = global.as_pointer_value();
         self.globals.insert(c.name.clone(), (ptr, ty));
+        if matches!(c.ty, Some(Type::String(_))) {
+            self.string_vars.insert(c.name.clone());
+        }
         Ok(())
     }
 
@@ -1220,6 +1235,7 @@ impl<'ctx> Codegen<'ctx> {
                     while padded.len() < Self::VEC_CAP as usize {
                         padded.push(dest_elem_ty.const_zero());
                     }
+                    padded.truncate(Self::VEC_CAP as usize);
                     let buf_val: BasicValueEnum<'ctx> = match arr_ty {
                         BasicTypeEnum::ArrayType(at) => match dest_elem_ty {
                             BasicTypeEnum::IntType(it) => {
@@ -1231,6 +1247,17 @@ impl<'ctx> Codegen<'ctx> {
                                     })
                                     .collect();
                                 it.const_array(&ivs).into()
+                            }
+                            BasicTypeEnum::PointerType(pt) => {
+                                let null = pt.const_null();
+                                let pvs: Vec<PointerValue<'ctx>> = padded
+                                    .iter()
+                                    .map(|cv| match cv {
+                                        BasicValueEnum::PointerValue(pv) => *pv,
+                                        _ => null,
+                                    })
+                                    .collect();
+                                pt.const_array(&pvs).into()
                             }
                             _ => at.const_zero().into(),
                         },
@@ -1377,6 +1404,9 @@ impl<'ctx> Codegen<'ctx> {
         global.set_linkage(inkwell::module::Linkage::External);
         let ptr = global.as_pointer_value();
         self.globals.insert(v.name.clone(), (ptr, ty));
+        if matches!(&v.ty, Type::String(_)) {
+            self.string_vars.insert(v.name.clone());
+        }
         Ok(())
     }
 
@@ -1409,6 +1439,7 @@ impl<'ctx> Codegen<'ctx> {
                         self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
                     }
                     let _ = self.codegen_block(&f.body)?;
                     if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -1451,6 +1482,7 @@ impl<'ctx> Codegen<'ctx> {
                         self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
                     }
                     let _ = self.codegen_block(&op.body)?;
                     if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -1508,6 +1540,7 @@ impl<'ctx> Codegen<'ctx> {
                         self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
                         let _ = self.codegen_block(body)?;
                         if self.builder.get_insert_block().unwrap().get_terminator().is_none() { self.builder.build_return(None).unwrap(); }
                         self.vars.pop();
@@ -1772,8 +1805,379 @@ impl<'ctx> Codegen<'ctx> {
         lookup != name && self.map_vars.contains(lookup)
     }
 
-    /// Search a map's keys for `key`, storing the matched slot index (or -1)
-    /// into a fresh i64 alloca. String slots compare by content (`strcmp`);
+    /// Is this variable a string (tracked at declaration)?
+    fn is_string_var(&self, name: &str) -> bool {
+        if self.string_vars.contains(name) {
+            return true;
+        }
+        let lookup = name.rsplit("::").next().unwrap_or(name);
+        lookup != name && self.string_vars.contains(lookup)
+    }
+
+    fn get_or_declare_strlen(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("strlen") {
+            return f;
+        }
+        let ptr = self.context.ptr_type(inkwell::AddressSpace::default());
+        let fn_ty = self.context.i64_type().fn_type(&[ptr.into()], false);
+        self.module.add_function("strlen", fn_ty, None)
+    }
+
+    /// Emit `if (!cond) abort()` in straight-line code and continue after.
+    /// Used for empty `pop`/`first`/`last` and capacity overflow traps.
+    fn codegen_trap_unless(
+        &self,
+        cond: inkwell::values::IntValue<'ctx>,
+        span: Span,
+    ) -> Result<(), CodegenError> {
+        let func = self.cur_fn.ok_or(CodegenError{message: "trap outside function".into(), span})?;
+        let ok_bb = self.context.append_basic_block(func, "trap.ok");
+        let fail_bb = self.context.append_basic_block(func, "trap.fail");
+        self.builder.build_conditional_branch(cond, ok_bb, fail_bb).unwrap();
+        self.builder.position_at_end(fail_bb);
+        self.builder.build_call(self.get_or_declare_abort(), &[], "trap.abort").unwrap();
+        self.builder.build_unreachable().unwrap();
+        self.builder.position_at_end(ok_bb);
+        Ok(())
+    }
+
+    /// Search an array buffer `[0..len)` for `key`; returns i1 found.
+    /// Integer slots compare directly (key coerced to slot width); pointer
+    /// slots compare by content (`strcmp`).
+    fn codegen_buffer_contains(
+        &self,
+        buf_ptr: PointerValue<'ctx>,
+        arr_ty: inkwell::types::ArrayType<'ctx>,
+        len: inkwell::values::IntValue<'ctx>,
+        key_val: BasicValueEnum<'ctx>,
+        span: Span,
+    ) -> Result<inkwell::values::IntValue<'ctx>, CodegenError> {
+        let slot_ty = arr_ty.get_element_type();
+        let key = self.coerce_to_ty(key_val, slot_ty);
+        let func = self.cur_fn.ok_or(CodegenError{message: "contains outside function".into(), span})?;
+        let found_ptr = self.create_entry_block_alloca("contains.found", self.context.bool_type().into());
+        self.builder.build_store(found_ptr, self.context.bool_type().const_zero()).unwrap();
+        let i_ptr = self.create_entry_block_alloca("contains.i", self.context.i64_type().into());
+        self.builder.build_store(i_ptr, self.context.i64_type().const_zero()).unwrap();
+        let loop_bb = self.context.append_basic_block(func, "contains.loop");
+        let body_bb = self.context.append_basic_block(func, "contains.body");
+        let exit_bb = self.context.append_basic_block(func, "contains.exit");
+        let zero = self.context.i64_type().const_int(0, false);
+        self.builder.build_unconditional_branch(loop_bb).unwrap();
+        self.builder.position_at_end(loop_bb);
+        let i = self.builder.build_load(self.context.i64_type(), i_ptr, "contains.i").unwrap().into_int_value();
+        let cont = self.builder.build_int_compare(IntPredicate::ULT, i, len, "contains.cont").unwrap();
+        self.builder.build_conditional_branch(cont, body_bb, exit_bb).unwrap();
+        self.builder.position_at_end(body_bb);
+        let eptr = unsafe {
+            self.builder.build_gep(arr_ty, buf_ptr, &[zero, i], "contains.slot").unwrap()
+        };
+        let slot = self.builder.build_load(slot_ty, eptr, "contains.elem").unwrap();
+        let eq = match (slot.get_type(), key.get_type()) {
+            (BasicTypeEnum::IntType(a), BasicTypeEnum::IntType(b)) if a.get_bit_width() == b.get_bit_width() => {
+                self.builder.build_int_compare(IntPredicate::EQ, slot.into_int_value(), key.into_int_value(), "contains.eq").unwrap()
+            }
+            (BasicTypeEnum::PointerType(_), BasicTypeEnum::PointerType(_)) => {
+                let cmp = self.builder.build_call(self.get_or_declare_strcmp(), &[slot.into(), key.into()], "contains.strcmp").unwrap();
+                let c = cmp.try_as_basic_value().basic().unwrap().into_int_value();
+                self.builder.build_int_compare(IntPredicate::EQ, c, self.context.i32_type().const_zero(), "contains.eq").unwrap()
+            }
+            _ => self.context.bool_type().const_int(0, false),
+        };
+        // found |= eq (no early exit; idempotent).
+        let prev = self.builder.build_load(self.context.bool_type(), found_ptr, "contains.prev").unwrap().into_int_value();
+        let both = self.builder.build_or(prev, eq, "contains.any").unwrap();
+        self.builder.build_store(found_ptr, both).unwrap();
+        let one = self.context.i64_type().const_int(1, false);
+        let ni = self.builder.build_int_add(i, one, "contains.inc").unwrap();
+        self.builder.build_store(i_ptr, ni).unwrap();
+        self.builder.build_unconditional_branch(loop_bb).unwrap();
+        self.builder.position_at_end(exit_bb);
+        Ok(self.builder.build_load(self.context.bool_type(), found_ptr, "contains").unwrap().into_int_value())
+    }
+
+    /// Collection and string methods (`len`, `is_empty`, `pop`, `clear`,
+    /// `contains`, `first`, `last`, `remove`, `get`; `push` is separate).
+    /// Sema has validated arity and types. Returns `Ok(None)` when the base
+    /// is not a tracked collection/string, falling through to class methods.
+    /// Bases are plain identifiers (MVP).
+    fn codegen_collection_method(
+        &mut self,
+        name: &str,
+        method: &str,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, CodegenError> {
+        enum Family {
+            Vec,
+            Arr,
+            Map,
+            Str,
+        }
+        let (ptr, ty) = match self.lookup_var(name) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let family = if self.is_vec_var(name) && ty.is_struct_type() {
+            Family::Vec
+        } else if self.is_map_var(name) && ty.is_struct_type() {
+            Family::Map
+        } else if ty.is_array_type() {
+            Family::Arr
+        } else if self.is_string_var(name) && ty.is_pointer_type() {
+            Family::Str
+        } else {
+            return Ok(None);
+        };
+        // Reject unknown methods per family here (sema already diagnosed).
+        let known = match family {
+            Family::Vec => matches!(method, "len" | "is_empty" | "pop" | "clear" | "contains" | "first" | "last"),
+            Family::Arr => matches!(method, "len" | "is_empty" | "contains" | "first" | "last"),
+            Family::Map => matches!(method, "len" | "is_empty" | "contains" | "remove" | "clear" | "get_or"),
+            Family::Str => matches!(method, "len" | "is_empty"),
+        };
+        if !known {
+            return Err(CodegenError{message: format!("unknown method `{method}` for `{name}`"), span});
+        }
+        let zero64 = self.context.i64_type().const_int(0, false);
+        let one64 = self.context.i64_type().const_int(1, false);
+        // Resolve buffer/length accessors per family.
+        enum Buf<'ctx> {
+            Vec { st: StructType<'ctx>, arr: inkwell::types::ArrayType<'ctx>, len: inkwell::values::IntValue<'ctx> },
+            Arr { arr: inkwell::types::ArrayType<'ctx>, n: u64 },
+            Map { st: StructType<'ctx>, keys: inkwell::types::ArrayType<'ctx>, vals: inkwell::types::ArrayType<'ctx>, len: inkwell::values::IntValue<'ctx> },
+            Str { val: PointerValue<'ctx> },
+        }
+        let buf = match family {
+            Family::Vec => {
+                let st = ty.into_struct_type();
+                let buf_ptr = self.builder.build_struct_gep(st, ptr, 0, "m.vec.buf").unwrap();
+                let arr = match st.get_field_type_at_index(0).unwrap() {
+                    BasicTypeEnum::ArrayType(at) => at,
+                    _ => return Err(CodegenError{message: "malformed vector buffer".into(), span}),
+                };
+                let len_ptr = self.builder.build_struct_gep(st, ptr, 1, "m.vec.len").unwrap();
+                let len = self.builder.build_load(self.context.i64_type(), len_ptr, "m.vec.len").unwrap().into_int_value();
+                let _ = buf_ptr;
+                Buf::Vec { st, arr, len }
+            }
+            Family::Arr => {
+                let arr = ty.into_array_type();
+                Buf::Arr { arr, n: arr.len() as u64 }
+            }
+            Family::Map => {
+                let st = ty.into_struct_type();
+                let keys = match st.get_field_type_at_index(0).unwrap() {
+                    BasicTypeEnum::ArrayType(at) => at,
+                    _ => return Err(CodegenError{message: "malformed map keys buffer".into(), span}),
+                };
+                let vals = match st.get_field_type_at_index(1).unwrap() {
+                    BasicTypeEnum::ArrayType(at) => at,
+                    _ => return Err(CodegenError{message: "malformed map values buffer".into(), span}),
+                };
+                let len_ptr = self.builder.build_struct_gep(st, ptr, 2, "m.map.len").unwrap();
+                let len = self.builder.build_load(self.context.i64_type(), len_ptr, "m.map.len").unwrap().into_int_value();
+                Buf::Map { st, keys, vals, len }
+            }
+            Family::Str => {
+                let val = self.builder.build_load(ty, ptr, "m.str").unwrap().into_pointer_value();
+                Buf::Str { val }
+            }
+        };
+        // Buffer pointer + element type for Vec/Arr families.
+        match method {
+            "len" => {
+                let v: BasicValueEnum<'ctx> = match &buf {
+                    Buf::Vec { len, .. } | Buf::Map { len, .. } => (*len).into(),
+                    Buf::Arr { n, .. } => self.context.i64_type().const_int(*n, false).into(),
+                    Buf::Str { val } => {
+                        let call = self.builder.build_call(self.get_or_declare_strlen(), &[(*val).into()], "m.strlen").unwrap();
+                        call.try_as_basic_value().basic().unwrap()
+                    }
+                };
+                Ok(Some(v))
+            }
+            "is_empty" => {
+                let is0 = match &buf {
+                    Buf::Vec { len, .. } | Buf::Map { len, .. } => {
+                        self.builder.build_int_compare(IntPredicate::EQ, *len, zero64, "m.empty").unwrap()
+                    }
+                    Buf::Arr { n, .. } => self.context.bool_type().const_int(if *n == 0 { 1 } else { 0 }, false),
+                    Buf::Str { val } => {
+                        let call = self.builder.build_call(self.get_or_declare_strlen(), &[(*val).into()], "m.strlen").unwrap();
+                        let l = call.try_as_basic_value().basic().unwrap().into_int_value();
+                        self.builder.build_int_compare(IntPredicate::EQ, l, zero64, "m.empty").unwrap()
+                    }
+                };
+                Ok(Some(is0.into()))
+            }
+            "pop" => {
+                // Vectors only (sema enforced).
+                let (st, arr, len) = match &buf {
+                    Buf::Vec { st, arr, len } => (*st, *arr, *len),
+                    _ => return Err(CodegenError{message: "`pop` needs a vector".into(), span}),
+                };
+                let nonzero = self.builder.build_int_compare(IntPredicate::NE, len, zero64, "m.pop.nonempty").unwrap();
+                self.codegen_trap_unless(nonzero, span)?;
+                let nlen = self.builder.build_int_sub(len, one64, "m.pop.dec").unwrap();
+                let len_ptr = self.builder.build_struct_gep(st, ptr, 1, "m.pop.len").unwrap();
+                self.builder.build_store(len_ptr, nlen).unwrap();
+                let buf_ptr = self.builder.build_struct_gep(st, ptr, 0, "m.pop.buf").unwrap();
+                let eptr = unsafe {
+                    self.builder.build_gep(arr, buf_ptr, &[zero64, nlen], "m.pop.slot").unwrap()
+                };
+                let elem_ty = arr.get_element_type();
+                Ok(Some(self.builder.build_load(elem_ty, eptr, "m.pop").unwrap()))
+            }
+            "clear" => {
+                match &buf {
+                    Buf::Vec { st, .. } => {
+                        let len_ptr = self.builder.build_struct_gep(*st, ptr, 1, "m.clear.len").unwrap();
+                        self.builder.build_store(len_ptr, zero64).unwrap();
+                    }
+                    Buf::Map { st, .. } => {
+                        let len_ptr = self.builder.build_struct_gep(*st, ptr, 2, "m.clear.len").unwrap();
+                        self.builder.build_store(len_ptr, zero64).unwrap();
+                    }
+                    _ => return Err(CodegenError{message: "`clear` needs a vector or map".into(), span}),
+                }
+                Ok(Some(self.context.i64_type().const_int(0, false).into()))
+            }
+            "contains" => {
+                let arg_val = self.codegen_call_arg(&args[0])?;
+                let found = match &buf {
+                    Buf::Vec { st, arr, len } => {
+                        let buf_ptr = self.builder.build_struct_gep(*st, ptr, 0, "m.contains.buf").unwrap();
+                        self.codegen_buffer_contains(buf_ptr, *arr, *len, arg_val, span)?
+                    }
+                    Buf::Arr { arr, n } => {
+                        let nlen = self.context.i64_type().const_int(*n, false);
+                        self.codegen_buffer_contains(ptr, *arr, nlen, arg_val, span)?
+                    }
+                    Buf::Map { st, keys, len, .. } => {
+                        let keys_ptr = self.builder.build_struct_gep(*st, ptr, 0, "m.contains.keys").unwrap();
+                        // Reuse the search loop shape via buffer scan.
+                        self.codegen_buffer_contains(keys_ptr, *keys, *len, arg_val, span)?
+                    }
+                    Buf::Str { .. } => return Err(CodegenError{message: "`contains` needs a collection".into(), span}),
+                };
+                Ok(Some(found.into()))
+            }
+            "first" | "last" => {
+                let is_first = method == "first";
+                let (bp, arr, len_v): (PointerValue<'ctx>, inkwell::types::ArrayType<'ctx>, Option<inkwell::values::IntValue<'ctx>>) = match &buf {
+                    Buf::Vec { st, arr, len } => {
+                        let buf_ptr = self.builder.build_struct_gep(*st, ptr, 0, "m.edge.buf").unwrap();
+                        (buf_ptr, *arr, Some(*len))
+                    }
+                    Buf::Arr { arr, n } => {
+                        if *n == 0 {
+                            self.codegen_trap_unless(self.context.bool_type().const_int(0, false), span)?;
+                        }
+                        (ptr, *arr, None)
+                    }
+                    _ => return Err(CodegenError{message: format!("`{method}` needs an array or vector"), span}),
+                };
+                let idx = if is_first {
+                    zero64
+                } else {
+                    match len_v {
+                        Some(len) => {
+                            let nonzero = self.builder.build_int_compare(IntPredicate::NE, len, zero64, "m.last.nonempty").unwrap();
+                            self.codegen_trap_unless(nonzero, span)?;
+                            self.builder.build_int_sub(len, one64, "m.last.idx").unwrap()
+                        }
+                        None => {
+                            // Static array: N > 0 checked above.
+                            let n = arr.len() as u64;
+                            self.context.i64_type().const_int(n - 1, false)
+                        }
+                    }
+                };
+                let eptr = unsafe {
+                    self.builder.build_gep(arr, bp, &[zero64, idx], "m.edge.slot").unwrap()
+                };
+                let elem_ty = arr.get_element_type();
+                Ok(Some(self.builder.build_load(elem_ty, eptr, "m.edge").unwrap()))
+            }
+            "remove" => {
+                // Maps only (sema enforced). Swap-with-last + shrink.
+                let (st, keys, vals, len) = match &buf {
+                    Buf::Map { st, keys, vals, len } => (*st, *keys, *vals, *len),
+                    _ => return Err(CodegenError{message: "`remove` needs a map".into(), span}),
+                };
+                let key_val = self.codegen_call_arg(&args[0])?;
+                let (idx_res, _, _, _) = self.codegen_map_search(ptr, st, key_val, span)?;
+                let func = self.cur_fn.ok_or(CodegenError{message: "map access outside function".into(), span})?;
+                let hit_bb = self.context.append_basic_block(func, "map.rm.hit");
+                let miss_bb = self.context.append_basic_block(func, "map.rm.miss");
+                let merge_bb = self.context.append_basic_block(func, "map.rm.merge");
+                let res = self.create_entry_block_alloca("map.rm.res", self.context.bool_type().into());
+                self.builder.build_store(res, self.context.bool_type().const_zero()).unwrap();
+                let idx = self.builder.build_load(self.context.i64_type(), idx_res, "map.rm.idx").unwrap().into_int_value();
+                let is_hit = self.builder.build_int_compare(IntPredicate::SGE, idx, zero64, "map.rm.found").unwrap();
+                self.builder.build_conditional_branch(is_hit, hit_bb, miss_bb).unwrap();
+                // hit: move last entry into idx, shrink.
+                self.builder.position_at_end(hit_bb);
+                let len_ptr = self.builder.build_struct_gep(st, ptr, 2, "map.rm.len").unwrap();
+                let nlen = self.builder.build_int_sub(len, one64, "map.rm.dec").unwrap();
+                let keys_ptr = self.builder.build_struct_gep(st, ptr, 0, "map.rm.keys").unwrap();
+                let vals_ptr = self.builder.build_struct_gep(st, ptr, 1, "map.rm.vals").unwrap();
+                let zero = zero64;
+                let last_kptr = unsafe { self.builder.build_gep(keys, keys_ptr, &[zero, nlen], "map.rm.lastk").unwrap() };
+                let last_vptr = unsafe { self.builder.build_gep(vals, vals_ptr, &[zero, nlen], "map.rm.lastv").unwrap() };
+                let lk = self.builder.build_load(keys.get_element_type(), last_kptr, "map.rm.lk").unwrap();
+                let lv = self.builder.build_load(vals.get_element_type(), last_vptr, "map.rm.lv").unwrap();
+                let dst_kptr = unsafe { self.builder.build_gep(keys, keys_ptr, &[zero, idx], "map.rm.dstk").unwrap() };
+                let dst_vptr = unsafe { self.builder.build_gep(vals, vals_ptr, &[zero, idx], "map.rm.dstv").unwrap() };
+                self.builder.build_store(dst_kptr, lk).unwrap();
+                self.builder.build_store(dst_vptr, lv).unwrap();
+                self.builder.build_store(len_ptr, nlen).unwrap();
+                self.builder.build_store(res, self.context.bool_type().const_int(1, false)).unwrap();
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(miss_bb);
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(merge_bb);
+                Ok(Some(self.builder.build_load(self.context.bool_type(), res, "map.rm").unwrap()))
+            }
+            "get_or" => {
+                // Maps only (sema enforced): hit ? vals[idx] : default.
+                let (st, vals, len) = match &buf {
+                    Buf::Map { st, vals, len, .. } => (*st, *vals, *len),
+                    _ => return Err(CodegenError{message: "`get` needs a map".into(), span}),
+                };
+                let _ = len;
+                let key_val = self.codegen_call_arg(&args[0])?;
+                let dflt_val = self.codegen_call_arg(&args[1])?;
+                let (idx_res, _, vals_arr_ty, val_ty) = self.codegen_map_search(ptr, st, key_val, span)?;
+                let func = self.cur_fn.ok_or(CodegenError{message: "map access outside function".into(), span})?;
+                let hit_bb = self.context.append_basic_block(func, "map.get2.hit");
+                let miss_bb = self.context.append_basic_block(func, "map.get2.miss");
+                let merge_bb = self.context.append_basic_block(func, "map.get2.merge");
+                let res = self.create_entry_block_alloca("map.get2.res", val_ty);
+                let cd = self.coerce_to_ty(dflt_val, val_ty);
+                self.builder.build_store(res, cd).unwrap();
+                let idx = self.builder.build_load(self.context.i64_type(), idx_res, "map.get2.idx").unwrap().into_int_value();
+                let is_hit = self.builder.build_int_compare(IntPredicate::SGE, idx, zero64, "map.get2.found").unwrap();
+                self.builder.build_conditional_branch(is_hit, hit_bb, miss_bb).unwrap();
+                self.builder.position_at_end(hit_bb);
+                let vals_ptr = self.builder.build_struct_gep(st, ptr, 1, "map.get2.vals").unwrap();
+                let vptr = unsafe {
+                    self.builder.build_gep(vals_arr_ty, vals_ptr, &[zero64, idx], "map.get2.slot").unwrap()
+                };
+                let vv = self.builder.build_load(val_ty, vptr, "map.get2.val").unwrap();
+                self.builder.build_store(res, vv).unwrap();
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(miss_bb);
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                self.builder.position_at_end(merge_bb);
+                Ok(Some(self.builder.build_load(val_ty, res, "map.get2").unwrap()))
+            }
+            _ => Err(CodegenError{message: format!("unknown method `{method}`"), span}),
+        }
+    }
+
+    /// Search a map's keys for `key`, storing the matched slot index (or -1)    /// into a fresh i64 alloca. String slots compare by content (`strcmp`);
     /// integer slots compare directly (keys coerced to slot width first).
     /// Returns the index alloca plus buffer/val types. The builder is left at
     /// a fresh `exit` block.
@@ -2394,64 +2798,11 @@ impl<'ctx> Codegen<'ctx> {
         self.module.add_function("strdup", fn_ty, None)
     }
 
-    fn is_stdlib_io_intrinsic(name: &str) -> bool {
-        matches!(name, "print" | "println" | "printInt" | "putChar")
-    }
-
-    fn codegen_stdlib_io_body(&mut self, f: &Function, func: FunctionValue<'ctx>) -> Result<(), CodegenError> {
-        // Bodies for std::io intrinsics — emit libc call then ret void
-        self.cur_fn = Some(func);
-        let entry = self.context.append_basic_block(func, "entry");
-        self.builder.position_at_end(entry);
-        self.vars.push(HashMap::new());
-        for (i, param) in f.params.iter().enumerate() {
-            let llvm_ty = self.llvm_ty_for(&param.ty);
-            let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
-            let param_val = func.get_nth_param(i as u32).unwrap();
-            self.builder.build_store(alloca, param_val).unwrap();
-            self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
-                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
-                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
-        }
-        match f.name.as_str() {
-            "print" => {
-                // printf("%s", s) — no newline
-                let s_ptr = self.lookup_var(&f.params[0].name).map(|(p, t)| self.builder.build_load(t, p, "s").unwrap()).unwrap_or_else(|| self.context.ptr_type(Default::default()).const_null().into());
-                let fmt = self.builder.build_global_string_ptr("%s", "fmt_s").unwrap();
-                let printf_fn = self.get_or_declare_printf();
-                self.builder.build_call(printf_fn, &[fmt.as_pointer_value().into(), s_ptr.into()], "printf_print").unwrap();
-            }
-            "println" => {
-                // puts(s) — adds newline
-                let s_ptr = self.lookup_var(&f.params[0].name).map(|(p, t)| self.builder.build_load(t, p, "s").unwrap()).unwrap_or_else(|| self.context.ptr_type(Default::default()).const_null().into());
-                let puts_fn = self.get_or_declare_puts();
-                self.builder.build_call(puts_fn, &[s_ptr.into()], "puts").unwrap();
-            }
-            "printInt" => {
-                let n_val = self.lookup_var(&f.params[0].name).map(|(p, t)| self.builder.build_load(t, p, "n").unwrap()).unwrap_or_else(|| self.context.i64_type().const_int(0,false).into());
-                let fmt = self.builder.build_global_string_ptr("%ld\n", "fmt_ld").unwrap();
-                let printf_fn = self.get_or_declare_printf();
-                self.builder.build_call(printf_fn, &[fmt.as_pointer_value().into(), n_val.into()], "printf_int").unwrap();
-            }
-            "putChar" => {
-                let c_val = self.lookup_var(&f.params[0].name).map(|(p, t)| self.builder.build_load(t, p, "c").unwrap()).unwrap_or_else(|| self.context.i32_type().const_int(0,false).into());
-                let putchar_fn = self.get_or_declare_putchar();
-                // ensure i32
-                let c_i32 = if c_val.is_int_value() && c_val.into_int_value().get_type().get_bit_width() != 32 {
-                    self.builder.build_int_z_extend_or_bit_cast(c_val.into_int_value(), self.context.i32_type(), "c_ext").unwrap().into()
-                } else { c_val };
-                self.builder.build_call(putchar_fn, &[c_i32.into()], "putchar").unwrap();
-            }
-            _ => {}
-        }
-        self.builder.build_return(None).unwrap();
-        self.vars.pop();
-        self.cur_fn = None;
-        if !func.verify(true) {
-            return Err(CodegenError{message: format!("stdlib fn {} verify failed", f.name), span: f.span});
-        }
-        Ok(())
-    }
+    // NOTE (real stdlib): no `is_stdlib_io_intrinsic` /
+    // `codegen_stdlib_io_body`. User-facing IO (`print`, `println`,
+    // `printInt`, `putChar`) is ordinary Holt in `stdlib/std/io.hlt` on top
+    // of `extern` libc declarations. The `get_or_declare_*` helpers below
+    // remain for compiler-internal lowering only (assert, interpolation).
 
     fn codegen_call_arg(&mut self, arg: &CallArg) -> Result<BasicValueEnum<'ctx>, CodegenError> {
         match arg {
@@ -2474,10 +2825,8 @@ impl<'ctx> Codegen<'ctx> {
                 message: format!("undeclared func {}", f.name),
                 span: f.name_span,
             })?;
-        // Intrinsify stdlib IO — bodies replaced with libc calls
-        if Self::is_stdlib_io_intrinsic(&f.name) {
-            return self.codegen_stdlib_io_body(f, func);
-        }
+        // NOTE (real stdlib): `print`-family names lower as ordinary calls.
+        // `std::io` wrappers are compiled like any other Holt function.
         self.cur_fn = Some(func);
         self.cur_is_main = f.name == "main";
         let entry = self.context.append_basic_block(func, "entry");
@@ -2530,6 +2879,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
                 }
             }
         }
@@ -2699,6 +3049,7 @@ impl<'ctx> Codegen<'ctx> {
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
         }
         let always_returns = self.codegen_block(&method.body)?;
         if !always_returns && self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -2812,6 +3163,7 @@ impl<'ctx> Codegen<'ctx> {
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
         }
         // `initialize` sugar: this.field = param for each param matching a field
         // EBNF §22: initialize is sugar for this.field = field
@@ -2900,6 +3252,7 @@ impl<'ctx> Codegen<'ctx> {
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
             let _ = self.codegen_block(body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
                 self.builder.build_return(None).unwrap();
@@ -2933,6 +3286,7 @@ impl<'ctx> Codegen<'ctx> {
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
                         if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
                         if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::String(_)) { self.string_vars.insert(param.name.clone()); }
         }
         let _ = self.codegen_block(&op.body)?;
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -3156,6 +3510,10 @@ impl<'ctx> Codegen<'ctx> {
                 {
                     self.map_vars.insert(d.name.clone());
                 }
+                // Track strings for `len()`/`is_empty()` lowering.
+                if matches!(&d.ty, Type::String(_)) {
+                    self.string_vars.insert(d.name.clone());
+                }
                 if let Some(init) = &d.init {
                     // Fixed-array initializer: store each element via GEP so
                     // element widths coerce exactly (e.g. i64 literals into
@@ -3377,6 +3735,9 @@ impl<'ctx> Codegen<'ctx> {
                     || matches!(&c.ty, None) && matches!(c.init.kind, ExprKind::VecEmpty(_));
                 if is_vec_const {
                     self.vec_vars.insert(c.name.clone());
+                }
+                if matches!(c.ty, Some(Type::String(_))) {
+                    self.string_vars.insert(c.name.clone());
                 }
                 // Vector const with literal initializer: per-element buffer fill.
                 if let (Some(Type::Vec { .. }), ExprKind::ArrayLit(elems)) =
@@ -3683,13 +4044,29 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     (Some(16), false, false)
                 };
+                // Strings iterate to their loaded length (strlen), not a
+                // hardcoded size.
+                let iter_is_str_here = matches!(&f.iter.kind, ExprKind::Ident(n) if self.is_string_var(n));
                 // Create initial branch to cond
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
                 self.builder.position_at_end(cond_bb);
                 let idx_val = self.builder.build_load(idx_ty, idx_ptr, "for.idx.load").unwrap().into_int_value();
                 // Vectors iterate to their loaded length; arrays to the const size.
-                // Maps iterate over keys up to the loaded length.
-                let limit = if iter_is_vec || iter_is_map {
+                // Maps iterate over keys up to the loaded length. Strings
+                // iterate to their loaded length (strlen).
+                let limit = if iter_is_str_here {
+                    if let ExprKind::Ident(ref arr_name) = f.iter.kind {
+                        if let Some((arr_ptr, arr_ty)) = self.lookup_var(arr_name) {
+                            let sptr = self.builder.build_load(arr_ty, arr_ptr, "for.str.ptr").unwrap().into_pointer_value();
+                            let call = self.builder.build_call(self.get_or_declare_strlen(), &[sptr.into()], "for.str.len").unwrap();
+                            call.try_as_basic_value().basic().unwrap().into_int_value()
+                        } else {
+                            self.context.i64_type().const_int(16, false)
+                        }
+                    } else {
+                        self.context.i64_type().const_int(16, false)
+                    }
+                } else if iter_is_vec || iter_is_map {
                     if let ExprKind::Ident(ref arr_name) = f.iter.kind {
                         if let Some((arr_ptr, arr_ty)) = self.lookup_var(arr_name) {
                             if arr_ty.is_struct_type() {
@@ -3745,9 +4122,12 @@ impl<'ctx> Codegen<'ctx> {
                             _ => None,
                         }
                     } else if arr_ty.is_pointer_type() {
+                        // Strings: byte-stepped load, zero-extended to `char`
+                        // (i32). Other pointers cannot occur per sema.
                         let loaded_arr = self.builder.build_load(arr_ty, arr_ptr, "ptr.load").unwrap().into_pointer_value();
-                        let elem_ptr = unsafe { self.builder.build_gep(self.context.i64_type(), loaded_arr, &[idx_val], "for.ptr.elem").unwrap() };
-                        Some(self.builder.build_load(self.context.i64_type(), elem_ptr, "for.elem").unwrap())
+                        let elem_ptr = unsafe { self.builder.build_gep(self.context.i8_type(), loaded_arr, &[idx_val], "for.str.elem").unwrap() };
+                        let ch = self.builder.build_load(self.context.i8_type(), elem_ptr, "for.str.ch").unwrap().into_int_value();
+                        Some(self.builder.build_int_z_extend(ch, self.context.i32_type(), "for.elem").unwrap().into())
                     } else { None }
                 } else {
                     // For non-ident iter (e.g., string), try to codegen iter as pointer? For now fallback to 0
@@ -3763,6 +4143,35 @@ impl<'ctx> Codegen<'ctx> {
                     let var_ptr = self.create_entry_block_alloca(&f.var, self.context.i64_type().into());
                     self.builder.build_store(var_ptr, self.context.i64_type().const_int(0,false)).unwrap();
                     self.vars.last_mut().unwrap().insert(f.var.clone(), (var_ptr, self.context.i64_type().into()));
+                }
+                // Optional second loop variable: the index for arrays,
+                // vectors and strings; the value for maps.
+                if let Some((v2, _)) = &f.var2 {
+                    if iter_is_map_here {
+                        if let ExprKind::Ident(ref arr_name) = f.iter.kind {
+                            if let Some((arr_ptr, arr_ty)) = self.lookup_var(arr_name) {
+                                if arr_ty.is_struct_type() {
+                                    let map_st = arr_ty.into_struct_type();
+                                    let vals_ptr = self.builder.build_struct_gep(map_st, arr_ptr, 1, "for.map.vals").unwrap();
+                                    if let BasicTypeEnum::ArrayType(vals_arr_ty) = map_st.get_field_type_at_index(1).unwrap() {
+                                        let val_elem_ty = vals_arr_ty.get_element_type();
+                                        let vptr = unsafe {
+                                            self.builder.build_gep(vals_arr_ty, vals_ptr, &[self.context.i64_type().const_int(0, false), idx_val], "for.map.val.ptr").unwrap()
+                                        };
+                                        let vv = self.builder.build_load(val_elem_ty, vptr, "for.map.val").unwrap();
+                                        let v2_ptr = self.create_entry_block_alloca(v2, val_elem_ty);
+                                        self.builder.build_store(v2_ptr, vv).unwrap();
+                                        self.vars.last_mut().unwrap().insert(v2.clone(), (v2_ptr, val_elem_ty));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let i64_ty = self.context.i64_type().into();
+                        let v2_ptr = self.create_entry_block_alloca(v2, i64_ty);
+                        self.builder.build_store(v2_ptr, idx_val).unwrap();
+                        self.vars.last_mut().unwrap().insert(v2.clone(), (v2_ptr, i64_ty));
+                    }
                 }
                 let _ = self.codegen_block(&f.body)?;
                 // after body, branch to inc
@@ -3908,6 +4317,13 @@ impl<'ctx> Codegen<'ctx> {
                             self.builder.build_store(len_ptr, nlen).unwrap();
                             return Ok(self.context.i64_type().const_int(0, false).into());
                         }
+                    }
+                }
+                // Collection and string methods (`len`, `push` aside, `pop`,
+                // `contains`, `get`, ...). Sema has validated arity/types.
+                if let ExprKind::Ident(name) = &object.kind {
+                    if let Some(ret) = self.codegen_collection_method(name, method, args, expr.span)? {
+                        return Ok(ret);
                     }
                 }
                 // Determine this pointer for method call
@@ -4551,35 +4967,9 @@ impl<'ctx> Codegen<'ctx> {
                 args,
                 type_args: _,
             } => {
-                // stdlib io intrinsics: print, println, printInt, putChar
-                if Self::is_stdlib_io_intrinsic(callee) {
-                    if callee == "print" && args.len()==1 {
-                        let v = self.codegen_call_arg(&args[0])?;
-                        if v.is_pointer_value() {
-                            let puts = self.get_or_declare_puts();
-                            // Use printf for no newline to avoid puts newline
-                            let fmt = self.builder.build_global_string_ptr("%s", "fmt_s").unwrap();
-                            self.builder.build_call(self.get_or_declare_printf(), &[fmt.as_pointer_value().into(), v.into()], "printf").unwrap();
-                        }
-                        return Ok(self.context.i64_type().const_int(0,false).into());
-                    } else if callee == "println" && args.len()==1 {
-                        let v = self.codegen_call_arg(&args[0])?;
-                        let puts = self.get_or_declare_puts();
-                        self.builder.build_call(puts, &[v.into()], "puts").unwrap();
-                        return Ok(self.context.i64_type().const_int(0,false).into());
-                    } else if callee == "printInt" && args.len()==1 {
-                        let v = self.codegen_call_arg(&args[0])?;
-                        let fmt = self.builder.build_global_string_ptr("%ld\n", "fmt_ld").unwrap();
-                        self.builder.build_call(self.get_or_declare_printf(), &[fmt.as_pointer_value().into(), v.into()], "printf").unwrap();
-                        return Ok(self.context.i64_type().const_int(0,false).into());
-                    } else if callee == "putChar" && args.len()==1 {
-                        let v = self.codegen_call_arg(&args[0])?;
-                        let putchar = self.get_or_declare_putchar();
-                        let c = if v.is_int_value() && v.into_int_value().get_type().get_bit_width()!=32 { self.builder.build_int_z_extend_or_bit_cast(v.into_int_value(), self.context.i32_type(), "c_ext").unwrap().into() } else { v };
-                        self.builder.build_call(putchar, &[c.into()], "putchar").unwrap();
-                        return Ok(self.context.i64_type().const_int(0,false).into());
-                    }
-                }
+                // NOTE (real stdlib): no `print`-family fast path. Calls to
+                // `std::io` functions lower through the ordinary function /
+                // extern resolution below.
                 // Check for class constructor call: ClassName(args) -> allocate + ctor
                 if let Some(ctors) = self.class_constructors.get(callee).cloned() {
                     // pick ctor by arity

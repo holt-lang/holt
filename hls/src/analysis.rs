@@ -449,6 +449,18 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
                 )
                 .with_scope(scope);
                 self.locals.push(sym);
+                if let Some((v2, s2)) = &s.var2 {
+                    let sym2 = make_symbol(
+                        v2,
+                        SymKind::Variable,
+                        *s2,
+                        s.span,
+                        format!("for {}", v2),
+                        Vec::new(),
+                    )
+                    .with_scope(scope);
+                    self.locals.push(sym2);
+                }
                 self.collect_expr(&s.iter);
                 self.collect_block(&s.body, scope);
             }

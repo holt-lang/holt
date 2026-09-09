@@ -828,6 +828,13 @@ fn expand_imports(
                             out_items.push(it)
                         }
                         compiler::ast::Item::Import(_) => {}
+                        // Real stdlib: `extern` blocks are linkage requirements,
+                        // not selectable symbols. A selective import like
+                        // `import std::io::{print}` still needs the libc
+                        // declarations its wrappers call into.
+                        compiler::ast::Item::Extern(_) => {
+                            out_items.push(it)
+                        }
                         _ => {}
                     }
                 }

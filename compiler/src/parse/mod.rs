@@ -2328,12 +2328,20 @@ impl Parser {
         let start = if let Some((_, ls)) = &label_opt { ls.start } else { self.peek_span().start };
         self.expect(Token::For, "for")?;
         let (var, var_span) = self.parse_ident()?;
+        // Optional second variable: `for x, i in ...` (index) or
+        // `for k, v in ...` over maps (value).
+        let var2 = if self.consume_if(Token::Comma) {
+            let (v2, s2) = self.parse_ident()?;
+            Some((v2, s2))
+        } else {
+            None
+        };
         self.expect(Token::In, "expected `in` after for variable")?;
         let iter = self.parse_expr()?;
         let body = self.parse_block()?;
         let end = body.span.end;
         let (label, label_span) = match label_opt { Some((n,s)) => (Some(n), Some(s)), None => (None, None) };
-        Ok(ForStmt { label, label_span, var, var_span, iter, body, span: Span::new(start, end) })
+        Ok(ForStmt { label, label_span, var, var_span, var2, iter, body, span: Span::new(start, end) })
     }
 
     fn parse_defer(&mut self) -> Result<DeferStmt, ParseError> {

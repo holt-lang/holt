@@ -521,6 +521,9 @@ pub struct ForStmt {
     pub label_span: Option<Span>,
     pub var: String,
     pub var_span: Span,
+    /// Optional second loop variable (`for x, i in ...`). Arrays, vectors
+    /// and strings bind the index; maps bind the value (first binds the key).
+    pub var2: Option<(String, Span)>,
     pub iter: Expr,
     pub body: Block,
     pub span: Span,

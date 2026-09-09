@@ -1,19 +1,48 @@
-// std::io — minimal IO for Holt (Phase 1 + pure Holt sources).
+// std::io — terminal IO for Holt (real stdlib: pure Holt + extern FFI).
 // Import via: import std::io
 // or selective: import std::io::{print, println, printInt, putChar}
 //
- // This module is intrinsified by codegen until `extern "c" from "stdio.h"` (§36)
-// is fully wired. The Holt signatures below are canonical; bodies are supplied
-// by the runtime (libc puts/printf/putchar) via LLVM declarations.
+// Contract (REAL_STDLIB.md): the compiler knows only `extern "c"` lowering
+// and internal libc helpers for its own codegen (assert, interpolation).
+// Every user-facing IO name below is an ordinary Holt function defined here.
+// If you call `print` without `import std::io`, sema must report an
+// undefined name — that is the intended boundary, not a bug.
+//
+// Holt `string` is a null-terminated `ptr (i8*)`; `char` is `i32`.
+// ABIs match C exactly: `i32 puts(string s)`, `i32 printf(string fmt, ...)`,
+// `i32 putchar(char c)`.
 
+extern "c" from "libc" do
+    i32 puts(string s)
+    i32 printf(string fmt, ...)
+    i32 putchar(char c)
+end
+
+// print — no trailing newline.
 void print(string s) do
+    printf("%s", s)
 end
 
+// println — with trailing newline (libc `puts` appends `\n`).
 void println(string s) do
+    puts(s)
 end
 
+// printInt — decimal with trailing newline.
 void printInt(int n) do
+    printf("%ld\n", n)
 end
 
+// putChar — single character, no newline.
 void putChar(char c) do
+    putchar(c)
+end
+
+// printBool — `true` / `false`, no newline.
+void printBool(bool b) do
+    if b do
+        print("true")
+    else do
+        print("false")
+    end
 end

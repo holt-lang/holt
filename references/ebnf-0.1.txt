@@ -831,8 +831,11 @@ loop-statement =
 
 for-statement =
     [ loop-label ] ,
-    "for" , identifier , "in" , expression ,
+    "for" , identifier , [ "," , identifier ] , "in" , expression ,
     block ;
+    (* `for x in arr` binds elements; `for x, i in arr` also binds  *)
+    (* the index. Over maps, `for k in m` binds keys and            *)
+    (* `for k, v in m` binds key/value pairs.                       *)
 
 
 loop-label =

@@ -39,7 +39,7 @@ class Rect extends Shape implements Drawable has
 
     // Trait implementation: `override` not required here
     public void draw() do
-        return
+        println("Yo!")
     end
 end
 
@@ -74,7 +74,7 @@ end
 
 int main() do
     // Struct literal style initialization (works for classes too)
-    Rect r = Rect has
+    Rect r = has
         id = 0
         x = 10
         y = 20

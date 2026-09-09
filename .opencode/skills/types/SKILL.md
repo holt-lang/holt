@@ -717,3 +717,66 @@ The standard library remains responsible for the actual implementations and APIs
 The compiler remains responsible for the language syntax and semantics that cannot simply be represented as ordinary library declarations.
 
 The standard library and compiler are distributed together, so fundamental types feel like built-in parts of Holt to the programmer while remaining architecturally separated from the compiler's language keywords.
+
+---
+
+# 21. Collection and String Methods
+
+The compiler validates and lowers these methods directly (they operate on compiler-managed storage that Holt source cannot address):
+
+```text
+vectors: len(), is_empty(), push(x), pop(), clear(),
+         contains(x), first(), last()
+arrays:  len(), is_empty(), contains(x), first(), last()
+maps:    len(), is_empty(), contains(k), remove(k),
+         clear(), get_or(k, default)
+strings: len(), is_empty()
+```
+
+Notes:
+
+* `pop`, `first`, and `last` on an empty vector trap via `abort`.
+  `first`/`last` on an empty fixed array likewise trap.
+* `push` past vector capacity (16 entries, MVP) traps via `abort`, as
+  does map insert past capacity.
+* Map reads of missing keys yield the zero value; `get_or(k, default)`
+  supplies an explicit fallback instead. `remove` reports whether the
+  key was present (swap-with-last, order not preserved).
+* `get` is a reserved property keyword, hence `get_or`.
+
+Because these lowercase libc/runtime symbols are referenced by generated
+code, user functions may not be named `strlen`, `strcmp`, `abort`,
+`puts`, `printf`, `putchar`, `strcat`, or `sprintf`.
+
+---
+
+# 22. Pair Iteration
+
+`for` binds one variable by default and optionally a second:
+
+```holt
+for name in names do
+    println(name)
+end
+
+for name, index in names do
+    println(index)
+    println(name)
+end
+```
+
+Over arrays, vectors, and strings the second variable is the `int`
+index. Over maps the first variable binds keys and the second binds
+values:
+
+```holt
+string:int users = has
+    "John": 1
+    "Jane": 2
+    "Jack": 3
+end
+
+for key, value in users do
+    ...
+end
+```

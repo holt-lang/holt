@@ -1,0 +1,40 @@
+// types_methods — collection and string methods plus pair iteration.
+//
+// vectors: len, is_empty, push, pop, clear, contains, first, last
+// arrays:  len, is_empty, contains, first, last
+// maps:    len, is_empty, contains, remove, clear, get_or
+// strings: len, is_empty
+//
+// `for x, i in ...` binds the index for arrays/vectors/strings;
+// `for k, v in ...` over maps binds key/value pairs.
+
+int vec nums = [10, 20, 30]
+
+string:int ages = has "Ann": 25, "Bob": 30 end
+
+string name = "hello"
+
+int arr fixed = [7, 8]
+
+int main() do
+    int total = 0
+    total = total + nums.len() + ages.len() + name.len() + fixed.len()
+    if ages.contains("Ann") do
+        total = total + 100
+    end
+    if fixed.contains(8) do
+        total = total + 10
+    end
+    total = total + nums.pop() + fixed.first() + fixed.last()
+    total = total + ages.get_or("Zed", 5)
+    if ages.remove("Ann") do
+        total = total + 2
+    end
+    for n, i in nums do
+        total = total + n + i
+    end
+    for k, v in ages do
+        total = total + v
+    end
+    return total
+end

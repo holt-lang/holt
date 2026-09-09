@@ -1313,7 +1313,21 @@ impl Checker {
                 _ => None,
             };
             if let Some(f) = func_opt {
-                if self.funcs.contains_key(&f.name) {
+                // Runtime-reserved libc symbols the compiler references for
+                // codegen (`strlen` for `string.len()`, `strcmp` for string
+                // keys/`contains`, `abort` for traps, IO shims). A user
+                // definition would silently merge with (or recurse into) the
+                // external declaration.
+                const RESERVED_RUNTIME: &[&str] = &[
+                    "strlen", "strcmp", "abort", "puts", "printf", "putchar",
+                    "strcat", "sprintf",
+                ];
+                if RESERVED_RUNTIME.contains(&f.name.as_str()) {
+                    self.errors.push(SemError {
+                        message: format!("function name `{}` is reserved for the runtime", f.name),
+                        span: f.name_span,
+                    });
+                } else if self.funcs.contains_key(&f.name) {
                     self.errors.push(SemError {
                         message: format!("duplicate function `{}`", f.name),
                         span: f.name_span,
@@ -1814,9 +1828,22 @@ impl Checker {
                         Ty::Int
                     }
                 };
+                // Second loop variable: the index for arrays/vectors/strings,
+                // the value for maps.
+                let second_ty: Option<Ty> = match &f.var2 {
+                    None => None,
+                    Some(_) => Some(match &iter_ty {
+                        Ty::Array(_) | Ty::FixedArray { .. } | Ty::Vec(_) | Ty::String => Ty::Int,
+                        Ty::Map { value, .. } => (**value).clone(),
+                        _ => Ty::Int,
+                    }),
+                };
                 self.loop_stack.push(f.label.clone());
                 self.push_scope();
                 self.declare_var(&f.var, elem_ty, f.var_span);
+                if let (Some((v2, s2)), Some(t2)) = (&f.var2, &second_ty) {
+                    self.declare_var(v2, t2.clone(), *s2);
+                }
                 let _ = self.check_block(&f.body, ret_ty);
                 self.pop_scope();
                 self.loop_stack.pop();
@@ -2252,11 +2279,9 @@ impl Checker {
                     for arg in args { let _ = self.check_call_arg(arg); }
                     return struct_ty;
                 }
-                // builtin io intrinsics
-                if matches!(callee.as_str(), "print" | "println" | "printInt" | "putChar") {
-                    for arg in args { let _ = self.check_call_arg(arg); }
-                    return Ty::Void;
-                }
+                // NOTE (real stdlib): no builtin IO shortcut. `print`/`println`/
+                // `printInt`/`putChar` are ordinary functions from `std::io`;
+                // without `import std::io` they are undefined names by design.
                 let sig = self.funcs.get(callee).cloned();
                 if let Some(sig) = sig {
                     if sig.param_is_variadic.iter().any(|&v| v) {
@@ -2607,6 +2632,11 @@ impl Checker {
                         }
                         return Ty::Void;
                     }
+                }
+                // Collection and string methods (types skill: stdlib behavior,
+                // compiler-validated). Returns Some when handled.
+                if let Some(ret) = self.check_collection_method(object, method, method_span, args, &obj_ty) {
+                    return ret;
                 }
                 let sname = match obj_ty {
                     Ty::Struct(ref n) => n.clone(),
@@ -3063,6 +3093,183 @@ impl Checker {
                     _ => self.errors.push(SemError { message: "ref argument must be lvalue".into(), span: expr.span }),
                 }
                 ty
+            }
+        }
+    }
+
+    /// Collection and string methods (types skill: behavior specified by the
+    /// skill/stdlib, validated by the compiler). Returns `Some` when the
+    /// receiver is a known collection/string type (handled or diagnosed),
+    /// `None` to fall through to class-method resolution.
+    ///
+    /// Supported methods:
+    /// - vectors: `len`, `is_empty`, `pop`, `clear`, `contains`, `first`,
+    ///   `last` (`push` is handled separately for type establishment);
+    /// - arrays: `len`, `is_empty`, `contains`, `first`, `last`;
+    /// - maps: `len`, `is_empty`, `contains`, `remove`, `clear`, `get_or`
+    ///   (`get` is a reserved property keyword);
+    /// - strings: `len`, `is_empty`.
+    fn check_collection_method(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        method_span: &Span,
+        args: &[CallArg],
+        obj_ty: &Ty,
+    ) -> Option<Ty> {
+        enum Family<'a> {
+            Seq { elem: &'a Ty, dynamic: bool },
+            Map { key: &'a Ty, value: &'a Ty },
+            Str,
+        }
+        let family = match obj_ty {
+            Ty::Vec(elem) => Family::Seq { elem, dynamic: true },
+            Ty::Array(elem) => Family::Seq { elem, dynamic: false },
+            Ty::FixedArray { elem, .. } => Family::Seq { elem, dynamic: false },
+            Ty::Map { key, value } => Family::Map { key, value },
+            Ty::String => Family::Str,
+            _ => return None,
+        };
+        // Mutating methods on `const` bindings are rejected (when the base
+        // is a plain identifier).
+        let mutating = matches!(method, "pop" | "clear" | "remove");
+        if mutating {
+            if let ExprKind::Ident(name) = &object.kind {
+                if self.is_const(name) {
+                    self.errors.push(SemError {
+                        message: format!("cannot call mutating method `{method}` on const `{name}`"),
+                        span: *method_span,
+                    });
+                }
+            }
+        }
+        // (expected arity, check args) — arg checking runs inline below.
+        let expect_arity = |want: usize| -> bool {
+            if args.len() != want {
+                return false;
+            }
+            true
+        };
+        let arity_ok = match method {
+            "len" | "is_empty" | "pop" | "clear" | "first" | "last" => expect_arity(0),
+            "contains" | "remove" => expect_arity(1),
+            "get_or" => expect_arity(2),
+            _ => true,
+        };
+        if !arity_ok {
+            let want = match method {
+                "len" | "is_empty" | "pop" | "clear" | "first" | "last" => 0,
+                "contains" | "remove" => 1,
+                "get_or" => 2,
+                _ => 0,
+            };
+            self.errors.push(SemError {
+                message: format!("`{method}` expects {want} arg(s), found {}", args.len()),
+                span: *method_span,
+            });
+            for a in args {
+                let _ = self.check_call_arg(a);
+            }
+            return Some(Ty::Int);
+        }
+        match (family, method) {
+            (Family::Seq { .. }, "len") => Some(Ty::Int),
+            (Family::Map { .. }, "len") => Some(Ty::Int),
+            (Family::Str, "len") => Some(Ty::Int),
+            (Family::Seq { .. }, "is_empty") => Some(Ty::Bool),
+            (Family::Map { .. }, "is_empty") => Some(Ty::Bool),
+            (Family::Str, "is_empty") => Some(Ty::Bool),
+            (Family::Seq { elem, dynamic }, "pop") => {
+                if !dynamic {
+                    self.errors.push(SemError {
+                        message: "`pop` is only available on vectors (`vec`), not fixed arrays".into(),
+                        span: *method_span,
+                    });
+                    return Some(elem.clone());
+                }
+                Some(elem.clone())
+            }
+            (Family::Seq { dynamic: true, .. }, "clear") => Some(Ty::Void),
+            (Family::Map { .. }, "clear") => Some(Ty::Void),
+            (Family::Seq { elem, .. }, "contains") => {
+                let aty = self.check_call_arg(&args[0]);
+                if !Ty::assignable(&aty, elem) {
+                    self.errors.push(SemError {
+                        message: format!("`contains` expects `{}`, found `{}`", elem, aty),
+                        span: args[0].span(),
+                    });
+                }
+                Some(Ty::Bool)
+            }
+            (Family::Map { key, .. }, "contains") => {
+                let aty = self.check_call_arg(&args[0]);
+                if !Ty::assignable(&aty, key) {
+                    self.errors.push(SemError {
+                        message: format!("`contains` expects key `{}`, found `{}`", key, aty),
+                        span: args[0].span(),
+                    });
+                }
+                Some(Ty::Bool)
+            }
+            (Family::Seq { elem, .. }, "first") | (Family::Seq { elem, .. }, "last") => {
+                Some(elem.clone())
+            }
+            (Family::Map { key, .. }, "remove") => {
+                let aty = self.check_call_arg(&args[0]);
+                if !Ty::assignable(&aty, key) {
+                    self.errors.push(SemError {
+                        message: format!("`remove` expects key `{}`, found `{}`", key, aty),
+                        span: args[0].span(),
+                    });
+                }
+                Some(Ty::Bool)
+            }
+            (Family::Map { key, value }, "get_or") => {
+                let kty = self.check_call_arg(&args[0]);
+                if !Ty::assignable(&kty, key) {
+                    self.errors.push(SemError {
+                        message: format!("`get_or` expects key `{}`, found `{}`", key, kty),
+                        span: args[0].span(),
+                    });
+                }
+                let dty = self.check_call_arg(&args[1]);
+                if !Ty::assignable(&dty, value) {
+                    self.errors.push(SemError {
+                        message: format!("`get_or` expects default `{}`, found `{}`", value, dty),
+                        span: args[1].span(),
+                    });
+                }
+                Some(value.clone())
+            }
+            // Availability errors: right family shape, wrong method.
+            (Family::Seq { dynamic: false, .. }, "clear")
+            | (Family::Seq { dynamic: false, .. }, "remove")
+            | (Family::Seq { dynamic: false, .. }, "get_or") => {
+                self.errors.push(SemError {
+                    message: format!("`{method}` is not available on fixed arrays"),
+                    span: *method_span,
+                });
+                for a in args {
+                    let _ = self.check_call_arg(a);
+                }
+                Some(Ty::Int)
+            }
+            (Family::Seq { .. }, _) | (Family::Map { .. }, _) | (Family::Str, _) => {
+                let supported = match obj_ty {
+                    Ty::Vec(_) => "`len`, `is_empty`, `push`, `pop`, `clear`, `contains`, `first`, `last`",
+                    Ty::Array(_) | Ty::FixedArray { .. } => "`len`, `is_empty`, `contains`, `first`, `last`",
+                    Ty::Map { .. } => "`len`, `is_empty`, `contains`, `remove`, `clear`, `get_or`",
+                    Ty::String => "`len`, `is_empty`",
+                    _ => "",
+                };
+                self.errors.push(SemError {
+                    message: format!("unknown method `{method}` for `{obj_ty}`; supported: {supported}"),
+                    span: *method_span,
+                });
+                for a in args {
+                    let _ = self.check_call_arg(a);
+                }
+                Some(Ty::Int)
             }
         }
     }
