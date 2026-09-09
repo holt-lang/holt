@@ -62,6 +62,9 @@ enum Commands {
     /// Check a .hlt source file (lex → parse → check, no codegen)
     #[command(visible_alias = "c")]
     Check(CheckArgs),
+    /// Run the Holt language server (LSP over stdio)
+    #[command(visible_alias = "ls")]
+    Lsp,
 }
 
 #[derive(Parser, Debug)]
@@ -178,6 +181,9 @@ fn main() -> miette::Result<()> {
         Commands::Build(args) => run_build(args),
         Commands::Run(args) => run_run(args),
         Commands::Check(args) => run_check(args),
+        // The language server speaks LSP on stdio and terminates itself with
+        // its own exit code after the client sends `exit`.
+        Commands::Lsp => std::process::exit(hls::server::run()),
     }
 }
 
