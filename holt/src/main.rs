@@ -25,6 +25,8 @@ enum Commands {
     Build(BuildArgs),
     /// Build and run a .hlt source file, removing the binary afterwards
     Run(RunArgs),
+    /// Check a .hlt source file (lex → parse → check, no codegen)
+    Check(CheckArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -97,7 +99,30 @@ struct RunArgs {
     program_args: Vec<String>,
 }
 
-/// Shared knobs for the compile pipeline (used by both `build` and `run`).
+#[derive(Parser, Debug)]
+struct CheckArgs {
+    /// Source file (.hlt) to check
+    file: PathBuf,
+
+    /// Print AST for debugging
+    #[arg(long, default_value_t = false)]
+    print_ast: bool,
+
+    /// Only print errors (no status lines or progress bar)
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
+
+    /// Force coloured output even when stderr is not a terminal
+    /// (also honours the `FORCE_COLOR` environment variable)
+    #[arg(long, default_value_t = false)]
+    color: bool,
+
+    /// Show verbose progress (default: summary lines)
+    #[arg(long, default_value_t = false)]
+    verbose: bool,
+}
+
+/// Shared knobs for the compile pipeline (used by `build`, `run` and `check`).
 struct CompileOptions<'a> {
     file: &'a Path,
     emit_llvm: bool,
@@ -108,6 +133,8 @@ struct CompileOptions<'a> {
     force_color: bool,
     verbose: bool,
     exe_path: Option<PathBuf>,
+    /// Stop after sema (no codegen/link). Used by `check`.
+    check_only: bool,
 }
 
 fn main() -> miette::Result<()> {
@@ -115,6 +142,7 @@ fn main() -> miette::Result<()> {
     match cli.command {
         Commands::Build(args) => run_build(args),
         Commands::Run(args) => run_run(args),
+        Commands::Check(args) => run_check(args),
     }
 }
 
@@ -148,11 +176,11 @@ fn seconds(d: Duration) -> String {
 }
 
 /// Single status line on stderr: brand-green right-aligned prefix + message.
-/// Suppressed under `--quiet`. Routed through the progress bar so the bar
-/// redraws cleanly instead of being corrupted by raw `eprintln!` output.
+/// Suppressed under `--quiet`. Suspends the progress bar so the bar redraws
+/// cleanly instead of being corrupted by raw `eprintln!` output.
 fn status(pb: &ProgressBar, quiet: bool, prefix: &str, msg: &str) {
     if !quiet {
-        pb.println(format!("{:>11} {}", brand(prefix), msg));
+        pb.suspend(|| eprintln!("{:>11} {}", brand(prefix), msg));
     }
 }
 
@@ -196,6 +224,24 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
         force_color: args.color,
         verbose: args.verbose,
         exe_path: args.output.clone(),
+        check_only: false,
+    };
+    let _ = compile(opts)?;
+    Ok(())
+}
+
+fn run_check(args: CheckArgs) -> miette::Result<()> {
+    let opts = CompileOptions {
+        file: &args.file,
+        emit_llvm: false,
+        emit_llvm_file: None,
+        keep_obj: true,
+        print_ast: args.print_ast,
+        quiet: args.quiet,
+        force_color: args.color,
+        verbose: args.verbose,
+        exe_path: None,
+        check_only: true,
     };
     let _ = compile(opts)?;
     Ok(())
@@ -225,6 +271,7 @@ fn run_run(args: RunArgs) -> miette::Result<()> {
         force_color: args.color,
         verbose: args.verbose,
         exe_path: Some(tmp_exe.clone()),
+        check_only: false,
     };
     let built = compile(opts)?;
     let exe = match built {
@@ -268,8 +315,14 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     init_colors(opts.force_color);
     let quiet = opts.quiet;
     let start_all = Instant::now();
-    // read, lex, parse, resolve, check, codegen/emit, link
-    let total_steps: u64 = if opts.emit_llvm { 6 } else { 7 };
+    // read, lex, parse, resolve, check, [codegen/emit, link]
+    let total_steps: u64 = if opts.check_only {
+        5
+    } else if opts.emit_llvm {
+        6
+    } else {
+        7
+    };
     let pb = new_progress_bar(quiet, total_steps);
 
     status(&pb, quiet, "Compiling", &file.display().to_string());
@@ -414,6 +467,18 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         );
         pb.abandon();
         fail(Report::new(multi));
+    }
+    if opts.check_only {
+        pb.finish_with_message("Finished");
+        status(&pb, quiet,
+            "Checked",
+            &format!(
+                "{} in {}",
+                file.display(),
+                seconds(start_all.elapsed())
+            ),
+        );
+        return Ok(None);
     }
     status(&pb, quiet,
         "Checked",
