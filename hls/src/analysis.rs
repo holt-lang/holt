@@ -494,9 +494,16 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
             ExprKind::Paren(e)
             | ExprKind::Unary { expr: e, .. }
             | ExprKind::Postfix { expr: e, .. } => self.collect_expr(e),
-            ExprKind::Tuple(es) => {
+            ExprKind::Tuple(es) | ExprKind::ArrayLit(es) => {
                 for e in es {
                     self.collect_expr(e);
+                }
+            }
+            ExprKind::VecEmpty(_) => {}
+            ExprKind::MapLit { entries, .. } => {
+                for (k, v) in entries {
+                    self.collect_expr(k);
+                    self.collect_expr(v);
                 }
             }
             ExprKind::Binary { lhs, rhs, .. } => {

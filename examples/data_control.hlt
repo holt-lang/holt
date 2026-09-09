@@ -25,13 +25,15 @@ int main() do
     int d = dist2(p) // 6*6 + 4*4 = 52
 
     // --- arrays and indexing ---
-    int[] arr
-    arr[0] = 10
-    arr[1] = 20
-    arr[2] = 30
+    // NOTE: `arr` is a compiler keyword (fixed-array type form), so the
+    // binding uses `items` instead.
+    int[] items
+    items[0] = 10
+    items[1] = 20
+    items[2] = 30
     int sum = 0
     // for loop over array
-    for v in arr do
+    for v in items do
         sum = sum + v
         if (sum is 30) do
             continue

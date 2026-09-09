@@ -1,0 +1,18 @@
+// types_ints — sized fundamental integer types (types skill §2).
+// No import required: i8..u128, uint resolve via the implicit stdlib env.
+
+i8 small = 100
+uint count = 7
+
+i32 add32(i32 x, i32 y) do
+    return x + y
+end
+
+int main() do
+    i32 a = 10
+    i32 b = 20
+    i32 c = add32(a, b)
+    u8 n = 255
+    i64 big = 5000000000
+    return c
+end

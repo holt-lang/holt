@@ -1,0 +1,25 @@
+// types_vec — dynamically sized vectors (types skill §9-11).
+// `vec` is a compiler keyword: the element type precedes it.
+// Empty `vec[]` has no element type until the first `push` fixes it.
+
+int vec numbers = [1, 2, 3, 4]
+
+any names = vec[]
+
+any values = vec[]
+
+int main() do
+    names.push("John")
+    names.push("Jane")
+    values.push(42)
+    values.push(100)
+    numbers.push(5)
+    int n = numbers[4]
+    int v = values[1]
+    string s = names[0]
+    int total = numbers[0] + n + v
+    for x in numbers do
+        total = total + x
+    end
+    return total
+end

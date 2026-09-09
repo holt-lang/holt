@@ -1,0 +1,20 @@
+// types_arr — fixed-size arrays (types skill §7-8).
+// `arr` is a compiler keyword: the element type precedes it.
+// Inferred size from initializer; explicit size is zero-initialized.
+
+int arr numbers = [1, 2, 3, 4]
+
+int arr[5] fixed
+
+string arr names = ["John", "Jane", "Abbas"]
+
+int main() do
+    numbers[1] = 20
+    int sum = numbers[0] + numbers[1] + numbers[2] + numbers[3]
+    fixed[0] = 7
+    int f = fixed[0]
+    for v in numbers do
+        sum = sum + v
+    end
+    return sum + f
+end

@@ -3,7 +3,9 @@
 (* Draft 0.2 — updated for Phase 5 fixes: accessors public by       *)
 (* default, separate get/set merging, `open` class-only, omitted    *)
 (* `Type` in `has` literals, T-17: `|`/`or` alternative chains +    *)
-(* tuple-pattern `(a,b)` in `match`                                *)
+(* tuple-pattern `(a,b)` in `match`, types skill: `arr`/`vec` type     *)
+(* forms, array literals `[1,2,3]`, empty `vec[]`, `K:V` map types +    *)
+(* `has k: v end` map literals                                       *)
 (* ================================================================ *)
 
 (* ---------------------------------------------------------------- *)
@@ -42,6 +44,7 @@ digit =
 keyword =
       "and"
     | "any"
+    | "arr"
     | "assert"
     | "bool"
     | "break"
@@ -90,6 +93,7 @@ keyword =
     | "trait"
     | "typedef"
     | "void"
+    | "vec"
     | "while"
     | "where" ;
 
@@ -257,6 +261,9 @@ primary-type =
     | function-type
     | tuple-type
     | any-type
+    | fixed-array-type
+    | vector-type
+    | map-type
     | parenthesized-type ;
 
 
@@ -301,6 +308,27 @@ tuple-type =
 
 parenthesized-type =
     "(" , type , ")" ;
+
+
+(* `arr` is a compiler keyword for fixed-size arrays (element type      *)
+(* precedes it). Inferred size takes the initializer length; explicit   *)
+(* size is zero-initialized and fixed for the array's lifetime.         *)
+fixed-array-type =
+    type , "arr" , [ "[" , integer-literal , "]" ] ;
+
+
+(* `vec` is a compiler keyword for owning, growable vectors (element    *)
+(* type precedes it). Empty vectors come from the `vec[]` expression    *)
+(* with an undetermined element type until the first `push`.            *)
+vector-type =
+    type , "vec" ;
+
+
+(* There is no `map` keyword. Map types use `KEY_TYPE:VALUE_TYPE`. The   *)
+(* `:` operator is distinct from `::` (qualified names) and from the    *)
+(* `where` constraint colon. `string:int[]` is a map to an array.        *)
+map-type =
+    type , ":" , type ;
 
 
 type-modifier =
@@ -530,6 +558,9 @@ primary-expression =
     | struct-expression
     | enum-variant-expression
     | tuple-expression
+    | array-literal
+    | empty-vector
+    | map-literal
     | parenthesized-expression ;
 
 
@@ -557,6 +588,32 @@ parenthesized-expression =
 
 tuple-expression =
     "(" , [ expression , { "," , expression } , [ "," ] ] , ")" ;
+
+
+(* Array literal: initializer for `TYPE arr` (size inferred from the      *)
+(* element count). All elements must be compatible with the element type. *)
+array-literal =
+    "[" , [ expression , { "," , expression } ] , "]" ;
+
+
+(* Empty vector: `vec[]` has no element type until the first `push`      *)
+(* establishes it permanently (e.g. `any xs = vec[]`).                  *)
+empty-vector =
+    "vec" , "[" , "]" ;
+
+
+(* Map literal: `has` entries of `key: value` for a `KEY:VALUE` type.    *)
+(* Multiline or compact (`has "a": 1, "b": 2 end`); the declared type   *)
+(* may be omitted for `any` (inferred from the first entry). Keys must  *)
+(* be `string` or int types; both sides are type-checked.               *)
+map-literal =
+    [ type ] , "has" ,
+    { map-entry } ,
+    "end" ;
+
+map-entry =
+    expression , ":" , expression ,
+    [ "," ] , statement-terminator ;
 
 
 

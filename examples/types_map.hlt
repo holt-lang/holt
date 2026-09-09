@@ -1,0 +1,29 @@
+// types_map — associative maps (types skill §12-14).
+// No `map` keyword: map types use `KEY_TYPE:VALUE_TYPE` and literals use
+// `has key: value, ... end` (multiline or compact).
+
+string:int ages = has
+    "John": 25
+    "Jane": 30
+end
+
+int:bool stm = has
+    1: true
+    2: false
+    3: false
+end
+
+string:bool admins = has "John": false, "Jane": true end
+
+int main() do
+    int a = ages["John"]
+    ages["Bob"] = 40
+    int total = a + ages["Jane"] + ages["Bob"]
+    if admins["Jane"] do
+        total = total + 1000
+    end
+    for name in ages do
+        total = total + ages[name]
+    end
+    return total
+end

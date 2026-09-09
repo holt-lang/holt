@@ -2,6 +2,7 @@
 //! All locals/params are `alloca` in entry block; structs lowered to llvm.struct with GEP.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use inkwell::IntPredicate;
@@ -50,6 +51,13 @@ pub struct Codegen<'ctx> {
     cur_is_main: bool,
     cur_class: Option<String>,
     closure_count: usize,
+    /// Variables holding vectors (`TYPE vec` or `any x = vec[]`). Their LLVM
+    /// type is the vec struct `{ [16 x E], i64 len }`; this set distinguishes
+    /// them from class instances (also structs) for `push`/index/`for`.
+    vec_vars: HashSet<String>,
+    /// Variables holding maps (`K:V` or `any m = has ... end`). LLVM type is
+    /// the map struct `{ [16 x K], [16 x V], i64 len }`.
+    map_vars: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +102,8 @@ impl<'ctx> Codegen<'ctx> {
             cur_fn: None,
             cur_is_main: false,
             cur_class: None,
+            vec_vars: HashSet::new(),
+            map_vars: HashSet::new(),
         }
     }
 
@@ -289,6 +299,8 @@ impl<'ctx> Codegen<'ctx> {
             let fn_ty = match ret_ty {
                 crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
                 crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::UInt => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::SizedInt { bits, .. } => self.llvm_int_for_bits(bits).fn_type(&param_llvm, false),
                 crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
                 crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, false),
                 crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
@@ -297,6 +309,35 @@ impl<'ctx> Codegen<'ctx> {
                     st.fn_type(&param_llvm, false)
                 }
                 crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).fn_type(&param_llvm, false),
+                crate::sema::Ty::FixedArray { elem: ref elem, size: ref size } => {
+                    let n = size.unwrap_or(16) as u32;
+                    match self.llvm_ty_for_sema(elem.as_ref()) {
+                        Some(BasicTypeEnum::IntType(it)) => it.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::FloatType(ft)) => ft.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::PointerType(pt)) => pt.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::StructType(st)) => st.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::ArrayType(at)) => at.array_type(n).fn_type(&param_llvm, false),
+                        _ => self.context.i64_type().array_type(n).fn_type(&param_llvm, false),
+                    }
+                },
+                crate::sema::Ty::Vec(ref elem) => {
+                    let inner = match elem.as_ref() {
+                        crate::sema::Ty::Any => self.context.i64_type().into(),
+                        _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    self.vec_struct_ty(inner).fn_type(&param_llvm, false)
+                },
+                crate::sema::Ty::Map { key: ref key, value: ref value } => {
+                    let k = match key.as_ref() {
+                        crate::sema::Ty::Any => self.context.i64_type().into(),
+                        _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    let v = match value.as_ref() {
+                        crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                        _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    self.map_struct_ty(k, v).fn_type(&param_llvm, false)
+                },
                 crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
                 crate::sema::Ty::Optional(ref el) => {
                     let inner = self.llvm_ty_for_sema(el).unwrap();
@@ -360,6 +401,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             let fn_ty = match ret_ty {
                 crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::UInt => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::SizedInt { bits, .. } => self.llvm_int_for_bits(bits).fn_type(&param_llvm, false),
                 crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
                 _ => self.context.i64_type().fn_type(&param_llvm, false),
             };
@@ -632,6 +675,8 @@ impl<'ctx> Codegen<'ctx> {
                     let fn_ty = match ret_ty {
                         crate::sema::Ty::Void => self.context.void_type().fn_type(&param_llvm, false),
                         crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::UInt => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::SizedInt { bits, .. } => self.llvm_int_for_bits(bits).fn_type(&param_llvm, false),
                         crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
                         crate::sema::Ty::Char => self.context.i32_type().fn_type(&param_llvm, false),
                         crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
@@ -650,6 +695,35 @@ impl<'ctx> Codegen<'ctx> {
                         crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
                         crate::sema::Ty::Function(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
                         crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).fn_type(&param_llvm, false),
+                crate::sema::Ty::FixedArray { elem: ref elem, size: ref size } => {
+                    let n = size.unwrap_or(16) as u32;
+                    match self.llvm_ty_for_sema(elem.as_ref()) {
+                        Some(BasicTypeEnum::IntType(it)) => it.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::FloatType(ft)) => ft.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::PointerType(pt)) => pt.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::StructType(st)) => st.array_type(n).fn_type(&param_llvm, false),
+                        Some(BasicTypeEnum::ArrayType(at)) => at.array_type(n).fn_type(&param_llvm, false),
+                        _ => self.context.i64_type().array_type(n).fn_type(&param_llvm, false),
+                    }
+                },
+                crate::sema::Ty::Vec(ref elem) => {
+                    let inner = match elem.as_ref() {
+                        crate::sema::Ty::Any => self.context.i64_type().into(),
+                        _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    self.vec_struct_ty(inner).fn_type(&param_llvm, false)
+                },
+                crate::sema::Ty::Map { key: ref key, value: ref value } => {
+                    let k = match key.as_ref() {
+                        crate::sema::Ty::Any => self.context.i64_type().into(),
+                        _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    let v = match value.as_ref() {
+                        crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                        _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    self.map_struct_ty(k, v).fn_type(&param_llvm, false)
+                },
                         crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).fn_type(&param_llvm, false),
                         crate::sema::Ty::Optional(ref el) => {
                             let inner = self.llvm_ty_for_sema(el).unwrap();
@@ -699,6 +773,8 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     let fn_ty = match ret_ty {
                         crate::sema::Ty::Int => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::UInt => self.context.i64_type().fn_type(&param_llvm, false),
+                crate::sema::Ty::SizedInt { bits, .. } => self.llvm_int_for_bits(bits).fn_type(&param_llvm, false),
                         crate::sema::Ty::Bool => self.context.bool_type().fn_type(&param_llvm, false),
                         _ => self.context.i64_type().fn_type(&param_llvm, false),
                     };
@@ -878,6 +954,26 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn declare_const(&mut self, c: &ConstDecl) -> Result<(), CodegenError> {
+        // Top-level map constants lower exactly like global map variables
+        // (const-folded entries), then flagged constant.
+        if matches!(c.ty, Some(Type::Map { .. }))
+            || matches!(&c.ty, None) && matches!(c.init.kind, ExprKind::MapLit { .. })
+        {
+            let ty = c.ty.clone().unwrap_or(Type::Any(Span::new(0, 0)));
+            let fake = VarDecl {
+                visibility: c.visibility.clone(),
+                ty,
+                name: c.name.clone(),
+                name_span: c.name_span,
+                init: Some(c.init.clone()),
+                span: c.span,
+            };
+            self.declare_global_var(&fake)?;
+            if let Some(g) = self.module.get_global(&c.name) {
+                g.set_constant(true);
+            }
+            return Ok(());
+        }
         let ty = if let Some(t) = &c.ty {
             self.llvm_ty_for(t)
         } else {
@@ -894,8 +990,12 @@ impl<'ctx> Codegen<'ctx> {
         let global = self.module.add_global(ty, None, &c.name);
         global.set_constant(true);
         // For simple literals, set initializer directly; for complex, initializer will be set at runtime via holt.init (deferred)
+        // Int literals are emitted in the target width (sized ints truncate/extend).
         let init_val = match &c.init.kind {
-            ExprKind::IntLit(v) => self.context.i64_type().const_int(*v as u64, true).into(),
+            ExprKind::IntLit(v) => match ty {
+                BasicTypeEnum::IntType(it) => it.const_int(*v as u64, true).into(),
+                _ => self.context.i64_type().const_int(*v as u64, true).into(),
+            },
             ExprKind::BoolLit(b) => self.context.bool_type().const_int(if *b {1} else {0}, false).into(),
             ExprKind::StringLit(s) => {
                 let str_val = self.context.const_string(s.as_bytes(), true);
@@ -921,13 +1021,329 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn declare_global_var(&mut self, v: &VarDecl) -> Result<(), CodegenError> {
+        // Global maps: `{ keys, vals, len }` const struct. Literal entries
+        // const-fold (literals; anything else zero-fills); otherwise zero.
+        if matches!(&v.ty, Type::Map { .. })
+            || matches!(&v.ty, Type::Any(_))
+                && v.init.as_ref().is_some_and(|i| matches!(i.kind, ExprKind::MapLit { .. }))
+        {
+            let entries: &[(Expr, Expr)] = match &v.init {
+                Some(init) => match &init.kind {
+                    ExprKind::MapLit { entries, .. } => entries,
+                    _ => &[],
+                },
+                None => &[],
+            };
+            let (dk, dv) = self.map_keyval_llvm_ty(&v.ty, entries);
+            let map_st = self.map_struct_ty(dk, dv);
+            let global = self.module.add_global(map_st.as_basic_type_enum(), None, &v.name);
+            global.set_constant(false);
+            // Const-fold entries; pad buffers to capacity.
+            let fold_const = |e: &Expr, slot: BasicTypeEnum<'ctx>| -> BasicValueEnum<'ctx> {
+                match &e.kind {
+                    ExprKind::IntLit(val) => match slot {
+                        BasicTypeEnum::IntType(it) => it.const_int(*val as u64, true).into(),
+                        _ => self.context.i64_type().const_int(*val as u64, true).into(),
+                    },
+                    ExprKind::BoolLit(b) => match slot {
+                        BasicTypeEnum::IntType(it) => it.const_int(if *b { 1 } else { 0 }, false).into(),
+                        _ => self.context.bool_type().const_int(if *b { 1 } else { 0 }, false).into(),
+                    },
+                    ExprKind::CharLit(ch) => self.context.i32_type().const_int(*ch as u64, false).into(),
+                    _ => slot.const_zero(),
+                }
+            };
+            // NOTE: string keys need runtime globals; const-fold strings via
+            // private globals like scalar string inits.
+            let mut key_consts: Vec<BasicValueEnum<'ctx>> = Vec::new();
+            let mut val_consts: Vec<BasicValueEnum<'ctx>> = Vec::new();
+            for (k, val) in entries.iter() {
+                let kc = match &k.kind {
+                    ExprKind::StringLit(s) => {
+                        let str_val = self.context.const_string(s.as_bytes(), true);
+                        let str_ty = str_val.get_type();
+                        let str_global = self.module.add_global(str_ty, None, &format!("str.mapkey.{}.{}", v.name, self.globals.len()));
+                        str_global.set_initializer(&str_val);
+                        str_global.set_constant(true);
+                        str_global.set_linkage(inkwell::module::Linkage::Private);
+                        let zero = self.context.i32_type().const_zero();
+                        let ptr = unsafe { str_global.as_pointer_value().const_gep(str_ty, &[zero, zero]) };
+                        let pv: BasicValueEnum<'ctx> = ptr.as_basic_value_enum();
+                        self.coerce_to_ty(pv, dk)
+                    }
+                    _ => fold_const(k, dk),
+                };
+                key_consts.push(kc);
+                let vc = match &val.kind {
+                    ExprKind::StringLit(s) => {
+                        let str_val = self.context.const_string(s.as_bytes(), true);
+                        let str_ty = str_val.get_type();
+                        let str_global = self.module.add_global(str_ty, None, &format!("str.mapval.{}.{}", v.name, self.globals.len()));
+                        str_global.set_initializer(&str_val);
+                        str_global.set_constant(true);
+                        str_global.set_linkage(inkwell::module::Linkage::Private);
+                        let zero = self.context.i32_type().const_zero();
+                        let ptr = unsafe { str_global.as_pointer_value().const_gep(str_ty, &[zero, zero]) };
+                        let pv: BasicValueEnum<'ctx> = ptr.as_basic_value_enum();
+                        self.coerce_to_ty(pv, dv)
+                    }
+                    _ => fold_const(val, dv),
+                };
+                val_consts.push(vc);
+            }
+            let keys_arr = match map_st.get_field_type_at_index(0).unwrap() {
+                BasicTypeEnum::ArrayType(at) => at,
+                _ => unreachable!(),
+            };
+            let vals_arr = match map_st.get_field_type_at_index(1).unwrap() {
+                BasicTypeEnum::ArrayType(at) => at,
+                _ => unreachable!(),
+            };
+            // Pad to capacity with slot zeros.
+            while key_consts.len() < Self::MAP_CAP as usize {
+                key_consts.push(dk.const_zero());
+            }
+            while val_consts.len() < Self::MAP_CAP as usize {
+                val_consts.push(dv.const_zero());
+            }
+            let keys_val: BasicValueEnum<'ctx> = match dk {
+                BasicTypeEnum::IntType(it) => {
+                    let mut ivs: Vec<inkwell::values::IntValue<'ctx>> = key_consts.iter().map(|cv| match cv {
+                        BasicValueEnum::IntValue(iv) => *iv,
+                        _ => it.const_zero(),
+                    }).collect();
+                    while ivs.len() < Self::MAP_CAP as usize {
+                        ivs.push(it.const_zero());
+                    }
+                    ivs.truncate(Self::MAP_CAP as usize);
+                    it.const_array(&ivs).into()
+                }
+                BasicTypeEnum::PointerType(pt) => {
+                    let null = pt.const_null();
+                    let mut pvs: Vec<PointerValue<'ctx>> = key_consts.iter().map(|cv| match cv {
+                        BasicValueEnum::PointerValue(pv) => *pv,
+                        _ => null,
+                    }).collect();
+                    while pvs.len() < Self::MAP_CAP as usize {
+                        pvs.push(null);
+                    }
+                    pvs.truncate(Self::MAP_CAP as usize);
+                    pt.const_array(&pvs).into()
+                }
+                _ => keys_arr.const_zero().into(),
+            };
+            let vals_val: BasicValueEnum<'ctx> = match dv {
+                BasicTypeEnum::IntType(it) => {
+                    let mut ivs: Vec<inkwell::values::IntValue<'ctx>> = val_consts.iter().map(|cv| match cv {
+                        BasicValueEnum::IntValue(iv) => *iv,
+                        _ => it.const_zero(),
+                    }).collect();
+                    while ivs.len() < Self::MAP_CAP as usize {
+                        ivs.push(it.const_zero());
+                    }
+                    ivs.truncate(Self::MAP_CAP as usize);
+                    it.const_array(&ivs).into()
+                }
+                BasicTypeEnum::PointerType(pt) => {
+                    let null = pt.const_null();
+                    let mut pvs: Vec<PointerValue<'ctx>> = val_consts.iter().map(|cv| match cv {
+                        BasicValueEnum::PointerValue(pv) => *pv,
+                        _ => null,
+                    }).collect();
+                    while pvs.len() < Self::MAP_CAP as usize {
+                        pvs.push(null);
+                    }
+                    pvs.truncate(Self::MAP_CAP as usize);
+                    pt.const_array(&pvs).into()
+                }
+                _ => vals_arr.const_zero().into(),
+            };
+            let len = (entries.len().min(Self::MAP_CAP as usize)) as u64;
+            let init_val: BasicValueEnum<'ctx> = map_st.const_named_struct(&[
+                keys_val.into(),
+                vals_val.into(),
+                self.context.i64_type().const_int(len, false).into(),
+            ]).into();
+            global.set_initializer(&init_val);
+            global.set_linkage(inkwell::module::Linkage::External);
+            let ptr = global.as_pointer_value();
+            self.globals.insert(v.name.clone(), (ptr, map_st.into()));
+            self.map_vars.insert(v.name.clone());
+            return Ok(());
+        }
+        if let Type::Vec { .. } = &v.ty {
+            let dest_elem_ty = self.vec_elem_llvm_ty(&v.ty);
+            let vec_st = self.vec_struct_ty(dest_elem_ty);
+            let arr_ty: BasicTypeEnum<'ctx> = vec_st.get_field_type_at_index(0).unwrap();
+            let global = self.module.add_global(vec_st.as_basic_type_enum(), None, &v.name);
+            global.set_constant(false);
+            let init_val: BasicValueEnum<'ctx> = match &v.init {
+                Some(init) if matches!(init.kind, ExprKind::ArrayLit(_)) => {
+                    let elems = match &init.kind {
+                        ExprKind::ArrayLit(elems) => elems,
+                        _ => unreachable!(),
+                    };
+                    let len = elems.len().min(Self::VEC_CAP as usize);
+                    let const_vals: Vec<BasicValueEnum<'ctx>> = elems
+                        .iter()
+                        .take(len)
+                        .map(|e| match &e.kind {
+                            ExprKind::IntLit(val) => match dest_elem_ty {
+                                BasicTypeEnum::IntType(it) => {
+                                    it.const_int(*val as u64, true).into()
+                                }
+                                _ => self.context.i64_type().const_int(*val as u64, true).into(),
+                            },
+                            ExprKind::BoolLit(b) => match dest_elem_ty {
+                                BasicTypeEnum::IntType(it) => {
+                                    it.const_int(if *b { 1 } else { 0 }, false).into()
+                                }
+                                _ => self.context.bool_type().const_int(if *b { 1 } else { 0 }, false).into(),
+                            },
+                            ExprKind::StringLit(s) => {
+                                let str_val = self.context.const_string(s.as_bytes(), true);
+                                let str_ty = str_val.get_type();
+                                let str_global = self.module.add_global(str_ty, None, &format!("str.vec.{}.{}", v.name, self.globals.len()));
+                                str_global.set_initializer(&str_val);
+                                str_global.set_constant(true);
+                                str_global.set_linkage(inkwell::module::Linkage::Private);
+                                let zero = self.context.i32_type().const_zero();
+                                let ptr = unsafe { str_global.as_pointer_value().const_gep(str_ty, &[zero, zero]) };
+                                let pv: BasicValueEnum<'ctx> = ptr.as_basic_value_enum();
+                                self.coerce_to_ty(pv, dest_elem_ty)
+                            }
+                            _ => dest_elem_ty.const_zero(),
+                        })
+                        .collect();
+                    // Pad buffer to capacity, then build `{ buffer, len }`.
+                    let mut padded = const_vals;
+                    while padded.len() < Self::VEC_CAP as usize {
+                        padded.push(dest_elem_ty.const_zero());
+                    }
+                    let buf_val: BasicValueEnum<'ctx> = match arr_ty {
+                        BasicTypeEnum::ArrayType(at) => match dest_elem_ty {
+                            BasicTypeEnum::IntType(it) => {
+                                let ivs: Vec<inkwell::values::IntValue<'ctx>> = padded
+                                    .iter()
+                                    .map(|cv| match cv {
+                                        BasicValueEnum::IntValue(iv) => *iv,
+                                        _ => it.const_zero(),
+                                    })
+                                    .collect();
+                                it.const_array(&ivs).into()
+                            }
+                            _ => at.const_zero().into(),
+                        },
+                        _ => arr_ty.const_zero(),
+                    };
+                    vec_st
+                        .const_named_struct(&[
+                            buf_val.into(),
+                            self.context.i64_type().const_int(len as u64, false).into(),
+                        ])
+                        .into()
+                }
+                _ => vec_st.const_zero().into(),
+            };
+            global.set_initializer(&init_val);
+            global.set_linkage(inkwell::module::Linkage::External);
+            let ptr = global.as_pointer_value();
+            self.globals.insert(v.name.clone(), (ptr, vec_st.into()));
+            self.vec_vars.insert(v.name.clone());
+            return Ok(());
+        }
+        // `any xs = vec[]` globals: i64-slot vector, length 0.
+        if let (Type::Any(_), Some(init)) = (&v.ty, &v.init) {
+            if matches!(init.kind, ExprKind::VecEmpty(_)) {
+                let elem: BasicTypeEnum<'ctx> = self.context.i64_type().into();
+                let vec_st = self.vec_struct_ty(elem);
+            let global = self.module.add_global(vec_st.as_basic_type_enum(), None, &v.name);
+                global.set_constant(false);
+                let zero: BasicValueEnum<'ctx> = vec_st.const_zero().into();
+                global.set_initializer(&zero);
+                global.set_linkage(inkwell::module::Linkage::External);
+                let ptr = global.as_pointer_value();
+                self.globals.insert(v.name.clone(), (ptr, vec_st.into()));
+                self.vec_vars.insert(v.name.clone());
+                return Ok(());
+            }
+        }
+        if let (
+            Type::FixedArray { elem, size, .. },
+            Some(init),
+        ) = (&v.ty, &v.init)
+        {
+            if let ExprKind::ArrayLit(elems) = &init.kind {
+                let n = size.unwrap_or(elems.len() as u64) as u32;
+                let inner = self.llvm_ty_for(elem);
+                let arr_ty = match inner {
+                    BasicTypeEnum::IntType(it) => it.array_type(n).into(),
+                    BasicTypeEnum::PointerType(pt) => pt.array_type(n).into(),
+                    BasicTypeEnum::FloatType(ft) => ft.array_type(n).into(),
+                    BasicTypeEnum::StructType(st) => st.array_type(n).into(),
+                    BasicTypeEnum::ArrayType(at) => at.array_type(n).into(),
+                    _ => self.context.i64_type().array_type(n).into(),
+                };
+                let global = self.module.add_global(arr_ty, None, &v.name);
+                global.set_constant(false);
+                // Const-fold literal elements (MVP: integer-like literals
+                // coerced to the element width; anything else zero-fills).
+                let zero_int = self.context.i64_type().const_int(0, false);
+                let int_elems: Vec<inkwell::values::IntValue<'ctx>> = elems
+                    .iter()
+                    .map(|e| match &e.kind {
+                        ExprKind::IntLit(val) => match inner {
+                            BasicTypeEnum::IntType(it) => {
+                                it.const_int(*val as u64, true)
+                            }
+                            _ => zero_int,
+                        },
+                        ExprKind::BoolLit(b) => self
+                            .context
+                            .bool_type()
+                            .const_int(if *b { 1 } else { 0 }, false),
+                        ExprKind::CharLit(ch) => {
+                            self.context.i32_type().const_int(*ch as u64, false)
+                        }
+                        _ => match inner {
+                            BasicTypeEnum::IntType(it) => it.const_zero(),
+                            _ => zero_int,
+                        },
+                    })
+                    .collect();
+                let init_val: BasicValueEnum<'ctx> = match arr_ty {
+                    BasicTypeEnum::ArrayType(at) => match inner {
+                        BasicTypeEnum::IntType(it) => {
+                            // Pad with zeros if explicit N > literal length.
+                            let mut vals = int_elems.clone();
+                            while vals.len() < n as usize {
+                                vals.push(it.const_zero());
+                            }
+                            // Truncate if literal longer (sema already errored).
+                            vals.truncate(n as usize);
+                            it.const_array(&vals).into()
+                        }
+                        _ => at.const_zero().into(),
+                    },
+                    _ => arr_ty.const_zero(),
+                };
+                global.set_initializer(&init_val);
+                global.set_linkage(inkwell::module::Linkage::External);
+                let ptr = global.as_pointer_value();
+                self.globals.insert(v.name.clone(), (ptr, arr_ty));
+                return Ok(());
+            }
+        }
         let ty = self.llvm_ty_for(&v.ty);
         let global = self.module.add_global(ty, None, &v.name);
         global.set_constant(false);
         // For simple literals, set initializer directly; for complex, zero and init via holt.init
         let init_val: BasicValueEnum<'ctx> = if let Some(init) = &v.init {
             match &init.kind {
-                ExprKind::IntLit(val) => self.context.i64_type().const_int(*val as u64, true).into(),
+                ExprKind::IntLit(val) => match ty {
+                    BasicTypeEnum::IntType(it) => it.const_int(*val as u64, true).into(),
+                    _ => self.context.i64_type().const_int(*val as u64, true).into(),
+                },
                 ExprKind::BoolLit(b) => self.context.bool_type().const_int(if *b {1} else {0}, false).into(),
                 ExprKind::StringLit(s) => {
                     // Create a private global string and use its pointer as initializer for `string` global
@@ -991,6 +1407,8 @@ impl<'ctx> Codegen<'ctx> {
                         let val = func.get_nth_param((i+1) as u32).unwrap();
                         self.builder.build_store(alloca, val).unwrap();
                         self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
                     }
                     let _ = self.codegen_block(&f.body)?;
                     if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -1031,6 +1449,8 @@ impl<'ctx> Codegen<'ctx> {
                         let val = func.get_nth_param((i+1) as u32).unwrap();
                         self.builder.build_store(alloca, val).unwrap();
                         self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
                     }
                     let _ = self.codegen_block(&op.body)?;
                     if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -1086,6 +1506,8 @@ impl<'ctx> Codegen<'ctx> {
                         let val = func.get_nth_param(1).unwrap();
                         self.builder.build_store(alloca, val).unwrap();
                         self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
                         let _ = self.codegen_block(body)?;
                         if self.builder.get_insert_block().unwrap().get_terminator().is_none() { self.builder.build_return(None).unwrap(); }
                         self.vars.pop();
@@ -1140,6 +1562,343 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
+    fn llvm_int_for_bits(&self, bits: u16) -> inkwell::types::IntType<'ctx> {
+        match bits {
+            8 => self.context.i8_type(),
+            16 => self.context.i16_type(),
+            32 => self.context.i32_type(),
+            64 => self.context.i64_type(),
+            128 => self.context.i128_type(),
+            _ => self.context.i64_type(),
+        }
+    }
+
+    /// Coerce an integer value to a destination LLVM type via trunc/sext.
+    /// Non-integer or same-type values pass through unchanged. Used so that
+    /// `i32 x = 5` (i64 literal → i32 slot) emits valid IR with opaque ptrs
+    /// (the verifier cannot catch width mismatches on `ptr` stores).
+    /// Also converts int↔pointer (via inttoptr/ptrtoint) for undetermined
+    /// (`any`) vector slots, which are i64 and may hold string pointers.
+    fn coerce_to_ty(
+        &self,
+        val: BasicValueEnum<'ctx>,
+        dest: BasicTypeEnum<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let src = val.get_type();
+        if src == dest {
+            return val;
+        }
+        match (src, dest) {
+            (BasicTypeEnum::IntType(s), BasicTypeEnum::IntType(d)) => {
+                let sw = s.get_bit_width();
+                let dw = d.get_bit_width();
+                let iv = val.into_int_value();
+                if sw > dw {
+                    self.builder.build_int_truncate(iv, d, "trunc").unwrap().into()
+                } else if sw < dw {
+                    // Signed extend (MVP: all ints sext; unsigned zext deferred).
+                    self.builder.build_int_s_extend(iv, d, "sext").unwrap().into()
+                } else {
+                    val
+                }
+            }
+            (BasicTypeEnum::IntType(_), BasicTypeEnum::PointerType(d)) => self
+                .builder
+                .build_int_to_ptr(val.into_int_value(), d, "inttoptr")
+                .unwrap()
+                .into(),
+            (BasicTypeEnum::PointerType(_), BasicTypeEnum::IntType(d)) => self
+                .builder
+                .build_ptr_to_int(val.into_pointer_value(), d, "ptrtoint")
+                .unwrap()
+                .into(),
+            _ => val,
+        }
+    }
+
+    /// Unify two integer operands to the wider width (sext the narrower).
+    /// Non-integer pairs pass through unchanged.
+    fn unify_int_operands(
+        &self,
+        l: BasicValueEnum<'ctx>,
+        r: BasicValueEnum<'ctx>,
+    ) -> (BasicValueEnum<'ctx>, BasicValueEnum<'ctx>) {
+        match (l.get_type(), r.get_type()) {
+            (BasicTypeEnum::IntType(lt), BasicTypeEnum::IntType(rt)) => {
+                let lw = lt.get_bit_width();
+                let rw = rt.get_bit_width();
+                if lw == rw {
+                    (l, r)
+                } else if lw < rw {
+                    (self.coerce_to_ty(l, r.get_type()), r)
+                } else {
+                    (l, self.coerce_to_ty(r, l.get_type()))
+                }
+            }
+            _ => (l, r),
+        }
+    }
+
+    /// Max elements in a vector buffer (MVP fixed capacity; `push` past it
+    /// traps via `abort`).
+    const VEC_CAP: u32 = 16;
+
+    /// Max entries in a map (MVP fixed capacity; insert past it traps via
+    /// `abort`, mirroring `push`).
+    const MAP_CAP: u32 = 16;
+
+    /// Vector struct type `{ [CAP x E], i64 len }` for element LLVM type E.
+    /// Anonymous structs are structurally uniqued by LLVM, so rebuilding per
+    /// site is sound.
+    fn vec_struct_ty(&self, elem: BasicTypeEnum<'ctx>) -> StructType<'ctx> {
+        let buf: BasicTypeEnum<'ctx> = match elem {
+            BasicTypeEnum::IntType(it) => it.array_type(Self::VEC_CAP).into(),
+            BasicTypeEnum::FloatType(ft) => ft.array_type(Self::VEC_CAP).into(),
+            BasicTypeEnum::PointerType(pt) => pt.array_type(Self::VEC_CAP).into(),
+            BasicTypeEnum::StructType(st) => st.array_type(Self::VEC_CAP).into(),
+            BasicTypeEnum::ArrayType(at) => at.array_type(Self::VEC_CAP).into(),
+            _ => self.context.i64_type().array_type(Self::VEC_CAP).into(),
+        };
+        self.context.struct_type(
+            &[buf.into(), self.context.i64_type().into()],
+            false,
+        )
+    }
+
+    /// Element LLVM type for a `vec` declaration type. `Any` (from `vec[]`
+    /// with no established type) uses i64 slots; values convert at the
+    /// `push`/use boundaries via [`Self::coerce_to_ty`].
+    fn vec_elem_llvm_ty(&self, ty: &Type) -> BasicTypeEnum<'ctx> {
+        match ty {
+            Type::Vec { elem, .. } => match elem.as_ref() {
+                Type::Any(_) => self.context.i64_type().into(),
+                _ => self.llvm_ty_for(elem),
+            },
+            Type::Any(_) => self.context.i64_type().into(),
+            _ => self.llvm_ty_for(ty),
+        }
+    }
+
+    /// Is this variable a vector (tracked at declaration)?
+    fn is_vec_var(&self, name: &str) -> bool {
+        if self.vec_vars.contains(name) {
+            return true;
+        }
+        let lookup = name.rsplit("::").next().unwrap_or(name);
+        lookup != name && self.vec_vars.contains(lookup)
+    }
+
+    /// Map struct type `{ [CAP x K], [CAP x V], i64 len }`.
+    fn map_struct_ty(
+        &self,
+        key: BasicTypeEnum<'ctx>,
+        val: BasicTypeEnum<'ctx>,
+    ) -> StructType<'ctx> {
+        let keys: BasicTypeEnum<'ctx> = match key {
+            BasicTypeEnum::IntType(it) => it.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::FloatType(ft) => ft.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::PointerType(pt) => pt.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::StructType(st) => st.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::ArrayType(at) => at.array_type(Self::MAP_CAP).into(),
+            _ => self.context.i64_type().array_type(Self::MAP_CAP).into(),
+        };
+        let vals: BasicTypeEnum<'ctx> = match val {
+            BasicTypeEnum::IntType(it) => it.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::FloatType(ft) => ft.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::PointerType(pt) => pt.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::StructType(st) => st.array_type(Self::MAP_CAP).into(),
+            BasicTypeEnum::ArrayType(at) => at.array_type(Self::MAP_CAP).into(),
+            _ => self.context.i64_type().array_type(Self::MAP_CAP).into(),
+        };
+        self.context.struct_type(
+            &[keys.into(), vals.into(), self.context.i64_type().into()],
+            false,
+        )
+    }
+
+    /// Key/value LLVM types for a map declaration. `Any` sides (inferred
+    /// `any m = has ... end`) fall back to the literal shape via
+    /// [`Self::lit_slot_ty`] when entries are available, else i64/ptr.
+    fn map_keyval_llvm_ty(&self, ty: &Type, entries: &[ (Expr, Expr) ]) -> (BasicTypeEnum<'ctx>, BasicTypeEnum<'ctx>) {
+        match ty {
+            Type::Map { key, value, .. } => {
+                let k = match key.as_ref() {
+                    Type::Any(_) => entries.first().map(|(k, _)| self.lit_slot_ty(k, true)).unwrap_or_else(|| self.context.i64_type().into()),
+                    _ => self.llvm_ty_for(key),
+                };
+                let v = match value.as_ref() {
+                    Type::Any(_) => entries.first().map(|(_, v)| self.lit_slot_ty(v, false)).unwrap_or_else(|| self.context.i64_type().into()),
+                    _ => self.llvm_ty_for(value),
+                };
+                (k, v)
+            }
+            Type::Any(_) => {
+                let k = entries.first().map(|(k, _)| self.lit_slot_ty(k, true)).unwrap_or_else(|| self.context.i64_type().into());
+                let v = entries.first().map(|(_, v)| self.lit_slot_ty(v, false)).unwrap_or_else(|| self.context.i64_type().into());
+                (k, v)
+            }
+            _ => (self.context.i64_type().into(), self.context.i64_type().into()),
+        }
+    }
+
+    /// Slot type for a literal key/value by shape: strings → ptr, ints →
+    /// i64 (widened at use), bools → i1, chars → i32, floats → f64.
+    fn lit_slot_ty(&self, e: &Expr, _is_key: bool) -> BasicTypeEnum<'ctx> {
+        match &e.kind {
+            ExprKind::StringLit(_) => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+            ExprKind::IntLit(_) => self.context.i64_type().into(),
+            ExprKind::BoolLit(_) => self.context.bool_type().into(),
+            ExprKind::CharLit(_) => self.context.i32_type().into(),
+            ExprKind::FloatLit(_) => self.context.f64_type().into(),
+            _ => self.context.i64_type().into(),
+        }
+    }
+
+    fn get_or_declare_strcmp(&self) -> FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function("strcmp") {
+            return f;
+        }
+        let ptr = self.context.ptr_type(inkwell::AddressSpace::default());
+        let fn_ty = self.context.i32_type().fn_type(&[ptr.into(), ptr.into()], false);
+        self.module.add_function("strcmp", fn_ty, None)
+    }
+
+    /// Is this variable a map (tracked at declaration)?
+    fn is_map_var(&self, name: &str) -> bool {
+        if self.map_vars.contains(name) {
+            return true;
+        }
+        let lookup = name.rsplit("::").next().unwrap_or(name);
+        lookup != name && self.map_vars.contains(lookup)
+    }
+
+    /// Search a map's keys for `key`, storing the matched slot index (or -1)
+    /// into a fresh i64 alloca. String slots compare by content (`strcmp`);
+    /// integer slots compare directly (keys coerced to slot width first).
+    /// Returns the index alloca plus buffer/val types. The builder is left at
+    /// a fresh `exit` block.
+    fn codegen_map_search(
+        &mut self,
+        map_ptr: PointerValue<'ctx>,
+        map_st: StructType<'ctx>,
+        key_val: BasicValueEnum<'ctx>,
+        span: Span,
+    ) -> Result<
+        (
+            PointerValue<'ctx>,
+            inkwell::types::ArrayType<'ctx>,
+            inkwell::types::ArrayType<'ctx>,
+            BasicTypeEnum<'ctx>,
+        ),
+        CodegenError,
+    > {
+        let keys_arr_ty = match map_st.get_field_type_at_index(0).unwrap() {
+            BasicTypeEnum::ArrayType(at) => at,
+            _ => return Err(CodegenError{message: "malformed map keys buffer".into(), span}),
+        };
+        let vals_arr_ty = match map_st.get_field_type_at_index(1).unwrap() {
+            BasicTypeEnum::ArrayType(at) => at,
+            _ => return Err(CodegenError{message: "malformed map values buffer".into(), span}),
+        };
+        let key_slot_ty = keys_arr_ty.get_element_type();
+        let val_ty = vals_arr_ty.get_element_type();
+        let key = self.coerce_to_ty(key_val, key_slot_ty);
+        let len_ptr = self.builder.build_struct_gep(map_st, map_ptr, 2, "map.len.ptr").unwrap();
+        let len = self.builder.build_load(self.context.i64_type(), len_ptr, "map.len").unwrap().into_int_value();
+        let func = self.cur_fn.ok_or(CodegenError{message: "map access outside function".into(), span})?;
+        let idx_res = self.create_entry_block_alloca("map.search.idx", self.context.i64_type().into());
+        self.builder.build_store(idx_res, self.context.i64_type().const_int(-1i64 as u64, false)).unwrap();
+        let i_ptr = self.create_entry_block_alloca("map.search.i", self.context.i64_type().into());
+        self.builder.build_store(i_ptr, self.context.i64_type().const_zero()).unwrap();
+        let loop_bb = self.context.append_basic_block(func, "map.search.loop");
+        let body_bb = self.context.append_basic_block(func, "map.search.body");
+        let hit_bb = self.context.append_basic_block(func, "map.search.hit");
+        let next_bb = self.context.append_basic_block(func, "map.search.next");
+        let exit_bb = self.context.append_basic_block(func, "map.search.exit");
+        let zero = self.context.i64_type().const_int(0, false);
+        self.builder.build_unconditional_branch(loop_bb).unwrap();
+        // loop: i < len ?
+        self.builder.position_at_end(loop_bb);
+        let i = self.builder.build_load(self.context.i64_type(), i_ptr, "map.i").unwrap().into_int_value();
+        let cont = self.builder.build_int_compare(IntPredicate::ULT, i, len, "map.cont").unwrap();
+        self.builder.build_conditional_branch(cont, body_bb, exit_bb).unwrap();
+        // body: compare keys[i]
+        self.builder.position_at_end(body_bb);
+        let kptr = unsafe {
+            self.builder.build_gep(keys_arr_ty, self.builder.build_struct_gep(map_st, map_ptr, 0, "map.keys.ptr").unwrap(), &[zero, i], "map.key.ptr").unwrap()
+        };
+        let slot = self.builder.build_load(key_slot_ty, kptr, "map.key").unwrap();
+        let eq = match (slot.get_type(), key.get_type()) {
+            (BasicTypeEnum::IntType(a), BasicTypeEnum::IntType(b)) if a.get_bit_width() == b.get_bit_width() => {
+                self.builder.build_int_compare(IntPredicate::EQ, slot.into_int_value(), key.into_int_value(), "map.key.eq").unwrap()
+            }
+            (BasicTypeEnum::PointerType(_), BasicTypeEnum::PointerType(_)) => {
+                let cmp = self.builder.build_call(self.get_or_declare_strcmp(), &[slot.into(), key.into()], "map.strcmp").unwrap();
+                let c = cmp.try_as_basic_value().basic().unwrap().into_int_value();
+                self.builder.build_int_compare(IntPredicate::EQ, c, self.context.i32_type().const_zero(), "map.key.eq").unwrap()
+            }
+            _ => self.context.bool_type().const_int(0, false),
+        };
+        self.builder.build_conditional_branch(eq, hit_bb, next_bb).unwrap();
+        // hit: record index, done
+        self.builder.position_at_end(hit_bb);
+        self.builder.build_store(idx_res, i).unwrap();
+        self.builder.build_unconditional_branch(exit_bb).unwrap();
+        // next: i += 1
+        self.builder.position_at_end(next_bb);
+        let one = self.context.i64_type().const_int(1, false);
+        let ni = self.builder.build_int_add(i, one, "map.i.inc").unwrap();
+        self.builder.build_store(i_ptr, ni).unwrap();
+        self.builder.build_unconditional_branch(loop_bb).unwrap();
+        self.builder.position_at_end(exit_bb);
+        Ok((idx_res, keys_arr_ty, vals_arr_ty, val_ty))
+    }
+
+    /// Store map literal entries into an allocated map struct: keys into
+    /// field 0, values into field 1 (both coerced), length into field 2.
+    fn store_map_entries(
+        &mut self,
+        alloca: PointerValue<'ctx>,
+        map_st: StructType<'ctx>,
+        key_ty: BasicTypeEnum<'ctx>,
+        val_ty: BasicTypeEnum<'ctx>,
+        entries: &[(Expr, Expr)],
+    ) -> Result<(), CodegenError> {
+        let keys_ptr = self.builder.build_struct_gep(map_st, alloca, 0, "map.keys").unwrap();
+        let vals_ptr = self.builder.build_struct_gep(map_st, alloca, 1, "map.vals").unwrap();
+        let keys_arr_ty = match map_st.get_field_type_at_index(0).unwrap() {
+            BasicTypeEnum::ArrayType(at) => at,
+            _ => return Err(CodegenError{message: "malformed map keys buffer".into(), span: Span::new(0, 0)}),
+        };
+        let vals_arr_ty = match map_st.get_field_type_at_index(1).unwrap() {
+            BasicTypeEnum::ArrayType(at) => at,
+            _ => return Err(CodegenError{message: "malformed map values buffer".into(), span: Span::new(0, 0)}),
+        };
+        let zero = self.context.i64_type().const_int(0, false);
+        for (i, (k, v)) in entries.iter().enumerate() {
+            let kv = self.codegen_expr(k)?;
+            let ck = self.coerce_to_ty(kv, key_ty);
+            let idx = self.context.i64_type().const_int(i as u64, false);
+            let kptr = unsafe {
+                self.builder
+                    .build_gep(keys_arr_ty, keys_ptr, &[zero, idx], &format!("map.key.{i}"))
+                    .unwrap()
+            };
+            self.builder.build_store(kptr, ck).unwrap();
+            let vv = self.codegen_expr(v)?;
+            let cv = self.coerce_to_ty(vv, val_ty);
+            let vptr = unsafe {
+                self.builder
+                    .build_gep(vals_arr_ty, vals_ptr, &[zero, idx], &format!("map.val.{i}"))
+                    .unwrap()
+            };
+            self.builder.build_store(vptr, cv).unwrap();
+        }
+        let len_ptr = self.builder.build_struct_gep(map_st, alloca, 2, "map.len").unwrap();
+        self.builder.build_store(len_ptr, self.context.i64_type().const_int(entries.len() as u64, false)).unwrap();
+        Ok(())
+    }
+
     fn llvm_ty_for(&self, ty: &Type) -> BasicTypeEnum<'ctx> {
         match ty {
             Type::Int(_) => self.context.i64_type().into(),
@@ -1159,6 +1918,19 @@ impl<'ctx> Codegen<'ctx> {
                     return self.context.i64_type().into();
                 }
                 let lookup = n.rsplit("::").next().unwrap_or(n);
+                // Implicit stdlib ints (types skill §1-2): `i8`..`u128`, `uint`
+                // lex as Ident — lower directly without a struct lookup.
+                if let Some(std_ty) = crate::sema::Ty::from_stdlib_name(lookup) {
+                    match std_ty {
+                        crate::sema::Ty::UInt | crate::sema::Ty::Int => {
+                            return self.context.i64_type().into()
+                        }
+                        crate::sema::Ty::SizedInt { bits, .. } => {
+                            return self.llvm_int_for_bits(bits).into()
+                        }
+                        _ => {}
+                    }
+                }
                 if lookup.len() == 1 && lookup.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                     return self.context.i64_type().into();
                 }
@@ -1202,6 +1974,36 @@ impl<'ctx> Codegen<'ctx> {
                     _ => self.context.i64_type().array_type(16).into(),
                 }
             }
+            Type::FixedArray { elem, size, .. } => {
+                // Explicit size → [N x elem]; inferred (None) → [16 x elem]
+                // placeholder (locals with initializers refine at the decl site).
+                let n = size.unwrap_or(16) as u32;
+                let inner = self.llvm_ty_for(elem);
+                match inner {
+                    BasicTypeEnum::IntType(it) => it.array_type(n).into(),
+                    BasicTypeEnum::PointerType(pt) => pt.array_type(n).into(),
+                    BasicTypeEnum::FloatType(ft) => ft.array_type(n).into(),
+                    BasicTypeEnum::StructType(st) => st.array_type(n).into(),
+                    BasicTypeEnum::ArrayType(at) => at.array_type(n).into(),
+                    _ => self.context.i64_type().array_type(n).into(),
+                }
+            }
+            Type::Vec { .. } => {
+                let elem = self.vec_elem_llvm_ty(ty);
+                self.vec_struct_ty(elem).into()
+            }
+            Type::Map { key, value, .. } => {
+                // `Any` sides without literal context: int keys, ptr values.
+                let k = match key.as_ref() {
+                    Type::Any(_) => self.context.i64_type().into(),
+                    _ => self.llvm_ty_for(key),
+                };
+                let v = match value.as_ref() {
+                    Type::Any(_) => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                    _ => self.llvm_ty_for(value),
+                };
+                self.map_struct_ty(k, v).into()
+            }
             Type::Pointer(_, _) => self
                 .context
                 .ptr_type(inkwell::AddressSpace::default())
@@ -1224,6 +2026,10 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Option<BasicTypeEnum<'ctx>> {
         match ty {
             crate::sema::Ty::Int => Some(self.context.i64_type().into()),
+            // types skill §2-3: `uint` is unsigned pointer-sized → i64 widths;
+            // fixed widths lower to matching LLVM int types (signless in LLVM).
+            crate::sema::Ty::UInt => Some(self.context.i64_type().into()),
+            crate::sema::Ty::SizedInt { bits, .. } => Some(self.llvm_int_for_bits(*bits).into()),
             crate::sema::Ty::Bool => Some(self.context.bool_type().into()),
             crate::sema::Ty::Char => Some(self.context.i32_type().into()),
             crate::sema::Ty::String => Some(
@@ -1279,6 +2085,40 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     Some(self.context.i64_type().array_type(16).into())
                 }
+            }
+            crate::sema::Ty::FixedArray { elem, size } => {
+                let n = size.unwrap_or(16) as u32;
+                if let Some(inner) = self.llvm_ty_for_sema(elem) {
+                    match inner {
+                        BasicTypeEnum::IntType(it) => Some(it.array_type(n).into()),
+                        BasicTypeEnum::PointerType(pt) => Some(pt.array_type(n).into()),
+                        BasicTypeEnum::FloatType(ft) => Some(ft.array_type(n).into()),
+                        BasicTypeEnum::StructType(st) => Some(st.array_type(n).into()),
+                        BasicTypeEnum::ArrayType(at) => Some(at.array_type(n).into()),
+                        _ => Some(self.context.i64_type().array_type(n).into()),
+                    }
+                } else {
+                    Some(self.context.i64_type().array_type(n).into())
+                }
+            }
+            crate::sema::Ty::Vec(elem) => {
+                // `Vec(Any)` (undetermined) uses i64 slots.
+                let inner = match elem.as_ref() {
+                    crate::sema::Ty::Any => self.context.i64_type().into(),
+                    _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
+                };
+                Some(self.vec_struct_ty(inner).into())
+            }
+            crate::sema::Ty::Map { key, value } => {
+                let k = match key.as_ref() {
+                    crate::sema::Ty::Any => self.context.i64_type().into(),
+                    _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                };
+                let v = match value.as_ref() {
+                    crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                    _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                };
+                Some(self.map_struct_ty(k, v).into())
             }
             crate::sema::Ty::Pointer(_) => Some(
                 self.context
@@ -1400,6 +2240,12 @@ impl<'ctx> Codegen<'ctx> {
                 crate::sema::Ty::Int => {
                     self.context.i64_type().fn_type(&param_types, is_c_varargs)
                 }
+                crate::sema::Ty::UInt => {
+                    self.context.i64_type().fn_type(&param_types, is_c_varargs)
+                }
+                crate::sema::Ty::SizedInt { bits, .. } => {
+                    self.llvm_int_for_bits(bits).fn_type(&param_types, is_c_varargs)
+                }
                 crate::sema::Ty::Bool => {
                     self.context.bool_type().fn_type(&param_types, is_c_varargs)
                 }
@@ -1426,6 +2272,36 @@ impl<'ctx> Codegen<'ctx> {
                     // For array element i64, array type is [16 x i64]
                     let arr_ty = self.context.i64_type().array_type(16);
                     arr_ty.fn_type(&param_types, is_c_varargs)
+                }
+                crate::sema::Ty::FixedArray { elem: ref elem, size: ref size } => {
+                    let n = size.unwrap_or(16) as u32;
+                    let elem_ty = self.llvm_ty_for_sema(elem.as_ref()).unwrap();
+                    match elem_ty {
+                        BasicTypeEnum::IntType(it) => it.array_type(n).fn_type(&param_types, is_c_varargs),
+                        BasicTypeEnum::FloatType(ft) => ft.array_type(n).fn_type(&param_types, is_c_varargs),
+                        BasicTypeEnum::PointerType(pt) => pt.array_type(n).fn_type(&param_types, is_c_varargs),
+                        BasicTypeEnum::StructType(st) => st.array_type(n).fn_type(&param_types, is_c_varargs),
+                        BasicTypeEnum::ArrayType(at) => at.array_type(n).fn_type(&param_types, is_c_varargs),
+                        _ => self.context.i64_type().array_type(n).fn_type(&param_types, is_c_varargs),
+                    }
+                }
+                crate::sema::Ty::Vec(ref elem) => {
+                    let inner = match elem.as_ref() {
+                        crate::sema::Ty::Any => self.context.i64_type().into(),
+                        _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    self.vec_struct_ty(inner).fn_type(&param_types, is_c_varargs)
+                }
+                crate::sema::Ty::Map { key: ref key, value: ref value } => {
+                    let k = match key.as_ref() {
+                        crate::sema::Ty::Any => self.context.i64_type().into(),
+                        _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    let v = match value.as_ref() {
+                        crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                        _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                    };
+                    self.map_struct_ty(k, v).fn_type(&param_types, is_c_varargs)
                 }
                 crate::sema::Ty::Pointer(_) => self
                     .context
@@ -1534,6 +2410,8 @@ impl<'ctx> Codegen<'ctx> {
             let param_val = func.get_nth_param(i as u32).unwrap();
             self.builder.build_store(alloca, param_val).unwrap();
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
         }
         match f.name.as_str() {
             "print" => {
@@ -1650,6 +2528,8 @@ impl<'ctx> Codegen<'ctx> {
                 let alloca = self.create_entry_block_alloca(&param.name, llvm_ty);
                     self.builder.build_store(alloca, param_val).unwrap();
                     self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
                 }
             }
         }
@@ -1674,6 +2554,12 @@ impl<'ctx> Codegen<'ctx> {
                     crate::sema::Ty::Int => {
                         self.context.i64_type().const_int(0, false).into()
                     }
+                    crate::sema::Ty::UInt => {
+                        self.context.i64_type().const_int(0, false).into()
+                    }
+                    crate::sema::Ty::SizedInt { bits, .. } => {
+                        self.llvm_int_for_bits(bits).const_int(0, false).into()
+                    }
                     crate::sema::Ty::Bool => {
                         self.context.bool_type().const_int(0, false).into()
                     }
@@ -1694,6 +2580,35 @@ impl<'ctx> Codegen<'ctx> {
                         .array_type(16)
                         .const_zero()
                         .into(),
+                    crate::sema::Ty::FixedArray { elem: ref elem, size: ref size } => {
+                        let n = size.unwrap_or(16) as u32;
+                        match self.llvm_ty_for_sema(elem.as_ref()) {
+                            Some(BasicTypeEnum::IntType(it)) => it.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::FloatType(ft)) => ft.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::PointerType(pt)) => pt.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::StructType(st)) => st.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::ArrayType(at)) => at.array_type(n).const_zero().into(),
+                            _ => self.context.i64_type().array_type(n).const_zero().into(),
+                        }
+                    },
+                    crate::sema::Ty::Vec(ref elem) => {
+                        let inner = match elem.as_ref() {
+                            crate::sema::Ty::Any => self.context.i64_type().into(),
+                            _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
+                        };
+                        self.vec_struct_ty(inner).const_zero().into()
+                    },
+                    crate::sema::Ty::Map { key: ref key, value: ref value } => {
+                        let k = match key.as_ref() {
+                            crate::sema::Ty::Any => self.context.i64_type().into(),
+                            _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                        };
+                        let v = match value.as_ref() {
+                            crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                            _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                        };
+                        self.map_struct_ty(k, v).const_zero().into()
+                    },
                     crate::sema::Ty::Pointer(_) => self
                         .context
                         .ptr_type(inkwell::AddressSpace::default())
@@ -1782,6 +2697,8 @@ impl<'ctx> Codegen<'ctx> {
             let param_val = func.get_nth_param((i+1) as u32).unwrap();
             self.builder.build_store(alloca, param_val).unwrap();
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
         }
         let always_returns = self.codegen_block(&method.body)?;
         if !always_returns && self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -1790,11 +2707,42 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 let zero: BasicValueEnum = match info.ret {
                     crate::sema::Ty::Int => self.context.i64_type().const_int(0, false).into(),
+                    crate::sema::Ty::UInt => self.context.i64_type().const_int(0, false).into(),
+                    crate::sema::Ty::SizedInt { bits, .. } => self.llvm_int_for_bits(bits).const_int(0, false).into(),
                     crate::sema::Ty::Bool => self.context.bool_type().const_int(0, false).into(),
                     crate::sema::Ty::Char => self.context.i32_type().const_int(0, false).into(),
                     crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
                     crate::sema::Ty::Struct(ref n) => self.struct_types.get(n).unwrap().const_zero().into(),
                     crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).const_zero().into(),
+                    crate::sema::Ty::FixedArray { elem: ref elem, size: ref size } => {
+                        let n = size.unwrap_or(16) as u32;
+                        match self.llvm_ty_for_sema(elem.as_ref()) {
+                            Some(BasicTypeEnum::IntType(it)) => it.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::FloatType(ft)) => ft.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::PointerType(pt)) => pt.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::StructType(st)) => st.array_type(n).const_zero().into(),
+                            Some(BasicTypeEnum::ArrayType(at)) => at.array_type(n).const_zero().into(),
+                            _ => self.context.i64_type().array_type(n).const_zero().into(),
+                        }
+                    },
+                    crate::sema::Ty::Vec(ref elem) => {
+                        let inner = match elem.as_ref() {
+                            crate::sema::Ty::Any => self.context.i64_type().into(),
+                            _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
+                        };
+                        self.vec_struct_ty(inner).const_zero().into()
+                    },
+                    crate::sema::Ty::Map { key: ref key, value: ref value } => {
+                        let k = match key.as_ref() {
+                            crate::sema::Ty::Any => self.context.i64_type().into(),
+                            _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                        };
+                        let v = match value.as_ref() {
+                            crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                            _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                        };
+                        self.map_struct_ty(k, v).const_zero().into()
+                    },
                     crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
                     crate::sema::Ty::Optional(ref el) => {
                         let inner = self.llvm_ty_for_sema(el).unwrap();
@@ -1862,6 +2810,8 @@ impl<'ctx> Codegen<'ctx> {
             let val = func.get_nth_param((i+1) as u32).unwrap();
             self.builder.build_store(alloca, val).unwrap();
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
         }
         // `initialize` sugar: this.field = param for each param matching a field
         // EBNF §22: initialize is sugar for this.field = field
@@ -1948,6 +2898,8 @@ impl<'ctx> Codegen<'ctx> {
             let val = func.get_nth_param(1).unwrap();
             self.builder.build_store(alloca, val).unwrap();
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
             let _ = self.codegen_block(body)?;
             if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
                 self.builder.build_return(None).unwrap();
@@ -1979,6 +2931,8 @@ impl<'ctx> Codegen<'ctx> {
             let val = func.get_nth_param((i+1) as u32).unwrap();
             self.builder.build_store(alloca, val).unwrap();
             self.vars.last_mut().unwrap().insert(param.name.clone(), (alloca, llvm_ty));
+                        if matches!(&param.ty, Type::Vec { .. }) { self.vec_vars.insert(param.name.clone()); }
+                        if matches!(&param.ty, Type::Map { .. }) { self.map_vars.insert(param.name.clone()); }
         }
         let _ = self.codegen_block(&op.body)?;
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -2130,15 +3084,161 @@ impl<'ctx> Codegen<'ctx> {
     fn codegen_stmt(&mut self, stmt: &Stmt) -> Result<bool, CodegenError> {
         match stmt {
             Stmt::VarDecl(d) => {
-                let ty = self.llvm_ty_for(&d.ty);
+                // Fixed arrays with an array-literal initializer allocate the
+                // exact length: inferred `int arr x = [...]` uses the init
+                // length; explicit `int arr[N] x = [...]` uses N (sema has
+                // already verified N == len).
+                // Vectors allocate `{ buffer, len }`; `any xs = vec[]` uses
+                // i64 slots until `push` establishes the element type.
+                let ty = match (&d.ty, &d.init) {
+                    (
+                        Type::FixedArray { elem, size, .. },
+                        Some(init),
+                    ) if matches!(init.kind, ExprKind::ArrayLit(_)) => {
+                        let n = size.unwrap_or_else(|| match &init.kind {
+                            ExprKind::ArrayLit(elems) => elems.len() as u64,
+                            _ => 16,
+                        }) as u32;
+                        let inner = self.llvm_ty_for(elem);
+                        match inner {
+                            BasicTypeEnum::IntType(it) => it.array_type(n).into(),
+                            BasicTypeEnum::PointerType(pt) => pt.array_type(n).into(),
+                            BasicTypeEnum::FloatType(ft) => ft.array_type(n).into(),
+                            BasicTypeEnum::StructType(st) => st.array_type(n).into(),
+                            BasicTypeEnum::ArrayType(at) => at.array_type(n).into(),
+                            _ => self.context.i64_type().array_type(n).into(),
+                        }
+                    }
+                    (Type::Any(_), Some(init))
+                        if matches!(init.kind, ExprKind::VecEmpty(_)) =>
+                    {
+                        self.vec_struct_ty(self.context.i64_type().into()).into()
+                    }
+                    (Type::Map { .. }, _) => {
+                        let entries: &[(Expr, Expr)] = match &d.init {
+                            Some(init) if matches!(init.kind, ExprKind::MapLit { .. }) => match &init.kind {
+                                ExprKind::MapLit { entries, .. } => entries,
+                                _ => unreachable!(),
+                            },
+                            _ => &[],
+                        };
+                        let (k, v) = self.map_keyval_llvm_ty(&d.ty, entries);
+                        self.map_struct_ty(k, v).into()
+                    }
+                    (Type::Any(_), Some(init))
+                        if matches!(init.kind, ExprKind::MapLit { .. }) =>
+                    {
+                        let entries: &[(Expr, Expr)] = match &init.kind {
+                            ExprKind::MapLit { entries, .. } => entries,
+                            _ => &[],
+                        };
+                        let (k, v) = self.map_keyval_llvm_ty(&d.ty, entries);
+                        self.map_struct_ty(k, v).into()
+                    }
+                    _ => self.llvm_ty_for(&d.ty),
+                };
                 let alloca = self.create_entry_block_alloca(&d.name, ty);
                 self.vars
                     .last_mut()
                     .unwrap()
                     .insert(d.name.clone(), (alloca, ty));
+                // Track vectors for `push`/index/`for` lowering.
+                if matches!(&d.ty, Type::Vec { .. })
+                    || matches!(&d.ty, Type::Any(_))
+                        && d.init.as_ref().is_some_and(|i| matches!(i.kind, ExprKind::VecEmpty(_)))
+                {
+                    self.vec_vars.insert(d.name.clone());
+                }
+                // Track maps for index/`for` lowering.
+                if matches!(&d.ty, Type::Map { .. })
+                    || matches!(&d.ty, Type::Any(_))
+                        && d.init.as_ref().is_some_and(|i| matches!(i.kind, ExprKind::MapLit { .. }))
+                {
+                    self.map_vars.insert(d.name.clone());
+                }
                 if let Some(init) = &d.init {
-                    let val = self.codegen_expr(init)?;
-                    self.builder.build_store(alloca, val).unwrap();
+                    // Fixed-array initializer: store each element via GEP so
+                    // element widths coerce exactly (e.g. i64 literals into
+                    // an `i32 arr` slot).
+                    if let (
+                        Type::FixedArray { elem, .. },
+                        ExprKind::ArrayLit(elems),
+                    ) = (&d.ty, &init.kind)
+                    {
+                        let dest_elem_ty = self.llvm_ty_for(elem);
+                        let arr_ty = match ty {
+                            BasicTypeEnum::ArrayType(at) => at,
+                            _ => unreachable!("fixed-array alloca must be array type"),
+                        };
+                        let zero = self.context.i64_type().const_int(0, false);
+                        for (i, e) in elems.iter().enumerate() {
+                            let v = self.codegen_expr(e)?;
+                            let cv = self.coerce_to_ty(v, dest_elem_ty);
+                            let idx = self.context.i64_type().const_int(i as u64, false);
+                            let eptr = unsafe {
+                                self.builder
+                                    .build_gep(arr_ty, alloca, &[zero, idx], &format!("arr.init.{i}"))
+                                    .unwrap()
+                            };
+                            self.builder.build_store(eptr, cv).unwrap();
+                        }
+                    } else if let (
+                        Type::Vec { .. },
+                        ExprKind::ArrayLit(elems),
+                    ) = (&d.ty, &init.kind)
+                    {
+                        // Vector initializer: fill buffer, set length.
+                        let dest_elem_ty = self.vec_elem_llvm_ty(&d.ty);
+                        let vec_st = match ty {
+                            BasicTypeEnum::StructType(st) => st,
+                            _ => unreachable!("vector alloca must be struct type"),
+                        };
+                        let buf_ptr = self.builder.build_struct_gep(vec_st, alloca, 0, "vec.buf").unwrap();
+                        let buf_arr_ty = match dest_elem_ty {
+                            BasicTypeEnum::IntType(it) => it.array_type(Self::VEC_CAP).into(),
+                            BasicTypeEnum::FloatType(ft) => ft.array_type(Self::VEC_CAP).into(),
+                            BasicTypeEnum::PointerType(pt) => pt.array_type(Self::VEC_CAP).into(),
+                            BasicTypeEnum::StructType(st) => st.array_type(Self::VEC_CAP).into(),
+                            BasicTypeEnum::ArrayType(at) => at.array_type(Self::VEC_CAP).into(),
+                            _ => self.context.i64_type().array_type(Self::VEC_CAP).into(),
+                        };
+                        let buf_arr_ty = match buf_arr_ty {
+                            BasicTypeEnum::ArrayType(at) => at,
+                            _ => unreachable!(),
+                        };
+                        let zero = self.context.i64_type().const_int(0, false);
+                        for (i, e) in elems.iter().enumerate() {
+                            let v = self.codegen_expr(e)?;
+                            let cv = self.coerce_to_ty(v, dest_elem_ty);
+                            let idx = self.context.i64_type().const_int(i as u64, false);
+                            let eptr = unsafe {
+                                self.builder
+                                    .build_gep(buf_arr_ty, buf_ptr, &[zero, idx], &format!("vec.init.{i}"))
+                                    .unwrap()
+                            };
+                            self.builder.build_store(eptr, cv).unwrap();
+                        }
+                        let len_ptr = self.builder.build_struct_gep(vec_st, alloca, 1, "vec.len").unwrap();
+                        self.builder.build_store(len_ptr, self.context.i64_type().const_int(elems.len() as u64, false)).unwrap();
+                    } else if matches!(init.kind, ExprKind::VecEmpty(_)) {
+                        // Empty vector: zero buffer, length 0.
+                        self.builder.build_store(alloca, ty.const_zero()).unwrap();
+                    } else if let ExprKind::MapLit { entries, .. } = &init.kind {
+                        // Map literal: keys/values into buffers, set length.
+                        // (Sema has validated entry types; `any` declarations
+                        // infer slots from the literal shape.)
+                        let map_entries: &[(Expr, Expr)] = entries;
+                        let (dest_key_ty, dest_val_ty) = self.map_keyval_llvm_ty(&d.ty, map_entries);
+                        let map_st = match ty {
+                            BasicTypeEnum::StructType(st) => st,
+                            _ => unreachable!("map alloca must be struct type"),
+                        };
+                        self.store_map_entries(alloca, map_st, dest_key_ty, dest_val_ty, map_entries)?;
+                    } else {
+                        let val = self.codegen_expr(init)?;
+                        let coerced = self.coerce_to_ty(val, ty);
+                        self.builder.build_store(alloca, coerced).unwrap();
+                    }
                 } else {
                     // zero init for all types
                     let zero: BasicValueEnum = match &d.ty {
@@ -2177,6 +3277,26 @@ impl<'ctx> Codegen<'ctx> {
                             .array_type(16)
                             .const_zero()
                             .into(),
+                        Type::FixedArray { elem, size, .. } => {
+                            let n = size.unwrap_or(16) as u32;
+                            let inner = self.llvm_ty_for(elem);
+                            match inner {
+                                BasicTypeEnum::IntType(it) => it.array_type(n).const_zero().into(),
+                                BasicTypeEnum::PointerType(pt) => pt.array_type(n).const_zero().into(),
+                                BasicTypeEnum::FloatType(ft) => ft.array_type(n).const_zero().into(),
+                                BasicTypeEnum::StructType(st) => st.array_type(n).const_zero().into(),
+                                BasicTypeEnum::ArrayType(at) => at.array_type(n).const_zero().into(),
+                                _ => self.context.i64_type().array_type(n).const_zero().into(),
+                            }
+                        }
+                        Type::Vec { .. } => {
+                            let elem = self.vec_elem_llvm_ty(&d.ty);
+                            self.vec_struct_ty(elem).const_zero().into()
+                        }
+                        Type::Map { .. } => {
+                            let (k, v) = self.map_keyval_llvm_ty(&d.ty, &[]);
+                            self.map_struct_ty(k, v).const_zero().into()
+                        }
                         Type::Pointer(_, _) => self
                             .context
                             .ptr_type(inkwell::AddressSpace::default())
@@ -2220,8 +3340,30 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(false)
             }
             Stmt::Const(c) => {
+                // Map consts allocate the map struct: explicit `K:V` uses its
+                // slots; untyped `const m = has ... end` infers from entries.
+                let is_map_const = matches!(c.ty, Some(Type::Map { .. }))
+                    || matches!(&c.ty, None) && matches!(c.init.kind, ExprKind::MapLit { .. });
+                if is_map_const {
+                    let entries: &[(Expr, Expr)] = match &c.init.kind {
+                        ExprKind::MapLit { entries, .. } => entries,
+                        _ => &[],
+                    };
+                    let decl_ty: Type = c.ty.clone().unwrap_or(Type::Any(Span::new(0, 0)));
+                    let (dk, dv) = self.map_keyval_llvm_ty(&decl_ty, entries);
+                    let map_st = self.map_struct_ty(dk, dv);
+                    let ty: BasicTypeEnum<'ctx> = map_st.into();
+                    let alloca = self.create_entry_block_alloca(&c.name, ty);
+                    self.vars.last_mut().unwrap().insert(c.name.clone(), (alloca, ty));
+                    self.map_vars.insert(c.name.clone());
+                    self.store_map_entries(alloca, map_st, dk, dv, entries)?;
+                    return Ok(false);
+                }
                 let ty = if let Some(t) = &c.ty {
                     self.llvm_ty_for(t)
+                } else if matches!(c.init.kind, ExprKind::VecEmpty(_)) {
+                    // `const xs = vec[]`: undetermined i64-slot vector.
+                    self.vec_struct_ty(self.context.i64_type().into()).into()
                 } else {
                     // infer from init via sema type? For MVP, assume int
                     // Try to infer by codegen init first to get type, then alloca
@@ -2231,6 +3373,48 @@ impl<'ctx> Codegen<'ctx> {
                 // If ty was inferred as int placeholder but init is string, we need correct ty
                 // For `const x = "hello"` with no type, ty should be string (ptr)
                 // We can codegen init first to get its type, then create alloca with that type if ty was None
+                let is_vec_const = matches!(c.ty, Some(Type::Vec { .. }))
+                    || matches!(&c.ty, None) && matches!(c.init.kind, ExprKind::VecEmpty(_));
+                if is_vec_const {
+                    self.vec_vars.insert(c.name.clone());
+                }
+                // Vector const with literal initializer: per-element buffer fill.
+                if let (Some(Type::Vec { .. }), ExprKind::ArrayLit(elems)) =
+                    (&c.ty, &c.init.kind)
+                {
+                    let alloca = self.create_entry_block_alloca(&c.name, ty);
+                    self.vars.last_mut().unwrap().insert(c.name.clone(), (alloca, ty));
+                    let dest_elem_ty = self.vec_elem_llvm_ty(c.ty.as_ref().unwrap());
+                    let vec_st = match ty {
+                        BasicTypeEnum::StructType(st) => st,
+                        _ => unreachable!("vector alloca must be struct type"),
+                    };
+                    let buf_ptr = self.builder.build_struct_gep(vec_st, alloca, 0, "vec.buf").unwrap();
+                    let buf_arr_ty = match dest_elem_ty {
+                        BasicTypeEnum::IntType(it) => it.array_type(Self::VEC_CAP).into(),
+                        BasicTypeEnum::PointerType(pt) => pt.array_type(Self::VEC_CAP).into(),
+                        _ => self.context.i64_type().array_type(Self::VEC_CAP).into(),
+                    };
+                    let buf_arr_ty = match buf_arr_ty {
+                        BasicTypeEnum::ArrayType(at) => at,
+                        _ => unreachable!(),
+                    };
+                    let zero = self.context.i64_type().const_int(0, false);
+                    for (i, e) in elems.iter().enumerate() {
+                        let v = self.codegen_expr(e)?;
+                        let cv = self.coerce_to_ty(v, dest_elem_ty);
+                        let idx = self.context.i64_type().const_int(i as u64, false);
+                        let eptr = unsafe {
+                            self.builder
+                                .build_gep(buf_arr_ty, buf_ptr, &[zero, idx], &format!("vec.init.{i}"))
+                                .unwrap()
+                        };
+                        self.builder.build_store(eptr, cv).unwrap();
+                    }
+                    let len_ptr = self.builder.build_struct_gep(vec_st, alloca, 1, "vec.len").unwrap();
+                    self.builder.build_store(len_ptr, self.context.i64_type().const_int(elems.len() as u64, false)).unwrap();
+                    return Ok(false);
+                }
                 let init_val = self.codegen_expr(&c.init)?;
                 let actual_ty = if c.ty.is_none() {
                     init_val.get_type()
@@ -2239,7 +3423,8 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 let alloca = self.create_entry_block_alloca(&c.name, actual_ty);
                 self.vars.last_mut().unwrap().insert(c.name.clone(), (alloca, actual_ty));
-                self.builder.build_store(alloca, init_val).unwrap();
+                let stored = self.coerce_to_ty(init_val, actual_ty);
+                self.builder.build_store(alloca, stored).unwrap();
                 Ok(false)
             }
             Stmt::Destructure(d) => {
@@ -2350,7 +3535,22 @@ impl<'ctx> Codegen<'ctx> {
                     }
                 } else if let Some(expr) = &r.value {
                     let val = self.codegen_expr(expr)?;
-                    self.builder.build_return(Some(&val)).unwrap();
+                    // Coerce int return to the function's declared return width
+                    // (e.g. `i32 foo() do return 5 end` — literal is i64).
+                    let coerced = if val.is_int_value() {
+                        if let Some(cur) = self.cur_fn {
+                            if let Some(ret_ty) = cur.get_type().get_return_type() {
+                                self.coerce_to_ty(val, ret_ty)
+                            } else {
+                                val
+                            }
+                        } else {
+                            val
+                        }
+                    } else {
+                        val
+                    };
+                    self.builder.build_return(Some(&coerced)).unwrap();
                 } else {
                     self.builder.build_return(None).unwrap();
                 }
@@ -2463,12 +3663,51 @@ impl<'ctx> Codegen<'ctx> {
                 let idx_ptr = self.create_entry_block_alloca(&idx_name, idx_ty);
                 self.builder.build_store(idx_ptr, self.context.i64_type().const_int(0, false)).unwrap();
                 // Determine array to iterate: for now require iter is Ident array variable
-                // We will evaluate iter expression? For simplicity we require iter is Ident of int[] variable, and we use its array length 16 constant
+                // Array length comes from the actual LLVM array type (fixed
+                // `arr[N]` uses N; legacy `T[]` uses 16). Vectors iterate to
+                // their loaded length. Maps iterate over their keys.
+                let (iter_len_const, iter_is_vec, iter_is_map): (Option<u64>, bool, bool) = if let ExprKind::Ident(ref arr_name) = f.iter.kind {
+                    if let Some((_, arr_ty)) = self.lookup_var(arr_name) {
+                        if self.is_vec_var(arr_name) && arr_ty.is_struct_type() {
+                            (None, true, false)
+                        } else if self.is_map_var(arr_name) && arr_ty.is_struct_type() {
+                            (None, false, true)
+                        } else if arr_ty.is_array_type() {
+                            (Some(arr_ty.into_array_type().len() as u64), false, false)
+                        } else {
+                            (Some(16), false, false)
+                        }
+                    } else {
+                        (Some(16), false, false)
+                    }
+                } else {
+                    (Some(16), false, false)
+                };
                 // Create initial branch to cond
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
                 self.builder.position_at_end(cond_bb);
                 let idx_val = self.builder.build_load(idx_ty, idx_ptr, "for.idx.load").unwrap().into_int_value();
-                let limit = self.context.i64_type().const_int(16, false);
+                // Vectors iterate to their loaded length; arrays to the const size.
+                // Maps iterate over keys up to the loaded length.
+                let limit = if iter_is_vec || iter_is_map {
+                    if let ExprKind::Ident(ref arr_name) = f.iter.kind {
+                        if let Some((arr_ptr, arr_ty)) = self.lookup_var(arr_name) {
+                            if arr_ty.is_struct_type() {
+                                let vec_st = arr_ty.into_struct_type();
+                                let len_ptr = self.builder.build_struct_gep(vec_st, arr_ptr, if iter_is_map { 2 } else { 1 }, "for.iter.len.ptr").unwrap();
+                                self.builder.build_load(self.context.i64_type(), len_ptr, "for.iter.len").unwrap().into_int_value()
+                            } else {
+                                self.context.i64_type().const_int(16, false)
+                            }
+                        } else {
+                            self.context.i64_type().const_int(16, false)
+                        }
+                    } else {
+                        self.context.i64_type().const_int(16, false)
+                    }
+                } else {
+                    self.context.i64_type().const_int(iter_len_const.unwrap_or(16), false)
+                };
                 let cond = self.builder.build_int_compare(IntPredicate::SLT, idx_val, limit, "for.cond").unwrap();
                 self.builder.build_conditional_branch(cond, body_bb, exit_bb).unwrap();
                 self.loop_stack.push(LoopContext{cond_bb: inc_bb, exit_bb, label: f.label.clone(), defer_depth: self.defer_stack.len()});
@@ -2483,11 +3722,28 @@ impl<'ctx> Codegen<'ctx> {
                 self.defer_stack.push(Vec::new());
                 // Declare for var in this scope
                 // If iter is array, element type is int
+                let iter_is_vec_here = matches!(&f.iter.kind, ExprKind::Ident(n) if self.is_vec_var(n));
+                let iter_is_map_here = matches!(&f.iter.kind, ExprKind::Ident(n) if self.is_map_var(n));
                 let elem_val: Option<BasicValueEnum<'ctx>> = if let Some((arr_ptr, arr_ty)) = iter_val_opt {
                     if arr_ty.is_array_type() {
                         let arr_ty_a = arr_ty.into_array_type();
                         let elem_ptr = unsafe { self.builder.build_gep(arr_ty_a, arr_ptr, &[self.context.i64_type().const_int(0,false), idx_val], "for.elem.ptr").unwrap() };
-                        Some(self.builder.build_load(self.context.i64_type(), elem_ptr, "for.elem").unwrap())
+                        let elem_ty = arr_ty_a.get_element_type();
+                        Some(self.builder.build_load(elem_ty, elem_ptr, "for.elem").unwrap())
+                    } else if (iter_is_vec_here || iter_is_map_here) && arr_ty.is_struct_type() {
+                        // Vector element: buffer is struct field 0.
+                        // Map iteration yields keys: keys buffer is field 0.
+                        let vec_st = arr_ty.into_struct_type();
+                        let buf_ptr = self.builder.build_struct_gep(vec_st, arr_ptr, 0, "for.iter.buf").unwrap();
+                        let buf_field_ty = vec_st.get_field_type_at_index(0).unwrap();
+                        match buf_field_ty {
+                            BasicTypeEnum::ArrayType(buf_arr_ty) => {
+                                let elem_ptr = unsafe { self.builder.build_gep(buf_arr_ty, buf_ptr, &[self.context.i64_type().const_int(0,false), idx_val], "for.iter.elem.ptr").unwrap() };
+                                let elem_ty = buf_arr_ty.get_element_type();
+                                Some(self.builder.build_load(elem_ty, elem_ptr, "for.iter.elem").unwrap())
+                            }
+                            _ => None,
+                        }
                     } else if arr_ty.is_pointer_type() {
                         let loaded_arr = self.builder.build_load(arr_ty, arr_ptr, "ptr.load").unwrap().into_pointer_value();
                         let elem_ptr = unsafe { self.builder.build_gep(self.context.i64_type(), loaded_arr, &[idx_val], "for.ptr.elem").unwrap() };
@@ -2604,6 +3860,56 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(self.builder.build_load(ty, ptr, "this").unwrap())
             }
             ExprKind::MethodCall{object, method, method_span: _, args} => {
+                // Vector `push` (types skill §10): `v.push(x)` appends `x`,
+                // growing `len`. Capacity is VEC_CAP; overflow traps via abort.
+                if method == "push" {
+                    if let ExprKind::Ident(name) = &object.kind {
+                        if self.is_vec_var(name) {
+                            if args.len() != 1 {
+                                return Err(CodegenError{message: format!("`push` expects 1 arg, found {}", args.len()), span: expr.span});
+                            }
+                            let (ptr, ty) = self.lookup_var(name).ok_or(CodegenError{message: format!("undefined var {name}"), span: object.span})?;
+                            let vec_st = match ty {
+                                BasicTypeEnum::StructType(st) => st,
+                                _ => return Err(CodegenError{message: format!("`push` on non-vector `{name}`"), span: object.span}),
+                            };
+                            let arg_val = self.codegen_call_arg(&args[0])?;
+                            // Buffer element type from the struct layout.
+                            let buf_field_ty = vec_st.get_field_type_at_index(0).unwrap();
+                            let buf_arr_ty = match buf_field_ty {
+                                BasicTypeEnum::ArrayType(at) => at,
+                                _ => return Err(CodegenError{message: "`push`: malformed vector buffer".into(), span: object.span}),
+                            };
+                            let dest_elem_ty = buf_arr_ty.get_element_type();
+                            let cv = self.coerce_to_ty(arg_val, dest_elem_ty);
+                            // len = vec.len; if len >= CAP abort; buf[len] = v; len += 1
+                            let len_ptr = self.builder.build_struct_gep(vec_st, ptr, 1, "vec.len.ptr").unwrap();
+                            let len = self.builder.build_load(self.context.i64_type(), len_ptr, "vec.len").unwrap().into_int_value();
+                            let cap = self.context.i64_type().const_int(Self::VEC_CAP as u64, false);
+                            let ok = self.builder.build_int_compare(IntPredicate::ULT, len, cap, "vec.cap.ok").unwrap();
+                            let func = self.cur_fn.ok_or(CodegenError{message: "`push` outside function".into(), span: expr.span})?;
+                            let ok_bb = self.context.append_basic_block(func, "vec.push.ok");
+                            let fail_bb = self.context.append_basic_block(func, "vec.push.fail");
+                            self.builder.build_conditional_branch(ok, ok_bb, fail_bb).unwrap();
+                            self.builder.position_at_end(fail_bb);
+                            self.builder.build_call(self.get_or_declare_abort(), &[], "vec.push.abort").unwrap();
+                            self.builder.build_unreachable().unwrap();
+                            self.builder.position_at_end(ok_bb);
+                            let buf_ptr = self.builder.build_struct_gep(vec_st, ptr, 0, "vec.buf.ptr").unwrap();
+                            let zero = self.context.i64_type().const_int(0, false);
+                            let eptr = unsafe {
+                                self.builder
+                                    .build_gep(buf_arr_ty, buf_ptr, &[zero, len], "vec.push.slot")
+                                    .unwrap()
+                            };
+                            self.builder.build_store(eptr, cv).unwrap();
+                            let one = self.context.i64_type().const_int(1, false);
+                            let nlen = self.builder.build_int_add(len, one, "vec.len.inc").unwrap();
+                            self.builder.build_store(len_ptr, nlen).unwrap();
+                            return Ok(self.context.i64_type().const_int(0, false).into());
+                        }
+                    }
+                }
                 // Determine this pointer for method call
                 let this_ptr: PointerValue<'ctx> = match &object.kind {
                     ExprKind::Ident(name) => {
@@ -2812,6 +4118,7 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 let l = self.codegen_expr(lhs)?;
                 let r = self.codegen_expr(rhs)?;
+                let (l, r) = self.unify_int_operands(l, r);
                 Ok(match op {
                     BinOp::Add => self
                         .builder
@@ -3055,13 +4362,14 @@ impl<'ctx> Codegen<'ctx> {
                 let val = self.codegen_expr(value)?;
                 match &lhs.kind {
                     ExprKind::Ident(name) => {
-                        let (ptr, _) =
+                        let (ptr, dest_ty) =
                             self.lookup_var(name).ok_or(CodegenError {
                                 message: format!("undefined var {name}"),
                                 span: lhs.span,
                             })?;
-                        self.builder.build_store(ptr, val).unwrap();
-                        Ok(val)
+                        let coerced = self.coerce_to_ty(val, dest_ty);
+                        self.builder.build_store(ptr, coerced).unwrap();
+                        Ok(coerced)
                     }
                     ExprKind::MemberAccess { object, field, .. } => {
                         // Check for property setter first
@@ -3084,6 +4392,75 @@ impl<'ctx> Codegen<'ctx> {
                         Ok(val)
                     }
                     ExprKind::Index { object, index } => {
+                        // Map insert/update: `m[k] = v` writes vals[slot] on a
+                        // hit, else appends (capacity-trapped like `push`).
+                        if let ExprKind::Ident(name) = &object.kind {
+                            if self.is_map_var(name) {
+                                if let Some((ptr, ty)) = self.lookup_var(name) {
+                                    if ty.is_struct_type() {
+                                        let map_st = ty.into_struct_type();
+                                        let key_val = self.codegen_expr(index)?;
+                                        let val_in = self.codegen_expr(value)?;
+                                        let (idx_res, _keys, vals_arr_ty, val_ty) =
+                                            self.codegen_map_search(ptr, map_st, key_val, expr.span)?;
+                                        let vals_ptr = self.builder.build_struct_gep(map_st, ptr, 1, "map.set.vals").unwrap();
+                                        let zero = self.context.i64_type().const_int(0, false);
+                                        let func = self.cur_fn.ok_or(CodegenError{message: "map access outside function".into(), span: expr.span})?;
+                                        let hit_bb = self.context.append_basic_block(func, "map.set.hit");
+                                        let miss_bb = self.context.append_basic_block(func, "map.set.miss");
+                                        let merge_bb = self.context.append_basic_block(func, "map.set.merge");
+                                        let idx = self.builder.build_load(self.context.i64_type(), idx_res, "map.set.idx").unwrap().into_int_value();
+                                        let is_hit = self.builder.build_int_compare(IntPredicate::SGE, idx, self.context.i64_type().const_zero(), "map.set.found").unwrap();
+                                        self.builder.build_conditional_branch(is_hit, hit_bb, miss_bb).unwrap();
+                                        // hit: vals[idx] = v
+                                        self.builder.position_at_end(hit_bb);
+                                        let cv = self.coerce_to_ty(val_in, val_ty);
+                                        let hptr = unsafe {
+                                            self.builder.build_gep(vals_arr_ty, vals_ptr, &[zero, idx], "map.set.slot").unwrap()
+                                        };
+                                        self.builder.build_store(hptr, cv).unwrap();
+                                        self.builder.build_unconditional_branch(merge_bb).unwrap();
+                                        // miss: append key+value at len (trap past capacity)
+                                        self.builder.position_at_end(miss_bb);
+                                        let len_ptr = self.builder.build_struct_gep(map_st, ptr, 2, "map.set.len.ptr").unwrap();
+                                        let len = self.builder.build_load(self.context.i64_type(), len_ptr, "map.set.len").unwrap().into_int_value();
+                                        let cap = self.context.i64_type().const_int(Self::MAP_CAP as u64, false);
+                                        let ok = self.builder.build_int_compare(IntPredicate::ULT, len, cap, "map.cap.ok").unwrap();
+                                        let ok_bb = self.context.append_basic_block(func, "map.set.ok");
+                                        let fail_bb = self.context.append_basic_block(func, "map.set.fail");
+                                        self.builder.build_conditional_branch(ok, ok_bb, fail_bb).unwrap();
+                                        self.builder.position_at_end(fail_bb);
+                                        self.builder.build_call(self.get_or_declare_abort(), &[], "map.set.abort").unwrap();
+                                        self.builder.build_unreachable().unwrap();
+                                        self.builder.position_at_end(ok_bb);
+                                        // Re-derive key slot type from the map layout.
+                                        let keys_arr_ty = match map_st.get_field_type_at_index(0).unwrap() {
+                                            BasicTypeEnum::ArrayType(at) => at,
+                                            _ => return Err(CodegenError{message: "malformed map keys buffer".into(), span: object.span}),
+                                        };
+                                        let key_slot_ty = keys_arr_ty.get_element_type();
+                                        let keys_ptr = self.builder.build_struct_gep(map_st, ptr, 0, "map.set.keys").unwrap();
+                                        let ck = self.coerce_to_ty(key_val, key_slot_ty);
+                                        let kptr = unsafe {
+                                            self.builder.build_gep(keys_arr_ty, keys_ptr, &[zero, len], "map.set.key").unwrap()
+                                        };
+                                        self.builder.build_store(kptr, ck).unwrap();
+                                        let cv2 = self.coerce_to_ty(val_in, val_ty);
+                                        let vptr = unsafe {
+                                            self.builder.build_gep(vals_arr_ty, vals_ptr, &[zero, len], "map.set.val").unwrap()
+                                        };
+                                        self.builder.build_store(vptr, cv2).unwrap();
+                                        let one = self.context.i64_type().const_int(1, false);
+                                        let nlen = self.builder.build_int_add(len, one, "map.len.inc").unwrap();
+                                        self.builder.build_store(len_ptr, nlen).unwrap();
+                                        self.builder.build_unconditional_branch(merge_bb).unwrap();
+                                        self.builder.position_at_end(merge_bb);
+                                        return Ok(val_in);
+                                    }
+                                }
+                                return Err(CodegenError{message: format!("`{name}` is not a writable map"), span: object.span});
+                            }
+                        }
                         // arr[idx] = val  -> GEP store
                         let idx_val =
                             self.codegen_expr(index)?.into_int_value();
@@ -3111,6 +4488,32 @@ impl<'ctx> Codegen<'ctx> {
                                         .build_store(elem_ptr, val)
                                         .unwrap();
                                     return Ok(val);
+                                } else if self.is_vec_var(name) && ty.is_struct_type() {
+                                    // vec[idx] = val -> buffer GEP store (length unchanged).
+                                    let vec_st = ty.into_struct_type();
+                                    let buf_ptr = self.builder.build_struct_gep(vec_st, ptr, 0, "vec.buf").unwrap();
+                                    let buf_field_ty = vec_st.get_field_type_at_index(0).unwrap();
+                                    let buf_arr_ty = match buf_field_ty {
+                                        BasicTypeEnum::ArrayType(at) => at,
+                                        _ => return Err(CodegenError{message: "malformed vector buffer".into(), span: object.span}),
+                                    };
+                                    let elem_ty = buf_arr_ty.get_element_type();
+                                    let cv = self.coerce_to_ty(val, elem_ty);
+                                    let elem_ptr = unsafe {
+                                        self.builder
+                                            .build_gep(
+                                                buf_arr_ty,
+                                                buf_ptr,
+                                                &[
+                                                    self.context.i64_type().const_int(0, false),
+                                                    idx_val,
+                                                ],
+                                                "vec.idx.store",
+                                            )
+                                            .unwrap()
+                                    };
+                                    self.builder.build_store(elem_ptr, cv).unwrap();
+                                    return Ok(cv);
                                 } else if ty.is_pointer_type() {
                                     let loaded = self
                                         .builder
@@ -3309,7 +4712,21 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         } else {
-                            for a in args { let v = self.codegen_call_arg(a)?; arg_vals.push(v.into()); }
+                            for (i, a) in args.iter().enumerate() {
+                                let v = self.codegen_call_arg(a)?;
+                                // Coerce int args to the declared param width
+                                // (e.g. `add32(100, 200)` literals are i64 → i32 params).
+                                let coerced = if let Some(param_ty) = info.params.get(i) {
+                                    if let Some(dest) = self.llvm_ty_for_sema(param_ty) {
+                                        self.coerce_to_ty(v, dest)
+                                    } else {
+                                        v
+                                    }
+                                } else {
+                                    v
+                                };
+                                arg_vals.push(coerced.into());
+                            }
                         }
                     }
                     let call = self.builder.build_call(func, &arg_vals, "call").unwrap();
@@ -3400,6 +4817,43 @@ impl<'ctx> Codegen<'ctx> {
             }
             ExprKind::Index { object, index } => {
                 // a[i] rvalue: GEP on array or string
+                // Maps take the search path (keys are values, not indices).
+                if let ExprKind::Ident(name) = &object.kind {
+                    if self.is_map_var(name) {
+                        if let Some((ptr, ty)) = self.lookup_var(name) {
+                            if ty.is_struct_type() {
+                                let map_st = ty.into_struct_type();
+                                let key_val = self.codegen_expr(index)?;
+                                let (idx_res, _keys, vals_arr_ty, val_ty) =
+                                    self.codegen_map_search(ptr, map_st, key_val, expr.span)?;
+                                // hit ? vals[idx] : zero
+                                let func = self.cur_fn.ok_or(CodegenError{message: "map access outside function".into(), span: expr.span})?;
+                                let hit_bb = self.context.append_basic_block(func, "map.get.hit");
+                                let miss_bb = self.context.append_basic_block(func, "map.get.miss");
+                                let merge_bb = self.context.append_basic_block(func, "map.get.merge");
+                                let res = self.create_entry_block_alloca("map.get.res", val_ty);
+                                self.builder.build_store(res, val_ty.const_zero()).unwrap();
+                                let idx = self.builder.build_load(self.context.i64_type(), idx_res, "map.get.idx").unwrap().into_int_value();
+                                let is_hit = self.builder.build_int_compare(IntPredicate::SGE, idx, self.context.i64_type().const_zero(), "map.get.found").unwrap();
+                                self.builder.build_conditional_branch(is_hit, hit_bb, miss_bb).unwrap();
+                                self.builder.position_at_end(hit_bb);
+                                let vals_ptr = self.builder.build_struct_gep(map_st, ptr, 1, "map.get.vals").unwrap();
+                                let zero = self.context.i64_type().const_int(0, false);
+                                let vptr = unsafe {
+                                    self.builder.build_gep(vals_arr_ty, vals_ptr, &[zero, idx], "map.get.slot").unwrap()
+                                };
+                                let vv = self.builder.build_load(val_ty, vptr, "map.get.val").unwrap();
+                                self.builder.build_store(res, vv).unwrap();
+                                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                                self.builder.position_at_end(miss_bb);
+                                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                                self.builder.position_at_end(merge_bb);
+                                return Ok(self.builder.build_load(val_ty, res, "map.get").unwrap());
+                            }
+                        }
+                        return Err(CodegenError{message: format!("`{name}` is not a readable map"), span: object.span});
+                    }
+                }
                 let idx_val = self.codegen_expr(index)?.into_int_value();
                 // Determine object type: if it's Ident array var, it's [16 x i64] alloca
                 // For simplicity, handle Ident array and member access array (e.g., s.arr[i]) via GEP
@@ -3427,6 +4881,33 @@ impl<'ctx> Codegen<'ctx> {
                             return Ok(self
                                 .builder
                                 .build_load(elem_ty, elem_ptr, "idx.load")
+                                .unwrap());
+                        } else if self.is_vec_var(name) && ty.is_struct_type() {
+                            // Vector index: buffer is struct field 0.
+                            let vec_st = ty.into_struct_type();
+                            let buf_ptr = self.builder.build_struct_gep(vec_st, ptr, 0, "vec.buf").unwrap();
+                            let buf_field_ty = vec_st.get_field_type_at_index(0).unwrap();
+                            let buf_arr_ty = match buf_field_ty {
+                                BasicTypeEnum::ArrayType(at) => at,
+                                _ => return Err(CodegenError{message: "malformed vector buffer".into(), span: object.span}),
+                            };
+                            let elem_ptr = unsafe {
+                                self.builder
+                                    .build_gep(
+                                        buf_arr_ty,
+                                        buf_ptr,
+                                        &[
+                                            self.context.i64_type().const_int(0, false),
+                                            idx_val,
+                                        ],
+                                        "vec.idx",
+                                    )
+                                    .unwrap()
+                            };
+                            let elem_ty = buf_arr_ty.get_element_type();
+                            return Ok(self
+                                .builder
+                                .build_load(elem_ty, elem_ptr, "vec.idx.load")
                                 .unwrap());
                         } else if ty.is_pointer_type() {
                             let loaded = self
@@ -3649,6 +5130,71 @@ impl<'ctx> Codegen<'ctx> {
                     let tmp = self.builder.build_insert_value(agg.into_struct_value(), v, i as u32, "tuple.ins").unwrap();
                     agg = tmp.as_basic_value_enum();
                 }
+                Ok(agg)
+            }
+            ExprKind::ArrayLit(elems) => {
+                // Array value sized to the literal length, element type from
+                // the first element (elements coerced to it). Used for
+                // non-decl positions; `VarDecl` with `FixedArray` type stores
+                // per-element via GEP for exact width matching.
+                if elems.is_empty() {
+                    return Ok(self.context.i64_type().array_type(0).const_zero().into());
+                }
+                let first = self.codegen_expr(&elems[0])?;
+                let elem_ty = first.get_type();
+                let arr_ty = match elem_ty {
+                    BasicTypeEnum::IntType(it) => it.array_type(elems.len() as u32).into(),
+                    BasicTypeEnum::FloatType(ft) => ft.array_type(elems.len() as u32).into(),
+                    BasicTypeEnum::PointerType(pt) => pt.array_type(elems.len() as u32).into(),
+                    BasicTypeEnum::StructType(st) => st.array_type(elems.len() as u32).into(),
+                    BasicTypeEnum::ArrayType(at) => at.array_type(elems.len() as u32).into(),
+                    _ => self.context.i64_type().array_type(elems.len() as u32).into(),
+                };
+                let mut agg: BasicValueEnum = match arr_ty {
+                    BasicTypeEnum::ArrayType(at) => at.get_undef().into(),
+                    _ => unreachable!(),
+                };
+                let first_c = self.coerce_to_ty(first, elem_ty);
+                let tmp = self.builder.build_insert_value(agg.into_array_value(), first_c, 0, "arr.0").unwrap();
+                agg = tmp.as_basic_value_enum();
+                for (i, e) in elems.iter().enumerate().skip(1) {
+                    let v = self.codegen_expr(e)?;
+                    let cv = self.coerce_to_ty(v, elem_ty);
+                    let tmp = self.builder.build_insert_value(agg.into_array_value(), cv, i as u32, &format!("arr.{i}")).unwrap();
+                    agg = tmp.as_basic_value_enum();
+                }
+                Ok(agg)
+            }
+            ExprKind::VecEmpty(_) => {
+                // Empty vector value: zeroed i64-slot struct. Declarations
+                // refine the buffer type via their `Vec` type; this fallback
+                // covers non-declaration positions.
+                let vec_st = self.vec_struct_ty(self.context.i64_type().into());
+                Ok(vec_st.const_zero().into())
+            }
+            ExprKind::MapLit { entries, .. } => {
+                // Map value (non-declaration positions): slots inferred from
+                // the first entry's shape; keys/values inserted per entry.
+                let (dk, dv) = if entries.is_empty() {
+                    (
+                        self.context.i64_type().into(),
+                        self.context.i64_type().into(),
+                    )
+                } else {
+                    (
+                        self.lit_slot_ty(&entries[0].0, true),
+                        self.lit_slot_ty(&entries[0].1, false),
+                    )
+                };
+                let map_st = self.map_struct_ty(dk, dv);
+                let mut agg: BasicValueEnum<'ctx> = map_st.const_zero().into();
+                // Rebuild per entry via GEP on a temp alloca (insertvalue on
+                // nested arrays is awkward); then load the finished struct.
+                let tmp = self.create_entry_block_alloca("map.tmp", map_st.into());
+                self.builder.build_store(tmp, agg).unwrap();
+                let entries_owned = entries.clone();
+                self.store_map_entries(tmp, map_st, dk, dv, &entries_owned)?;
+                agg = self.builder.build_load(map_st.as_basic_type_enum(), tmp, "map.tmp.load").unwrap();
                 Ok(agg)
             }
             ExprKind::Null => Ok(self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into()),
@@ -4269,6 +5815,19 @@ impl<'ctx> Codegen<'ctx> {
         match &expr.kind {
             ExprKind::Ident(name) => {
                 let lookup = name.rsplit("::").next().unwrap_or(name);
+                // Vectors lower as anonymous structs; report the vec type
+                // instead of attempting struct-name resolution (which would
+                // fail to find them in `struct_types`).
+                if self.is_vec_var(name) || (lookup != name && self.is_vec_var(lookup)) {
+                    return Ok(crate::sema::Ty::Vec(Box::new(crate::sema::Ty::Any)));
+                }
+                // Same for maps (anonymous `{ keys, vals, len }` structs).
+                if self.is_map_var(name) || (lookup != name && self.is_map_var(lookup)) {
+                    return Ok(crate::sema::Ty::Map {
+                        key: Box::new(crate::sema::Ty::Any),
+                        value: Box::new(crate::sema::Ty::Any),
+                    });
+                }
                 for scope in self.vars.iter().rev() {
                     if let Some((_, ty)) = scope.get(name).or_else(|| scope.get(lookup)) {
                         if ty.is_struct_type() {
@@ -4344,6 +5903,31 @@ impl<'ctx> Codegen<'ctx> {
                     tys.push(self.infer_expr_ty(e)?);
                 }
                 Ok(crate::sema::Ty::Tuple(tys))
+            }
+            ExprKind::ArrayLit(elems) => {
+                if elems.is_empty() {
+                    return Ok(crate::sema::Ty::FixedArray {
+                        elem: Box::new(crate::sema::Ty::Any),
+                        size: Some(0),
+                    });
+                }
+                let first = self.infer_expr_ty(&elems[0])?;
+                Ok(crate::sema::Ty::FixedArray {
+                    elem: Box::new(first),
+                    size: Some(elems.len()),
+                })
+            }
+            ExprKind::VecEmpty(_) => Ok(crate::sema::Ty::Vec(Box::new(crate::sema::Ty::Any))),
+            ExprKind::MapLit { entries, .. } => {
+                if entries.is_empty() {
+                    return Ok(crate::sema::Ty::Map {
+                        key: Box::new(crate::sema::Ty::Any),
+                        value: Box::new(crate::sema::Ty::Any),
+                    });
+                }
+                let k = self.infer_expr_ty(&entries[0].0)?;
+                let v = self.infer_expr_ty(&entries[0].1)?;
+                Ok(crate::sema::Ty::Map { key: Box::new(k), value: Box::new(v) })
             }
             ExprKind::Paren(inner) => self.infer_expr_ty(inner),
             _ => Err(CodegenError{message: "cannot infer type of this expr for struct GEP".into(), span: expr.span}),

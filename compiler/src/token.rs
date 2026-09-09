@@ -85,6 +85,10 @@ pub enum Token {
     And,
     #[token("any")]
     Any,
+    #[token("arr")]
+    Arr,
+    #[token("vec")]
+    Vec,
     #[token("assert")]
     Assert,
     #[token("bool")]
@@ -351,6 +355,8 @@ impl std::fmt::Display for Token {
             Self::Semicolon => ";",
             Self::And => "and",
             Self::Any => "any",
+            Self::Arr => "arr",
+            Self::Vec => "vec",
             Self::Assert => "assert",
             Self::Bool => "bool",
             Self::Break => "break",

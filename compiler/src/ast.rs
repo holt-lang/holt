@@ -126,6 +126,17 @@ pub enum Type {
     Tuple(Vec<Type>, Span),
     Any(Span),
     Array(Box<Type>, Span),    // T[]  (Phase 2)
+    /// Fixed-size array (types skill §7-8): `TYPE arr` (size inferred from
+    /// initializer) or `TYPE arr[SIZE]` (explicit size, zero-initialized).
+    /// `arr` is a compiler keyword; the element type precedes it.
+    FixedArray { elem: Box<Type>, size: Option<u64>, span: Span },
+    /// Dynamic owning vector (types skill §9): `TYPE vec`. Vectors may grow;
+    /// empty vectors come from the `vec[]` expression with `any` element type
+    /// until the first `push` establishes it.
+    Vec { elem: Box<Type>, span: Span },
+    /// Associative map (types skill §12): `KEY_TYPE:VALUE_TYPE`
+    /// (e.g. `string:int`). There is no `map` keyword.
+    Map { key: Box<Type>, value: Box<Type>, span: Span },
     Pointer(Box<Type>, Span),  // T*  (Phase 2)
     Optional(Box<Type>, Span), // T? (Phase 2 future)
 }
@@ -146,6 +157,9 @@ impl Type {
             | Type::Tuple(_, s)
             | Type::Any(s)
             | Type::Array(_, s)
+            | Type::FixedArray { span: s, .. }
+            | Type::Vec { span: s, .. }
+            | Type::Map { span: s, .. }
             | Type::Pointer(_, s)
             | Type::Optional(_, s) => *s,
         }
@@ -165,6 +179,12 @@ impl Type {
             Type::Tuple(tys, _) => format!("({})", tys.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")),
             Type::Any(_) => "any".into(),
             Type::Array(el, _) => format!("{}[]", el.name()),
+            Type::FixedArray { elem, size, .. } => match size {
+                Some(n) => format!("{} arr[{}]", elem.name(), n),
+                None => format!("{} arr", elem.name()),
+            },
+            Type::Vec { elem, .. } => format!("{} vec", elem.name()),
+            Type::Map { key, value, .. } => format!("{}:{}", key.name(), value.name()),
             Type::Pointer(el, _) => format!("{}*", el.name()),
             Type::Optional(el, _) => format!("{}?", el.name()),
         }
@@ -629,6 +649,18 @@ pub enum ExprKind {
         object: Box<Expr>,
         index: Box<Expr>,
     }, // a[i] Phase 2
+    /// Array literal (types skill §7-8): `[1, 2, 3, 4]` — initializer for
+    /// `TYPE arr` declarations. Size is inferred from element count.
+    ArrayLit(Vec<Expr>),
+    /// Empty vector (types skill §10): `vec[]` — no established element type
+    /// until the first `push`. Declared with `any` (e.g. `any xs = vec[]`).
+    VecEmpty(Span),
+    /// Map literal (types skill §13): `has "k": v, ... end` (explicit
+    /// `TYPE has ... end` or inferred bare `has ... end` in var init).
+    MapLit {
+        ty: Type,
+        entries: Vec<(Expr, Expr)>,
+    },
     Slice {
         object: Box<Expr>,
         start: Option<Box<Expr>>,

@@ -1469,6 +1469,13 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
+        self.parse_type_impl(true)
+    }
+
+    /// Type parser with optional map interpretation. `where T: Trait`
+    /// constraints use `allow_map = false` so the constraint colon is not
+    /// consumed as a `KEY:VALUE` map operator.
+    fn parse_type_impl(&mut self, allow_map: bool) -> Result<Type, ParseError> {
         // primary-type
         let mut ty: Type = {
             let st = self.peek().cloned().ok_or(ParseError {
@@ -1600,6 +1607,67 @@ impl Parser {
                     // rollback not needed for now
                 }
             }
+        }
+        // Fixed-size array suffix (types skill §7-8): `TYPE arr` (inferred)
+        // or `TYPE arr[SIZE]` (explicit). `arr` is a compiler keyword.
+        if self.peek_token() == Some(&Token::Arr) {
+            let arr_tok = self.advance().unwrap();
+            let mut size: Option<u64> = None;
+            let mut end = arr_tok.span.end;
+            if self.peek_token() == Some(&Token::LBracket) {
+                self.advance(); // [
+                if self.peek_token() == Some(&Token::RBracket) {
+                    self.advance(); // `arr[]` — treat as inferred
+                    end = self.tokens[self.pos - 1].span.end;
+                } else {
+                    let size_tok = self.peek().cloned().ok_or(ParseError {
+                        message: "expected array size after `arr[`".into(),
+                        span: Span::new(self.source.len(), self.source.len()),
+                    })?;
+                    match size_tok.token {
+                        Token::IntLit | Token::HexInt | Token::BinInt => {
+                            self.advance();
+                            let n = self.parse_int_lit(size_tok.span)?;
+                            if n < 0 {
+                                return Err(ParseError {
+                                    message: "array size must be non-negative".into(),
+                                    span: size_tok.span,
+                                });
+                            }
+                            size = Some(n as u64);
+                            let rb = self.expect(Token::RBracket, "expected `]` after array size")?;
+                            end = rb.span.end;
+                        }
+                        _ => {
+                            return Err(ParseError {
+                                message: format!("expected array size, found `{}`", size_tok.token),
+                                span: size_tok.span,
+                            });
+                        }
+                    }
+                }
+            }
+            let span = Span::new(ty.span().start, end);
+            ty = Type::FixedArray { elem: Box::new(ty), size, span };
+        }
+        // Dynamic vector suffix (types skill §9): `TYPE vec`. Unlike `arr`,
+        // vectors take no size — they own their storage and may grow.
+        // (`vec[]` empty construction is an *expression*, parsed in primary.)
+        if self.peek_token() == Some(&Token::Vec) {
+            let vec_tok = self.advance().unwrap();
+            let span = Span::new(ty.span().start, vec_tok.span.end);
+            ty = Type::Vec { elem: Box::new(ty), span };
+        }
+        // Map type (types skill §12): `KEY_TYPE:VALUE_TYPE` (no `map`
+        // keyword). `:` here is distinct from `::` (qualified names tokenize
+        // as one `ColonColon`). Value is a full type, so `string:int[]` is a
+        // map to an array; `(string:int)[]` is an array of maps.
+        // Disabled inside `where` constraints (`where T: Trait`).
+        if allow_map && self.peek_token() == Some(&Token::Colon) {
+            self.advance(); // :
+            let value = self.parse_type()?;
+            let span = Span::new(ty.span().start, value.span().end);
+            ty = Type::Map { key: Box::new(ty), value: Box::new(value), span };
         }
         // { type-modifier } : "?" | "*" | "[]"
         loop {
@@ -1778,11 +1846,12 @@ impl Parser {
         let start = self.advance().unwrap().span.start;
         let mut constraints = Vec::new();
         while !self.is_eof() && !matches!(self.peek_token(), Some(Token::Has) | Some(Token::Do) | Some(Token::End) | Some(Token::Newline) | Some(Token::Semicolon)) {
-            let ty = match self.parse_type() { Ok(t) => t, Err(_) => break };
+            // `where T: Trait` — the constraint colon is not a map operator.
+            let ty = match self.parse_type_impl(false) { Ok(t) => t, Err(_) => break };
             if !self.consume_if(Token::Colon) { break; }
             let mut bounds = Vec::new();
             loop {
-                match self.parse_type() {
+                match self.parse_type_impl(false) {
                     Ok(t) => bounds.push(t),
                     Err(_) => break,
                 }
@@ -2032,7 +2101,90 @@ impl Parser {
             self.consume_newlines();
             if self.peek_token() == Some(&Token::Has) {
                 let has_tok = self.advance().unwrap();
+                let _ = has_tok;
                 self.consume_newlines();
+                // Bare `has ... end` with a map declaration type is a map
+                // literal (`string:int m = has "k": v end`); with `any` try
+                // map entries first, falling back to struct fields.
+                let want_map = matches!(ty, Type::Map { .. });
+                let try_map_first = want_map || matches!(ty, Type::Any(_));
+                if try_map_first {
+                    let save_entries = self.pos;
+                    let mut entries = Vec::new();
+                    let mut is_map = true;
+                    while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+                        if matches!(
+                            self.peek_token(),
+                            Some(Token::Newline) | Some(Token::Semicolon) | Some(Token::Comma)
+                        ) {
+                            self.advance();
+                            continue;
+                        }
+                        // A map entry starts with a key expression followed by `:`.
+                        // Struct fields start with `Ident =`; probe without committing.
+                        let save_entry = self.pos;
+                        let key = match self.parse_expr() {
+                            Ok(k) => k,
+                            Err(_) => {
+                                is_map = false;
+                                break;
+                            }
+                        };
+                        if self.peek_token() != Some(&Token::Colon) {
+                            is_map = false;
+                            self.pos = save_entry;
+                            break;
+                        }
+                        self.advance(); // :
+                        let value = match self.parse_expr() {
+                            Ok(v) => v,
+                            Err(_) => {
+                                is_map = false;
+                                self.pos = save_entry;
+                                break;
+                            }
+                        };
+                        entries.push((key, value));
+                        if self.consume_if(Token::Comma) {
+                            self.consume_newlines();
+                            continue;
+                        }
+                        self.consume_newlines();
+                        if matches!(self.peek_token(), Some(Token::Semicolon)) {
+                            self.advance();
+                        }
+                    }
+                    if is_map {
+                        // For `any`, an empty `has end` is still a (empty) map.
+                        let end_tok = self.expect(Token::End, "expected `end` to close map literal")?;
+                        let span = Span::new(ty.span().start, end_tok.span.end);
+                        let lit = Expr{kind: ExprKind::MapLit{ty: ty.clone(), entries}, span};
+                        end = lit.span.end;
+                        init = Some(lit);
+                        let term_start = end;
+                        self.expect_terminator("variable declaration")?;
+                        let span = Span::new(ty.span().start, term_start);
+                        return Ok(VarDecl {
+                            visibility,
+                            ty,
+                            name,
+                            name_span,
+                            init,
+                            span,
+                        });
+                    }
+                    // Not map entries after all: rewind (unless the type
+                    // demands a map) and parse struct fields.
+                    if want_map {
+                        // `string:int m = has <non-map entries>` — surface the
+                        // entry error rather than a struct-field error.
+                        return Err(ParseError {
+                            message: "expected `key: value` entries in map literal".into(),
+                            span: self.peek_span(),
+                        });
+                    }
+                    self.pos = save_entries;
+                }
                 let mut fields = Vec::new();
                 while !self.is_eof() && self.peek_token() != Some(&Token::End) {
                     if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
@@ -3118,6 +3270,42 @@ impl Parser {
                     span,
                 })
             }
+            Token::LBracket => {
+                // Array literal (types skill §8): `[1, 2, 3, 4]` (or `[]`).
+                // Unambiguous in primary position: `[...]` postfix indexing
+                // only occurs *after* a primary.
+                self.advance(); // [
+                let mut elems = Vec::new();
+                if self.peek_token() == Some(&Token::RBracket) {
+                    let end = self.advance().unwrap().span.end;
+                    let span = Span::new(st.span.start, end);
+                    return Ok(Expr { kind: ExprKind::ArrayLit(elems), span });
+                }
+                loop {
+                    // Allow newlines inside literals
+                    self.consume_newlines();
+                    if self.peek_token() == Some(&Token::RBracket) {
+                        break;
+                    }
+                    let e = self.parse_expr()?;
+                    elems.push(e);
+                    self.consume_newlines();
+                    if !self.consume_if(Token::Comma) {
+                        break;
+                    }
+                }
+                let end = self.expect(Token::RBracket, "expected `]` after array literal")?.span.end;
+                let span = Span::new(st.span.start, end);
+                Ok(Expr { kind: ExprKind::ArrayLit(elems), span })
+            }
+            Token::Vec => {
+                // Empty vector (types skill §10): `vec[]`.
+                self.advance();
+                self.expect(Token::LBracket, "expected `[` after `vec` for empty vector `vec[]`")?;
+                let end = self.expect(Token::RBracket, "expected `]` for empty vector `vec[]`")?.span.end;
+                let span = Span::new(st.span.start, end);
+                Ok(Expr { kind: ExprKind::VecEmpty(span), span })
+            }
             _ => Err(ParseError {
                 message: format!("expected expression, found `{}`", st.token),
                 span: st.span,
@@ -3346,13 +3534,21 @@ impl Parser {
     fn try_parse_struct_literal(&mut self) -> Result<Option<Expr>, ParseError> {
         // Save position to backtrack if not a struct literal
         let save = self.pos;
-        // Try parse Type (int/bool/void/named) — but struct literal expects struct Named type
-        // We'll peek: Int/Bool/Ident could be start of Type
+        // Try parse Type (int/bool/void/named/...) — struct/map literals expect
+        // a type followed by `has`. Cover every type start (incl. `string`,
+        // sized-int idents like `i32`, `any`, tuples, `function<...>`).
         let is_type_start = matches!(
             self.peek_token(),
             Some(Token::Int)
                 | Some(Token::Bool)
                 | Some(Token::Void)
+                | Some(Token::StringKw)
+                | Some(Token::CharKw)
+                | Some(Token::Float)
+                | Some(Token::Double)
+                | Some(Token::Any)
+                | Some(Token::Function)
+                | Some(Token::LParen)
                 | Some(Token::Ident)
         );
         if !is_type_start {
@@ -3374,6 +3570,43 @@ impl Parser {
         // It is a struct literal
         let has_tok = self.advance().unwrap(); // consume has
         self.consume_newlines();
+        // Map literal (types skill §13): `TYPE has k: v, ... end` when the
+        // type is a `KEY:VALUE` map. Entries are `key: value` separated by
+        // commas, newlines, or semicolons (both styles below are valid).
+        if matches!(ty, Type::Map { .. }) {
+            let mut entries = Vec::new();
+            while !self.is_eof() && self.peek_token() != Some(&Token::End) {
+                if matches!(
+                    self.peek_token(),
+                    Some(Token::Newline) | Some(Token::Semicolon) | Some(Token::Comma)
+                ) {
+                    self.advance();
+                    continue;
+                }
+                let key = self.parse_expr()?;
+                self.expect(Token::Colon, "expected `:` between map key and value")?;
+                let value = self.parse_expr()?;
+                entries.push((key, value));
+                // Separator: `,` or terminator; `end` closes.
+                if self.consume_if(Token::Comma) {
+                    self.consume_newlines();
+                    continue;
+                }
+                self.consume_newlines();
+                if matches!(self.peek_token(), Some(Token::Semicolon)) {
+                    self.advance();
+                }
+            }
+            let end = self
+                .expect(Token::End, "expected `end` to close map literal")?
+                .span
+                .end;
+            let span = Span::new(ty.span().start, end);
+            return Ok(Some(Expr {
+                kind: ExprKind::MapLit { ty, entries },
+                span,
+            }));
+        }
         let mut fields = Vec::new();
         while !self.is_eof() && self.peek_token() != Some(&Token::End) {
             if matches!(

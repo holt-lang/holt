@@ -14,6 +14,12 @@ pub struct SemError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Int,
+    /// Unsigned pointer-sized (`uint`) — LLVM `i64` on 64-bit.
+    UInt,
+    /// Fixed-width integer from stdlib (`i8`..`i128`, `u8`..`u128`).
+    /// These are stdlib types (types skill §2), NOT compiler keywords:
+    /// they lex as `Ident` and resolve here via the implicit stdlib env.
+    SizedInt { bits: u16, signed: bool },
     Bool,
     Void,
     Char,
@@ -27,8 +33,104 @@ pub enum Ty {
     Any,
     Function(Box<Ty>, Vec<Ty>),
     Array(Box<Ty>),
+    /// Fixed-size array (types skill §7-8): `TYPE arr` (size inferred,
+    /// `None`) or `TYPE arr[N]` (explicit). Arrays are fixed-size for life.
+    FixedArray { elem: Box<Ty>, size: Option<usize> },
+    /// Dynamic owning vector (types skill §9-11): `TYPE vec`. An `Any`
+    /// element means undetermined — from `vec[]` until the first `push`
+    /// establishes it permanently.
+    Vec(Box<Ty>),
+    /// Associative map (types skill §12-14): `KEY:VALUE` (e.g. `string:int`).
+    /// Implementation/storage belongs to stdlib; the compiler validates the
+    /// key/value types at construction and access.
+    Map { key: Box<Ty>, value: Box<Ty> },
     Pointer(Box<Ty>),
     Optional(Box<Ty>),
+}
+
+impl Ty {
+    /// All fundamental stdlib integer names → Ty (types skill §1-2, §16-18).
+    /// `int`/`uint` are pointer-sized; the rest are fixed-width.
+    pub fn from_stdlib_name(name: &str) -> Option<Ty> {
+        match name {
+            "int" => Some(Ty::Int),
+            "uint" => Some(Ty::UInt),
+            "i8" => Some(Ty::SizedInt { bits: 8, signed: true }),
+            "i16" => Some(Ty::SizedInt { bits: 16, signed: true }),
+            "i32" => Some(Ty::SizedInt { bits: 32, signed: true }),
+            "i64" => Some(Ty::SizedInt { bits: 64, signed: true }),
+            "i128" => Some(Ty::SizedInt { bits: 128, signed: true }),
+            "u8" => Some(Ty::SizedInt { bits: 8, signed: false }),
+            "u16" => Some(Ty::SizedInt { bits: 16, signed: false }),
+            "u32" => Some(Ty::SizedInt { bits: 32, signed: false }),
+            "u64" => Some(Ty::SizedInt { bits: 64, signed: false }),
+            "u128" => Some(Ty::SizedInt { bits: 128, signed: false }),
+            _ => None,
+        }
+    }
+
+    pub fn is_int_like(&self) -> bool {
+        matches!(self, Ty::Int | Ty::UInt | Ty::SizedInt { .. })
+    }
+
+    /// MVP compatibility: any int-like is assignable to any int-like
+    /// (widening/narrowing via trunc/extend in codegen). Strict width
+    /// checking is deferred.
+    pub fn int_compatible(a: &Ty, b: &Ty) -> bool {
+        a.is_int_like() && b.is_int_like()
+    }
+
+    /// Assignment compatibility: exact match, `any` either side, or
+    /// int-like ↔ int-like (sized ints interoperate with `int` literals).
+    pub fn assignable(from: &Ty, to: &Ty) -> bool {
+        if from == to || *to == Ty::Any || *from == Ty::Any {
+            return true;
+        }
+        if Self::int_compatible(from, to) {
+            return true;
+        }
+        // Fixed arrays: element-wise assignable; an inferred-size (`None`)
+        // target accepts any length, an explicit target requires equal size.
+        // Vectors: element-wise assignable; an `Any` element on either side
+        // means undetermined (empty `vec[]`) and accepts anything — the
+        // first `push` establishes it (checked in MethodCall).
+        match (from, to) {
+            (
+                Ty::FixedArray { elem: fe, size: fs },
+                Ty::FixedArray { elem: te, size: ts },
+            ) => {
+                if !Self::assignable(fe, te) {
+                    return false;
+                }
+                match (fs, ts) {
+                    (_, None) => true,
+                    (Some(a), Some(b)) => a == b,
+                    // Explicit target vs unknown-length source: accept here;
+                    // length is validated at the declaration site.
+                    (None, Some(_)) => true,
+                }
+            }
+            (Ty::Vec(fe), Ty::Vec(te)) => {
+                if **fe == Ty::Any || **te == Ty::Any {
+                    return true;
+                }
+                Self::assignable(fe, te)
+            }
+            // Array literals initialize vectors element-wise
+            // (`int vec xs = [1, 2, 3]`).
+            (Ty::FixedArray { elem: fe, .. }, Ty::Vec(te)) => {
+                if **te == Ty::Any {
+                    return true;
+                }
+                Self::assignable(fe, te)
+            }
+            // Maps: key- and value-wise assignable.
+            (Ty::Map { key: fk, value: fv }, Ty::Map { key: tk, value: tv }) => {
+                Self::assignable(fk, tk) && Self::assignable(fv, tv)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl From<&Type> for Ty {
@@ -43,6 +145,9 @@ impl From<&Type> for Ty {
             Type::Double(_) => Ty::Double,
             Type::Named(n, _) => {
                 let base = n.rsplit("::").next().unwrap_or(n).to_string();
+                if let Some(std_ty) = Ty::from_stdlib_name(&base) {
+                    return std_ty;
+                }
                 Ty::Struct(base)
             },
             Type::Generic(n, args, _) => {
@@ -53,6 +158,15 @@ impl From<&Type> for Ty {
             Type::Tuple(tys, _) => Ty::Tuple(tys.iter().map(|t| Ty::from(t)).collect()),
             Type::Any(_) => Ty::Any,
             Type::Array(el, _) => Ty::Array(Box::new(Ty::from(el.as_ref()))),
+            Type::FixedArray { elem, size, .. } => Ty::FixedArray {
+                elem: Box::new(Ty::from(elem.as_ref())),
+                size: size.map(|n| n as usize),
+            },
+            Type::Vec { elem, .. } => Ty::Vec(Box::new(Ty::from(elem.as_ref()))),
+            Type::Map { key, value, .. } => Ty::Map {
+                key: Box::new(Ty::from(key.as_ref())),
+                value: Box::new(Ty::from(value.as_ref())),
+            },
             Type::Pointer(el, _) => {
                 Ty::Pointer(Box::new(Ty::from(el.as_ref())))
             }
@@ -66,6 +180,11 @@ impl std::fmt::Display for Ty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ty::Int => write!(f, "int"),
+            Ty::UInt => write!(f, "uint"),
+            Ty::SizedInt { bits, signed } => {
+                let c = if *signed { 'i' } else { 'u' };
+                write!(f, "{c}{bits}")
+            }
             Ty::Bool => write!(f, "bool"),
             Ty::Void => write!(f, "void"),
             Ty::Char => write!(f, "char"),
@@ -85,6 +204,12 @@ impl std::fmt::Display for Ty {
             Ty::Any => write!(f, "any"),
             Ty::Function(ret, args) => write!(f, "function<{}({})>", ret, args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
             Ty::Array(el) => write!(f, "{}[]", el),
+            Ty::FixedArray { elem, size } => match size {
+                Some(n) => write!(f, "{} arr[{}]", elem, n),
+                None => write!(f, "{} arr", elem),
+            },
+            Ty::Vec(elem) => write!(f, "{} vec", elem),
+            Ty::Map { key, value } => write!(f, "{}:{}", key, value),
             Ty::Pointer(el) => write!(f, "{}*", el),
             Ty::Optional(el) => write!(f, "{}?", el),
         }
@@ -257,11 +382,37 @@ impl Checker {
         None
     }
 
+    /// Update an existing variable's type in the nearest scope holding it.
+    /// Used for `vec[]` element-type establishment on the first `push`.
+    fn set_var_ty(&mut self, name: &str, ty: Ty) -> bool {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), ty);
+                return true;
+            }
+        }
+        false
+    }
+
     fn resolve_type(&mut self, ty: &Type) -> Ty {
         let mut t = Ty::from(ty);
         // Handle generic type params: if t is Struct with name that is a generic param, treat as Generic
         if let Ty::Struct(ref n) = t {
             let lookup = n.rsplit("::").next().unwrap_or(n);
+            // Implicit stdlib fundamental ints (types skill §1-2, §16-18):
+            // `i8`..`u128`, `uint` lex as Ident → resolve without import.
+            // (`int` stays a keyword token → Ty::Int via From; Ident "int"
+            // e.g. qualified `std::int` also maps here.)
+            if let Some(std_ty) = Ty::from_stdlib_name(lookup) {
+                // Don't shadow a user struct/class/enum/trait with the same name.
+                if !self.structs.contains_key(lookup)
+                    && !self.classes.contains_key(lookup)
+                    && !self.enums.contains_key(lookup)
+                    && !self.traits.contains_key(lookup)
+                {
+                    return std_ty;
+                }
+            }
             // Check if it's a generic param for current function/class
             // For minimal, check if it's a single uppercase letter like T, U, V
             if lookup.len() == 1 && lookup.chars().next().unwrap().is_ascii_uppercase() {
@@ -311,6 +462,38 @@ impl Checker {
                 if let Ty::Generic(ref n, _) = **el {
                     if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
                         self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                    }
+                }
+            }
+            Ty::FixedArray { elem: el, .. } => {
+                if let Ty::Struct(ref n) = **el {
+                    if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
+                        self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                    }
+                }
+                if let Ty::Enum(ref n) = **el {
+                    if !self.enums.contains_key(n) { self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()}); }
+                }
+            }
+            Ty::Vec(el) => {
+                if let Ty::Struct(ref n) = **el {
+                    if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
+                        self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                    }
+                }
+                if let Ty::Enum(ref n) = **el {
+                    if !self.enums.contains_key(n) { self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()}); }
+                }
+            }
+            Ty::Map { key, value } => {
+                for el in [key, value] {
+                    if let Ty::Struct(ref n) = **el {
+                        if !self.structs.contains_key(n) && !self.classes.contains_key(n) && !self.enums.contains_key(n) && !self.traits.contains_key(n) {
+                            self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()});
+                        }
+                    }
+                    if let Ty::Enum(ref n) = **el {
+                        if !self.enums.contains_key(n) { self.errors.push(SemError{message: format!("unknown type `{n}`"), span: ty.span()}); }
                     }
                 }
             }
@@ -968,7 +1151,7 @@ impl Checker {
                 }
                 let init_ty = self.check_expr(&c.init);
                 let is_null = matches!(c.init.kind, ExprKind::Null);
-                if !is_null && init_ty != decl_ty && decl_ty != Ty::Any {
+                if !is_null && !Ty::assignable(&init_ty, &decl_ty) && decl_ty != Ty::Any {
                     self.errors.push(SemError{message: format!("const initializer mismatch: expected `{}`, found `{}`", decl_ty, init_ty), span: c.init.span});
                 }
                 if self.scopes.last().map(|s| s.contains_key(&c.name)).unwrap_or(false) {
@@ -977,16 +1160,57 @@ impl Checker {
                     self.declare_const(&c.name, decl_ty, c.name_span);
                 }
             } else if let Item::Var(v) = item {
-                let decl_ty = self.resolve_type(&v.ty);
+                let mut decl_ty = self.resolve_type(&v.ty);
                 if decl_ty == Ty::Void {
                     self.errors.push(SemError{message: "global variable cannot have `void` type".into(), span: v.span});
                 }
+                if decl_ty == Ty::Any {
+                    if let Some(init) = &v.init {
+                        if matches!(init.kind, ExprKind::VecEmpty(_)) {
+                            decl_ty = Ty::Vec(Box::new(Ty::Any));
+                        }
+                    }
+                }
+                let mut init_checked = false;
+                if decl_ty == Ty::Any {
+                    if let Some(init) = &v.init {
+                        if matches!(init.kind, ExprKind::MapLit { .. }) {
+                            decl_ty = self.check_expr(init);
+                            init_checked = true;
+                        }
+                    }
+                }
+                if matches!(decl_ty, Ty::FixedArray { size: None, .. }) && v.init.is_none() {
+                    self.errors.push(SemError{message: format!("array `{}` has inferred size but no initializer: use `arr[N]` or `= [...]`", v.name), span: v.span});
+                }
                 if let Some(init) = &v.init {
-                    let init_ty = self.check_expr(init);
-                    let is_null = matches!(init.kind, ExprKind::Null);
-                    if !is_null && init_ty != decl_ty && decl_ty != Ty::Any && init_ty != Ty::Any {
-                        // Allow int literal for any?
-                        self.errors.push(SemError{message: format!("global var initializer mismatch: expected `{}`, found `{}`", decl_ty, init_ty), span: init.span});
+                    if init_checked {
+                        // Already validated while adopting the inferred map.
+                    } else {
+                        let init_ty = self.check_expr(init);
+                        let is_null = matches!(init.kind, ExprKind::Null);
+                        if let (
+                            Ty::FixedArray { size: Some(n), .. },
+                            Ty::FixedArray { size: Some(m), .. },
+                        ) = (&decl_ty, &init_ty)
+                        {
+                            if n != m {
+                                self.errors.push(SemError{message: format!("array size mismatch: declared `arr[{n}]` but initializer has {m} elements"), span: init.span});
+                            }
+                        }
+                        if !is_null && decl_ty != Ty::Any {
+                            let compatible = match (&decl_ty, &init_ty) {
+                                (
+                                    Ty::FixedArray { elem: de, .. },
+                                    Ty::FixedArray { elem: ie, .. },
+                                ) => Ty::assignable(ie, de),
+                                _ => Ty::assignable(&init_ty, &decl_ty),
+                            };
+                            if !compatible {
+                                // Allow int literal for any?
+                                self.errors.push(SemError{message: format!("global var initializer mismatch: expected `{}`, found `{}`", decl_ty, init_ty), span: init.span});
+                            }
+                        }
                     }
                 }
                 if self.scopes.last().map(|s| s.contains_key(&v.name)).unwrap_or(false) {
@@ -1360,25 +1584,71 @@ impl Checker {
     fn check_stmt(&mut self, stmt: &Stmt, ret_ty: &Ty) -> bool {
         match stmt {
             Stmt::VarDecl(d) => {
-                let decl_ty = self.resolve_type(&d.ty);
+                let mut decl_ty = self.resolve_type(&d.ty);
                 if decl_ty == Ty::Void {
                     self.errors.push(SemError {
                         message: "variable cannot have `void` type".into(),
                         span: d.span,
                     });
                 }
-                if let Some(init) = &d.init {
-                    let init_ty = self.check_expr(init);
-                    let is_null = matches!(init.kind, ExprKind::Null);
-                    let compatible = if init_ty == decl_ty { true } else {
-                        match (&decl_ty, &init_ty) {
-                            (Ty::Generic(n1, _), Ty::Enum(n2)) if n1 == n2 => true,
-                            (Ty::Enum(n1), Ty::Generic(n2, _)) if n1 == n2 => true,
-                            _ => false,
+                // `any xs = vec[]` declares an undetermined vector: the
+                // variable takes `Vec(Any)` until the first `push`.
+                // `any m = has k: v end` likewise adopts the inferred map.
+                // (The adopted init is marked checked to avoid duplicate
+                // diagnostics below.)
+                let mut init_checked = false;
+                if decl_ty == Ty::Any {
+                    if let Some(init) = &d.init {
+                        if matches!(init.kind, ExprKind::VecEmpty(_)) {
+                            decl_ty = Ty::Vec(Box::new(Ty::Any));
+                        } else if matches!(init.kind, ExprKind::MapLit { .. }) {
+                            decl_ty = self.check_expr(init);
+                            init_checked = true;
                         }
-                    };
-                    if !is_null && !compatible && decl_ty != Ty::Void && decl_ty != Ty::Any {
-                        self.errors.push(SemError{message: format!("type mismatch in initializer: expected `{decl_ty}`, found `{init_ty}`"), span: init.span});
+                    }
+                }
+                // Inferred-size `TYPE arr` requires an initializer to fix the size.
+                if matches!(decl_ty, Ty::FixedArray { size: None, .. }) && d.init.is_none() {
+                    self.errors.push(SemError {
+                        message: format!(
+                            "array `{}` has inferred size but no initializer: use `arr[N]` or `= [...]`",
+                            d.name
+                        ),
+                        span: d.span,
+                    });
+                }
+                if let Some(init) = &d.init {
+                    // Already validated while adopting an inferred type above.
+                    if !init_checked {
+                        let init_ty = self.check_expr(init);
+                        let is_null = matches!(init.kind, ExprKind::Null);
+                        // Explicit-size arrays validate length directly for a
+                        // precise diagnostic (types skill §8: initializer must
+                        // not violate the declared size).
+                        if let (
+                            Ty::FixedArray { size: Some(n), .. },
+                            Ty::FixedArray { size: Some(m), .. },
+                        ) = (&decl_ty, &init_ty)
+                        {
+                            if n != m {
+                                self.errors.push(SemError{message: format!("array size mismatch: declared `arr[{n}]` but initializer has {m} elements"), span: init.span});
+                            }
+                        }
+                        let compatible = if init_ty == decl_ty { true } else {
+                            match (&decl_ty, &init_ty) {
+                                (Ty::Generic(n1, _), Ty::Enum(n2)) if n1 == n2 => true,
+                                (Ty::Enum(n1), Ty::Generic(n2, _)) if n1 == n2 => true,
+                                // Size already diagnosed above; only elements matter here.
+                                (
+                                    Ty::FixedArray { elem: de, .. },
+                                    Ty::FixedArray { elem: ie, .. },
+                                ) => Ty::assignable(ie, de),
+                                _ => Ty::assignable(&init_ty, &decl_ty),
+                            }
+                        };
+                        if !is_null && !compatible && decl_ty != Ty::Void && decl_ty != Ty::Any {
+                            self.errors.push(SemError{message: format!("type mismatch in initializer: expected `{decl_ty}`, found `{init_ty}`"), span: init.span});
+                        }
                     }
                 }
                 self.declare_var(&d.name, decl_ty, d.name_span);
@@ -1395,7 +1665,7 @@ impl Checker {
                 }
                 let init_ty = self.check_expr(&c.init);
                 let is_null = matches!(c.init.kind, ExprKind::Null);
-                if !is_null && init_ty != decl_ty && decl_ty != Ty::Any {
+                if !is_null && !Ty::assignable(&init_ty, &decl_ty) && decl_ty != Ty::Any {
                     self.errors.push(SemError { message: format!("const initializer mismatch: expected `{decl_ty}`, found `{init_ty}`"), span: c.init.span });
                 }
                 self.declare_const(&c.name, decl_ty, c.name_span);
@@ -1407,6 +1677,8 @@ impl Checker {
                 let elem_tys: Vec<Ty> = match &expr_ty {
                     Ty::Tuple(tys) => tys.clone(),
                     Ty::Array(el) => vec![*el.clone(); d.targets.len()],
+                    Ty::FixedArray { elem, .. } => vec![*elem.clone(); d.targets.len()],
+                    Ty::Vec(elem) => vec![*elem.clone(); d.targets.len()],
                     _ => {
                         // Check if expr is tuple literal directly
                         if let ExprKind::Tuple(exprs) = &d.expr.kind {
@@ -1480,7 +1752,7 @@ impl Checker {
                     }),
                     (Some(expr), ty) => {
                         let got = self.check_expr(expr);
-                        if &got != ty {
+                        if !Ty::assignable(&got, ty) {
                             self.errors.push(SemError{message: format!("return type mismatch: expected `{ty}`, found `{got}`"), span: expr.span});
                         }
                     }
@@ -1525,6 +1797,17 @@ impl Checker {
                 let iter_ty = self.check_expr(&f.iter);
                 let elem_ty = match &iter_ty {
                     Ty::Array(el) => (**el).clone(),
+                    Ty::FixedArray { elem, .. } => (**elem).clone(),
+                    Ty::Vec(elem) => {
+                        if **elem == Ty::Any {
+                            self.errors.push(SemError{message: "cannot iterate vector with undetermined element type: `push` an element first".into(), span: f.iter.span});
+                            Ty::Any
+                        } else {
+                            (**elem).clone()
+                        }
+                    }
+                    // Maps iterate over their keys.
+                    Ty::Map { key, .. } => (**key).clone(),
                     Ty::String => Ty::Char,
                     _ => {
                         self.errors.push(SemError{message: format!("`for` iterable must be array or string, found `{iter_ty}`"), span: f.iter.span});
@@ -1624,35 +1907,35 @@ impl Checker {
                         Ty::Bool
                     }
                     UnaryOp::Neg | UnaryOp::Pos => {
-                        if t != Ty::Int {
+                        if !t.is_int_like() {
                             self.errors.push(SemError {
                                 message: format!(
-                                    "unary `{op:?}` requires `int`, found `{t}`"
+                                    "unary `{op:?}` requires int type, found `{t}`"
                                 ),
                                 span: expr.span,
                             });
                         }
-                        Ty::Int
+                        t
                     }
                     UnaryOp::BitNot | UnaryOp::Inc | UnaryOp::Dec => {
-                        if t != Ty::Int {
+                        if !t.is_int_like() {
                             self.errors.push(SemError {
                                 message: format!(
-                                    "unary `{op:?}` requires `int`, found `{t}`"
+                                    "unary `{op:?}` requires int type, found `{t}`"
                                 ),
                                 span: expr.span,
                             });
                         }
-                        Ty::Int
+                        t
                     }
                 }
             }
             ExprKind::Postfix { op, expr: inner } => {
                 let t = self.check_expr(inner);
-                if t != Ty::Int {
-                    self.errors.push(SemError{message: format!("postfix `{op:?}` requires `int`, found `{t}`"), span: expr.span});
+                if !t.is_int_like() {
+                    self.errors.push(SemError{message: format!("postfix `{op:?}` requires int type, found `{t}`"), span: expr.span});
                 }
-                Ty::Int
+                t
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let lt = self.check_expr(lhs);
@@ -1714,14 +1997,15 @@ impl Checker {
                     | BinOp::BitXor
                     | BinOp::Shl
                     | BinOp::Shr => {
-                        if lt != Ty::Int || rt != Ty::Int {
-                            self.errors.push(SemError{message: format!("arithmetic/bitwise `{op:?}` requires `int`, found `{lt}` and `{rt}`"), span: expr.span});
+                        if !lt.is_int_like() || !rt.is_int_like() {
+                            self.errors.push(SemError{message: format!("arithmetic/bitwise `{op:?}` requires int types, found `{lt}` and `{rt}`"), span: expr.span});
                         }
-                        Ty::Int
+                        // Result is the wider int-like operand (MVP: prefer lhs).
+                        lt
                     }
                     BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        if lt != Ty::Int || rt != Ty::Int {
-                            self.errors.push(SemError{message: format!("comparison `{op:?}` requires `int`, found `{lt}` and `{rt}`"), span: expr.span});
+                        if !lt.is_int_like() || !rt.is_int_like() {
+                            self.errors.push(SemError{message: format!("comparison `{op:?}` requires int types, found `{lt}` and `{rt}`"), span: expr.span});
                         }
                         Ty::Bool
                     }
@@ -1771,7 +2055,7 @@ impl Checker {
                 }
                 let rhs_ty = self.check_expr(value);
                 let is_null = matches!(value.kind, ExprKind::Null);
-                if !is_null && lhs_ty != rhs_ty {
+                if !is_null && !Ty::assignable(&rhs_ty, &lhs_ty) {
                     self.errors.push(SemError{message: format!("assignment type mismatch: expected `{lhs_ty}`, found `{rhs_ty}`"), span: expr.span});
                 }
                 lhs_ty
@@ -1779,8 +2063,8 @@ impl Checker {
             ExprKind::CompoundAssign { op: _, lhs, value } => {
                 let lhs_ty = self.check_lvalue(lhs);
                 let rhs_ty = self.check_expr(value);
-                if lhs_ty != Ty::Int || rhs_ty != Ty::Int {
-                    self.errors.push(SemError{message: format!("compound assignment requires `int`, found `{lhs_ty}` and `{rhs_ty}`"), span: expr.span});
+                if !lhs_ty.is_int_like() || !rhs_ty.is_int_like() {
+                    self.errors.push(SemError{message: format!("compound assignment requires int types, found `{lhs_ty}` and `{rhs_ty}`"), span: expr.span});
                 }
                 lhs_ty
             }
@@ -1940,7 +2224,7 @@ impl Checker {
                                     let pidx = if let CallArg::Named { name, .. } = arg {
                                         sig.param_names.iter().position(|n| n == name).unwrap_or(i)
                                     } else { i };
-                                    if &aty != &sig.params[pidx] && aty != Ty::Any {
+                                    if !Ty::assignable(&aty, &sig.params[pidx]) {
                                         self.errors.push(SemError{message: format!("ctor arg {}: expected `{}`, found `{aty}`", i+1, sig.params[pidx]), span: arg.span()});
                                     }
                                 }
@@ -1958,7 +2242,7 @@ impl Checker {
                         for (i, arg) in args.iter().enumerate() {
                             let aty = self.check_call_arg(arg);
                             let fty = &field_tys[i];
-                            if &aty != fty && aty != Ty::Any {
+                            if !Ty::assignable(&aty, fty) {
                                 self.errors.push(SemError{message: format!("ctor arg {}: expected `{}`, found `{aty}`", i+1, fty), span: arg.span()});
                             }
                         }
@@ -1994,7 +2278,7 @@ impl Checker {
                                 sig.param_names.iter().position(|n| n == name).unwrap_or(i)
                             } else { i };
                             if let Some(param_ty) = sig.params.get(pidx) {
-                                if &aty != param_ty && aty != Ty::Any {
+                                if !Ty::assignable(&aty, param_ty) {
                                     let is_generic = matches!(param_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
                                     if !is_generic {
                                         self.errors.push(SemError{message: format!("argument {} of `{callee}`: expected `{}`, found `{aty}`", i+1, param_ty), span: arg.span()});
@@ -2012,7 +2296,7 @@ impl Checker {
                         }
                         for (i, arg) in args.iter().enumerate() {
                             let aty = self.check_call_arg(arg);
-                            if let Some(pt) = params.get(i) { if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("argument {}: expected `{}`, found `{aty}`", i+1, pt), span: arg.span()}); } }
+                            if let Some(pt) = params.get(i) { if !Ty::assignable(&aty, pt) { self.errors.push(SemError{message: format!("argument {}: expected `{}`, found `{aty}`", i+1, pt), span: arg.span()}); } }
                         }
                         *ret
                     } else if let Ty::Any = var_ty {
@@ -2150,21 +2434,101 @@ impl Checker {
                 }
                 Ty::Struct(sname)
             }
+            ExprKind::MapLit { ty, entries } => {
+                // Explicit `KEY:VALUE has ... end` resolves directly; bare
+                // `has ... end` under `any` infers from the first entry.
+                let lit_ty = self.resolve_type(ty);
+                let (key_ty, val_ty) = match lit_ty {
+                    Ty::Map { key, value } => (*key, *value),
+                    Ty::Any => {
+                        if entries.is_empty() {
+                            return Ty::Map {
+                                key: Box::new(Ty::Any),
+                                value: Box::new(Ty::Any),
+                            };
+                        }
+                        let k0 = self.check_expr(&entries[0].0);
+                        let v0 = self.check_expr(&entries[0].1);
+                        for (k, v) in entries.iter().skip(1) {
+                            let kt = self.check_expr(k);
+                            if !Ty::assignable(&kt, &k0) {
+                                self.errors.push(SemError{message: format!("map key mismatch: expected `{k0}`, found `{kt}`"), span: k.span});
+                            }
+                            let vt = self.check_expr(v);
+                            if !Ty::assignable(&vt, &v0) {
+                                self.errors.push(SemError{message: format!("map value mismatch: expected `{v0}`, found `{vt}`"), span: v.span});
+                            }
+                        }
+                        return Ty::Map { key: Box::new(k0), value: Box::new(v0) };
+                    }
+                    _ => {
+                        self.errors.push(SemError{message: format!("map literal requires map type, found `{lit_ty}`"), span: expr.span});
+                        return lit_ty;
+                    }
+                };
+                // Only int-like and string keys are supported by codegen.
+                match &key_ty {
+                    Ty::String => {},
+                    t if t.is_int_like() => {},
+                    Ty::Any => {},
+                    other => {
+                        self.errors.push(SemError{message: format!("unsupported map key type `{other}`: keys must be `string` or int types"), span: expr.span});
+                    }
+                }
+                for (k, v) in entries {
+                    let kt = self.check_expr(k);
+                    if !Ty::assignable(&kt, &key_ty) {
+                        self.errors.push(SemError{message: format!("map key mismatch: expected `{key_ty}`, found `{kt}`"), span: k.span});
+                    }
+                    let vt = self.check_expr(v);
+                    if !Ty::assignable(&vt, &val_ty) {
+                        self.errors.push(SemError{message: format!("map value mismatch: expected `{val_ty}`, found `{vt}`"), span: v.span});
+                    }
+                }
+                Ty::Map { key: Box::new(key_ty), value: Box::new(val_ty) }
+            }
             ExprKind::StringLit(_) => Ty::String,
             ExprKind::CharLit(_) => Ty::Char,
             ExprKind::Index { object, index } => {
                 let obj_ty = self.check_expr(object);
                 let idx_ty = self.check_expr(index);
-                if idx_ty != Ty::Int {
+                // Maps validate the index against the key type in the match
+                // below; other indexables require int-like indices.
+                let is_map = matches!(obj_ty, Ty::Map { .. });
+                if !is_map && !idx_ty.is_int_like() {
                     self.errors.push(SemError {
                         message: format!(
-                            "index must be `int`, found `{idx_ty}`"
+                            "index must be an int type, found `{idx_ty}`"
                         ),
                         span: index.span,
                     });
                 }
                 match obj_ty {
                     Ty::Array(el) => *el,
+                    Ty::FixedArray { elem, .. } => *elem,
+                    Ty::Vec(elem) => {
+                        if *elem == Ty::Any {
+                            self.errors.push(SemError {
+                                message: "cannot index vector with undetermined element type: `push` an element first".into(),
+                                span: object.span,
+                            });
+                            Ty::Any
+                        } else {
+                            *elem
+                        }
+                    }
+                    Ty::Map { key, value } => {
+                        if !Ty::assignable(&idx_ty, key.as_ref()) {
+                            self.errors.push(SemError {
+                                message: format!(
+                                    "map index must be `{}`, found `{idx_ty}`",
+                                    key
+                                ),
+                                span: index.span,
+                            });
+                        }
+                        *value
+                    }
                     Ty::String => Ty::Char, // string[i] -> char ?
                     _ => {
                         self.errors.push(SemError {
@@ -2193,6 +2557,8 @@ impl Checker {
                 }
                 match obj_ty {
                     Ty::Array(el) => Ty::Array(el.clone()), // slice retains array type
+                    Ty::FixedArray { elem, size } => Ty::FixedArray { elem: elem.clone(), size }, // slice retains fixed-array type (MVP)
+                    Ty::Vec(elem) => Ty::Vec(elem.clone()), // slice retains vector type (MVP)
                     Ty::String => Ty::String, // string slice -> string
                     _ => {
                         self.errors.push(SemError { message: format!("cannot slice non-array type `{obj_ty}`"), span: object.span });
@@ -2210,6 +2576,38 @@ impl Checker {
             }
             ExprKind::MethodCall{object, method, method_span, args} => {
                 let obj_ty = self.check_expr(object);
+                // Vector `push` (types skill §10-11): `v.push(x)` appends and
+                // returns void. On an undetermined (`vec[]`) vector the first
+                // push permanently establishes the element type.
+                if let Ty::Vec(elem) = &obj_ty {
+                    if method == "push" {
+                        if args.len() != 1 {
+                            self.errors.push(SemError{message: format!("`push` expects 1 arg, found {}", args.len()), span: *method_span});
+                            for a in args { let _ = self.check_call_arg(a); }
+                            return Ty::Void;
+                        }
+                        let aty = self.check_call_arg(&args[0]);
+                        if **elem == Ty::Any {
+                            // Establishment: `any xs = vec[]` + `xs.push(42)`
+                            // fixes `xs` as an `int` vector from here on.
+                            if let ExprKind::Ident(name) = &object.kind {
+                                if self.is_const(name) {
+                                    self.errors.push(SemError{message: format!("cannot push to const vector `{}`", name), span: *method_span});
+                                } else {
+                                    let established = Ty::Vec(Box::new(aty.clone()));
+                                    self.set_var_ty(name, established);
+                                }
+                            }
+                            // Non-identifier bases can't be re-typed; the
+                            // single checked arg stands as the establishment.
+                            return Ty::Void;
+                        }
+                        if !Ty::assignable(&aty, elem) {
+                            self.errors.push(SemError{message: format!("`push` expects `{}`, found `{}`", elem, aty), span: args[0].span()});
+                        }
+                        return Ty::Void;
+                    }
+                }
                 let sname = match obj_ty {
                     Ty::Struct(ref n) => n.clone(),
                     _ => {
@@ -2241,7 +2639,7 @@ impl Checker {
                                     meth.param_names.iter().position(|n| n == name).unwrap_or(i)
                                 } else { i };
                                 if let Some(pt) = meth.params.get(pidx) {
-                                    if &aty != pt && aty != Ty::Any { self.errors.push(SemError{message: format!("arg {} of `{}`: expected `{}`, found `{}`", i+1, method, pt, aty), span: a.span()}); }
+                                    if !Ty::assignable(&aty, pt) { self.errors.push(SemError{message: format!("arg {} of `{}`: expected `{}`, found `{}`", i+1, method, pt, aty), span: a.span()}); }
                                 }
                             }
                         }
@@ -2294,7 +2692,7 @@ impl Checker {
                                 for (pty, arg) in payload_tys.iter().zip(args.iter()) {
                                     let aty = self.check_call_arg(arg);
                                     let is_generic = matches!(pty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
-                                    if &aty != pty && aty != Ty::Any && !is_generic {
+                                    if !Ty::assignable(&aty, pty) && !is_generic {
                                         self.errors.push(SemError{message: format!("variant `{variant}` payload: expected `{}`, found `{}`", pty, aty), span: arg.span()});
                                     }
                                 }
@@ -2599,6 +2997,32 @@ impl Checker {
                 let tys: Vec<Ty> = exprs.iter().map(|e| self.check_expr(e)).collect();
                 Ty::Tuple(tys)
             }
+            ExprKind::ArrayLit(elems) => {
+                // Element type is unified from the first element (MVP);
+                // every element must be assignable to it (types skill §8:
+                // all initializer elements compatible with element type).
+                if elems.is_empty() {
+                    Ty::FixedArray { elem: Box::new(Ty::Any), size: Some(0) }
+                } else {
+                    let first = self.check_expr(&elems[0]);
+                    for e in elems.iter().skip(1) {
+                        let t = self.check_expr(e);
+                        if !Ty::assignable(&t, &first) {
+                            self.errors.push(SemError {
+                                message: format!(
+                                    "array literal element mismatch: expected `{first}`, found `{t}`"
+                                ),
+                                span: e.span,
+                            });
+                        }
+                    }
+                    Ty::FixedArray { elem: Box::new(first), size: Some(elems.len()) }
+                }
+            }
+            ExprKind::VecEmpty(_) => {
+                // Undetermined element type until the first `push`.
+                Ty::Vec(Box::new(Ty::Any))
+            }
             ExprKind::InterpolatedString(_, _) => Ty::String,
             ExprKind::Closure { params, body, .. } => {
                 self.push_scope();
@@ -2658,7 +3082,7 @@ impl Checker {
                     sig.param_names.iter().position(|n| n == name).unwrap_or(i)
                 } else { i };
                 if let Some(param_ty) = sig.params.get(pidx) {
-                    if &aty != param_ty && aty != Ty::Any {
+                    if !Ty::assignable(&aty, param_ty) {
                         let is_generic = matches!(param_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
                         if !is_generic {
                             self.errors.push(SemError { message: format!("argument {} of `{}`: expected `{}`, found `{}`", i+1, callee, param_ty, aty), span: arg.span() });
@@ -2680,7 +3104,7 @@ impl Checker {
                     let aty = self.check_call_arg(arg);
                     let is_generic_elem = matches!(elem_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
                     let is_any_elem = *elem_ty == Ty::Any;
-                    if &aty != elem_ty && aty != Ty::Any && !is_generic_elem && !is_any_elem {
+                    if !Ty::assignable(&aty, elem_ty) && !is_generic_elem && !is_any_elem {
                         self.errors.push(SemError { message: format!("variadic argument {} of `{}`: expected `{}`, found `{}`", fixed + i + 1, callee, elem_ty, aty), span: arg.span() });
                     }
                 }
@@ -2689,7 +3113,7 @@ impl Checker {
                     let pidx = vidx + 1 + j;
                     if let Some(param_ty) = sig.params.get(pidx) {
                         let aty = self.check_call_arg(arg);
-                        if &aty != param_ty && aty != Ty::Any {
+                        if !Ty::assignable(&aty, param_ty) {
                             let is_generic = matches!(param_ty, Ty::Generic(n, _) if n.len() == 1 && n.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false));
                             if !is_generic {
                                 self.errors.push(SemError { message: format!("argument {} of `{}`: expected `{}`, found `{}`", pidx + 1, callee, param_ty, aty), span: arg.span() });
@@ -2725,7 +3149,7 @@ impl Checker {
                         }
                         let aty = self.check_call_arg(arg);
                         let expected = &sig.params[pidx];
-                        if &aty != expected && aty != Ty::Any {
+                        if !Ty::assignable(&aty, expected) {
                             self.errors.push(SemError { message: format!("named argument `{}` of `{}`: expected `{}`, found `{}`", name, callee, expected, aty), span: arg.span() });
                         }
                         if let Some(mode) = sig.param_modes.get(pidx) {
@@ -2756,7 +3180,7 @@ impl Checker {
         for (i, arg) in args.iter().enumerate() {
             let aty = self.check_call_arg(arg);
             if let Some(param_ty) = sig.params.get(i) {
-                if &aty != param_ty && aty != Ty::Any {
+                if !Ty::assignable(&aty, param_ty) {
                     self.errors.push(SemError { message: format!("argument {} of `{}`: expected `{}`, found `{}`", i + 1, callee, param_ty, aty), span: arg.span() });
                 }
             }
@@ -2937,16 +3361,43 @@ impl Checker {
             ExprKind::Index { object, index } => {
                 let obj_ty = self.check_expr(object);
                 let idx_ty = self.check_expr(index);
-                if idx_ty != Ty::Int {
+                // Maps validate the index against the key type in the match
+                // below; other indexables require int-like indices.
+                let is_map = matches!(obj_ty, Ty::Map { .. });
+                if !is_map && !idx_ty.is_int_like() {
                     self.errors.push(SemError {
                         message: format!(
-                            "index must be `int`, found `{idx_ty}`"
+                            "index must be an int type, found `{idx_ty}`"
                         ),
                         span: index.span,
                     });
                 }
                 match obj_ty {
                     Ty::Array(el) => *el,
+                    Ty::FixedArray { elem, .. } => *elem,
+                    Ty::Vec(elem) => {
+                        if *elem == Ty::Any {
+                            self.errors.push(SemError {
+                                message: "cannot index vector with undetermined element type: `push` an element first".into(),
+                                span: object.span,
+                            });
+                            Ty::Any
+                        } else {
+                            *elem
+                        }
+                    }
+                    Ty::Map { key, value } => {
+                        if !Ty::assignable(&idx_ty, key.as_ref()) {
+                            self.errors.push(SemError {
+                                message: format!(
+                                    "map index must be `{}`, found `{idx_ty}`",
+                                    key
+                                ),
+                                span: index.span,
+                            });
+                        }
+                        *value
+                    }
                     Ty::String => Ty::Char,
                     _ => {
                         self.errors.push(SemError {
