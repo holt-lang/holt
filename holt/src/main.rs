@@ -60,7 +60,8 @@ enum Commands {
     /// Build a .hlt source file (lex → parse → check → codegen → link)
     #[command(visible_alias = "b")]
     Build(BuildArgs),
-    /// Build and run a .hlt source file, removing the binary afterwards
+    /// Build and run a .hlt source file (rebuilds only when sources changed;
+    /// the binary is kept)
     #[command(visible_alias = "r")]
     Run(RunArgs),
     /// Check a .hlt source file (lex → parse → check, no codegen)
@@ -71,12 +72,32 @@ enum Commands {
     Lsp,
     /// Install the embedded standard library to `~/.hella/lib`
     Setup(SetupArgs),
+    /// Create a new Holt project (binary by default, `--lib` for a library)
+    New(NewArgs),
+}
+
+#[derive(Parser, Debug)]
+struct NewArgs {
+    /// Project directory to create (also used as the project name)
+    path: PathBuf,
+
+    /// Create a library project (`src/lib.hlt`) instead of a binary (`src/main.hlt`)
+    #[arg(long, default_value_t = false, conflicts_with = "bin")]
+    lib: bool,
+
+    /// Create a binary project (`src/main.hlt`; this is the default)
+    #[arg(long, default_value_t = false, conflicts_with = "lib")]
+    bin: bool,
+
+    /// Version control to initialize: `git` (default) or `none`
+    #[arg(long, default_value = "git")]
+    vcs: String,
 }
 
 #[derive(Parser, Debug)]
 struct BuildArgs {
-    /// Source file (.hlt) to compile
-    file: PathBuf,
+    /// Source file (.hlt) to compile (default: project `src/main.hlt`)
+    file: Option<PathBuf>,
 
     /// Emit LLVM IR to stdout and exit (no link)
     #[arg(long, default_value_t = false)]
@@ -118,8 +139,8 @@ struct BuildArgs {
 
 #[derive(Parser, Debug)]
 struct RunArgs {
-    /// Source file (.hlt) to compile and run
-    file: PathBuf,
+    /// Source file (.hlt) to compile and run (default: project `src/main.hlt`)
+    file: Option<PathBuf>,
 
     /// Keep object file (don't delete after linking)
     #[arg(long, default_value_t = false)]
@@ -160,8 +181,8 @@ struct SetupArgs {
 
 #[derive(Parser, Debug)]
 struct CheckArgs {
-    /// Source file (.hlt) to check
-    file: PathBuf,
+    /// Source file (.hlt) to check (default: project `src/main.hlt` or `src/lib.hlt`)
+    file: Option<PathBuf>,
 
     /// Print AST for debugging
     #[arg(long, default_value_t = false)]
@@ -195,6 +216,11 @@ struct CompileOptions<'a> {
     exe_path: Option<PathBuf>,
     /// Stop after sema (no codegen/link). Used by `check`.
     check_only: bool,
+    /// Emit `missing `main` function` when no `main` is declared.
+    /// Builds and runs always require an entry point; `check` only
+    /// requires it for files actually named `main` (library modules
+    /// are entry-less by design — same rule as the LSP).
+    require_main: bool,
 }
 
 fn main() -> miette::Result<()> {
@@ -207,7 +233,260 @@ fn main() -> miette::Result<()> {
         // its own exit code after the client sends `exit`.
         Commands::Lsp => std::process::exit(hls::server::run()),
         Commands::Setup(args) => run_setup(args),
+        Commands::New(args) => run_new(args),
     }
+}
+
+/// A resolved entry file plus optional project context (when no explicit
+/// file was given and the current directory is a Holt project).
+struct ResolvedEntry {
+    path: PathBuf,
+    project: Option<Project>,
+}
+
+/// Project context: root (holds `holt.toml`), binary name, and the
+/// build-output directory for the active profile.
+struct Project {
+    root: PathBuf,
+    bin_name: String,
+}
+
+impl Project {
+    /// `out/debug` or `out/release` under the project root (created on use).
+    fn out_dir(&self, release: bool) -> PathBuf {
+        self.root.join("out").join(if release {
+            "release"
+        } else {
+            "debug"
+        })
+    }
+}
+
+/// Resolve the entry file for build/run/check: an explicit file wins;
+/// otherwise the project convention applies (`src/main.hlt`, falling back
+/// to `src/lib.hlt` for `check`-able library sources).
+fn resolve_entry(explicit: Option<PathBuf>) -> miette::Result<ResolvedEntry> {
+    if let Some(f) = explicit {
+        return Ok(ResolvedEntry {
+            path: f,
+            project: None,
+        });
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| miette::miette!("failed to read current directory: {e}"))?;
+    let root = find_project_root(&cwd).unwrap_or(cwd.clone());
+    for cand in ["src/main.hlt", "src/lib.hlt"] {
+        let path = root.join(cand);
+        if path.is_file() {
+            let manifest = read_manifest(&root)?;
+            let bin_name = manifest
+                .as_ref()
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "main".to_string())
+                });
+            return Ok(ResolvedEntry {
+                path,
+                project: Some(Project { root, bin_name }),
+            });
+        }
+    }
+    Err(miette::miette!(
+        "no input file and no project found (looked for src/main.hlt and src/lib.hlt in {}); pass a file or run `holt new <name>`",
+        root.display()
+    ))
+}
+
+/// Walk up from `start` looking for a `holt.toml`; the directory holding it
+/// is the project root. `None` when outside any project.
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = if start.is_dir() {
+        start.to_path_buf()
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    loop {
+        if dir.join("holt.toml").is_file() {
+            return Some(dir);
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+/// Minimal `holt.toml` reader (only `name`/`version` exist for now; unknown
+/// keys are ignored so the manifest stays forward-compatible).
+struct Manifest {
+    name: String,
+    version: String,
+}
+
+fn read_manifest(root: &Path) -> miette::Result<Option<Manifest>> {
+    let path = root.join("holt.toml");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|e| miette::miette!("failed to read {}: {e}", path.display()))?;
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            miette::miette!("malformed {} line {}: {line:?}", path.display(), lineno + 1)
+        })?;
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| {
+                value
+                    .strip_prefix('\'')
+                    .and_then(|v| v.strip_suffix('\''))
+            })
+            .ok_or_else(|| {
+                miette::miette!(
+                    "malformed {} line {}: value must be quoted",
+                    path.display(),
+                    lineno + 1
+                )
+            })?;
+        match key.trim() {
+            "name" => name = Some(value.to_string()),
+            "version" => version = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    match (name, version) {
+        (Some(name), Some(version)) => Ok(Some(Manifest { name, version })),
+        _ => Err(miette::miette!(
+            "{} must define `name` and `version`",
+            path.display()
+        )),
+    }
+}
+
+/// Create a new Holt project: `holt.toml` manifest, VCS-ignored `out/`
+/// build directory (via `.gitignore`), and `src/main.hlt` (binary,
+/// default) or `src/lib.hlt` (`--lib`).
+fn run_new(args: NewArgs) -> miette::Result<()> {
+    match args.vcs.as_str() {
+        "git" | "none" => {}
+        other => {
+            return Err(miette::miette!(
+                "unsupported --vcs {other:?}: only `git` and `none` for now"
+            ));
+        }
+    }
+    let name = args
+        .path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            miette::miette!("invalid project path: {}", args.path.display())
+        })?;
+    if args.path.exists() {
+        if !args.path.is_dir() {
+            return Err(miette::miette!(
+                "{} exists and is not a directory",
+                args.path.display()
+            ));
+        }
+        let non_empty = fs::read_dir(&args.path)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+        if non_empty {
+            return Err(miette::miette!(
+                "{} already exists and is not empty",
+                args.path.display()
+            ));
+        }
+    }
+
+    let entry_name = if args.lib { "lib.hlt" } else { "main.hlt" };
+    // `{NAME}` is substituted below; lowercase `{name}` in the library
+    // template is genuine Holt string interpolation and is left alone.
+    let entry_template = if args.lib {
+        "// {NAME} — Holt library.\n\
+         //\n\
+         // Add modules next to this file and import them by file name:\n\
+         // `import mymod` → `mymod.hlt`, `import net::http` → `net/http.hlt`.\n\
+         \n\
+         string greet(string name) do\n\
+         \x20   return \"hello {name}\"\n\
+         end\n"
+    } else {
+        "// {NAME} — Holt binary project.\n\
+         \n\
+         import std::io\n\
+         \n\
+         void main() do\n\
+         \x20   println(\"Hello from {NAME}!\")\n\
+         end\n"
+    };
+    let entry_src = entry_template.replace("{NAME}", &name);
+    let files = [
+        (
+            "holt.toml".to_string(),
+            format!("name = \"{name}\"\nversion = \"0.1.0\"\n"),
+        ),
+        (format!("src/{entry_name}"), entry_src),
+        (".gitignore".to_string(), "/out/\n".to_string()),
+    ];
+
+    fs::create_dir_all(args.path.join("src")).map_err(|e| {
+        miette::miette!("failed to create {}: {e}", args.path.display())
+    })?;
+    for (rel, contents) in &files {
+        let dest = args.path.join(rel);
+        if dest.exists() {
+            return Err(miette::miette!(
+                "refusing to overwrite existing {}",
+                dest.display()
+            ));
+        }
+        fs::write(&dest, contents)
+            .map_err(|e| miette::miette!("failed to write {}: {e}", dest.display()))?;
+    }
+
+    if args.vcs == "git" {
+        match Command::new("git").arg("init").arg(&args.path).status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!(
+                "{:>11} `git init` exited with {s} — continuing without VCS",
+                brand("Warning")
+            ),
+            Err(e) => eprintln!(
+                "{:>11} could not run `git init` ({e}) — continuing without VCS",
+                brand("Warning")
+            ),
+        }
+    }
+
+    eprintln!(
+        "{:>11} {} ({})",
+        brand("Created"),
+        gpath(&args.path),
+        if args.lib { "library" } else { "binary" }
+    );
+    for (rel, _) in &files {
+        eprintln!("{:>11} {}", brand("Wrote"), args.path.join(rel).display());
+    }
+    eprintln!(
+        "{:>11} cd {} && {}",
+        brand("Next"),
+        args.path.display(),
+        if args.lib { "holt check" } else { "holt run" }
+    );
+    Ok(())
 }
 
 /// Install the embedded standard library (`stdlib/**/*.hlt` baked in by
@@ -326,8 +605,16 @@ fn fail(report: Report) -> ! {
 }
 
 fn run_build(args: BuildArgs) -> miette::Result<()> {
+    let entry = resolve_entry(args.file.clone())?;
+    // Project mode redirects output to `out/debug|release/<name>` unless
+    // `-o` is given; file mode keeps the legacy next-to-source default.
+    let exe_path = args.output.clone().or_else(|| {
+        entry.project.as_ref().map(|p| {
+            p.out_dir(args.release).join(&p.bin_name)
+        })
+    });
     let opts = CompileOptions {
-        file: &args.file,
+        file: &entry.path,
         emit_llvm: args.emit_llvm,
         emit_llvm_file: args.emit_llvm_file.as_deref(),
         keep_obj: args.keep_obj,
@@ -336,16 +623,22 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
         quiet: args.quiet,
         force_color: args.color,
         verbose: args.verbose,
-        exe_path: args.output.clone(),
+        exe_path,
         check_only: false,
+        require_main: true,
     };
     let _ = compile(opts)?;
     Ok(())
 }
 
 fn run_check(args: CheckArgs) -> miette::Result<()> {
+    let entry = resolve_entry(args.file.clone())?;
+    let require_main = entry
+        .path
+        .file_stem()
+        .is_some_and(|s| s == "main");
     let opts = CompileOptions {
-        file: &args.file,
+        file: &entry.path,
         emit_llvm: false,
         emit_llvm_file: None,
         keep_obj: true,
@@ -356,27 +649,25 @@ fn run_check(args: CheckArgs) -> miette::Result<()> {
         verbose: args.verbose,
         exe_path: None,
         check_only: true,
+        require_main,
     };
     let _ = compile(opts)?;
     Ok(())
 }
 
 fn run_run(args: RunArgs) -> miette::Result<()> {
-    // Temp binary next to the source (same filesystem → cheap, executable bit
-    // preserved). Removed after the program finishes, even on failure.
-    let stem = args
-        .file
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "holt-run".to_string());
-    let tmp_exe = args.file.with_file_name(format!(
-        ".{}-run-{}",
-        stem,
-        std::process::id()
-    ));
+    let entry = resolve_entry(args.file.clone())?;
+    // The binary persists: project mode uses `out/debug|release/<name>`
+    // (ignored by VCS), file mode the legacy next-to-source default.
+    // Rebuilds are skipped while sources are unchanged (see freshness in
+    // `compile`), so repeated `run` is cheap.
+    let exe_path = match &entry.project {
+        Some(p) => p.out_dir(args.release).join(&p.bin_name),
+        None => default_exe_path(&entry.path, None),
+    };
 
     let opts = CompileOptions {
-        file: &args.file,
+        file: &entry.path,
         emit_llvm: false,
         emit_llvm_file: None,
         keep_obj: args.keep_obj,
@@ -385,8 +676,9 @@ fn run_run(args: RunArgs) -> miette::Result<()> {
         quiet: args.quiet,
         force_color: args.color,
         verbose: args.verbose,
-        exe_path: Some(tmp_exe.clone()),
+        exe_path: Some(exe_path),
         check_only: false,
+        require_main: true,
     };
     let built = compile(opts)?;
     let exe = match built {
@@ -404,8 +696,8 @@ fn run_run(args: RunArgs) -> miette::Result<()> {
         .map_err(|e| {
             miette::miette!("failed to execute {}: {e}", exe.display())
         })?;
-    // Always clean up the generated binary.
-    let _ = fs::remove_file(&exe);
+
+    // The binary is kept (rebuilt only when sources change).
 
     // Propagate the program's exit code so `holt run` behaves like the binary.
     match status.code() {
@@ -533,8 +825,8 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     // ── Import expansion ─────────────────────────────────────────────
     pb.set_message("Resolving imports");
     let t_import = Instant::now();
-    let (program, import_errors) = compiler::modules::expand_imports(program, file);
-    if let Some(first) = import_errors.into_iter().next() {
+    let expanded = compiler::modules::expand_imports(program, file);
+    if let Some(first) = expanded.errors.into_iter().next() {
         let diag = compiler::error::SingleDiagnostic::new(
             filename.clone(),
             source.clone(),
@@ -544,6 +836,10 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         pb.abandon();
         fail(Report::new(diag));
     }
+    // Complete source set the build depends on (entry + resolved imports):
+    // a rebuild is skipped when the binary is newer than all of these.
+    let source_files = expanded.files;
+    let program = expanded.program;
     let program = {
         pb.inc(1);
         if opts.verbose {
@@ -566,7 +862,12 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     pb.set_message("Checking");
     status(&pb, quiet, "Checking", &filename);
     let t_check = Instant::now();
-    let sema_errors = compiler::sema::check(&program);
+    let sema_errors = compiler::sema::check_with_options(
+        &program,
+        compiler::sema::CheckOptions {
+            require_main: opts.require_main,
+        },
+    );
     pb.inc(1);
     if !sema_errors.is_empty() {
         let parts: Vec<(compiler::token::Span, String)> = sema_errors
@@ -638,6 +939,35 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
 
     let exe_path = default_exe_path(file, opts.exe_path.clone());
     let obj_path = obj_path_for_exe(&exe_path);
+    // Project mode (`out/debug|release/`) and explicit `-o` paths may point
+    // into directories that don't exist yet — neither LLVM nor clang creates
+    // parent directories.
+    for p in [&obj_path, &exe_path] {
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    miette::miette!("failed to create {}: {e}", parent.display())
+                })?;
+            }
+        }
+    }
+
+    // ── Freshness ────────────────────────────────────────────────────
+    // Skip codegen+link when the binary is newer than every source file
+    // (entry + resolved imports) and the build stamp still matches this
+    // profile and toolchain version. `run` relies on this: its binary
+    // persists between invocations and only rebuilds on change.
+    if is_fresh(&exe_path, &source_files, opts.release) {
+        pb.finish_with_message("Finished");
+        status(&pb, quiet,
+            "Fresh",
+            &format!(
+                "{} (up to date)",
+                gpath(&exe_path),
+            ),
+        );
+        return Ok(Some(exe_path));
+    }
 
     pb.set_message(format!("Compiling {}", obj_path.display()));
     let build_kind = if opts.release { "release" } else { "debug" };
@@ -682,6 +1012,10 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     if !opts.keep_obj {
         let _ = fs::remove_file(&obj_path);
     }
+    // Record what produced this binary so a later invocation can prove
+    // freshness without recompiling (profile + toolchain version; sources
+    // are compared by mtime against the binary itself).
+    write_build_stamp(&exe_path, opts.release);
 
     pb.finish_with_message("Finished");
     status(&pb, quiet,
@@ -694,6 +1028,46 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         ),
     );
     Ok(Some(exe_path))
+}
+
+/// Sidecar recording the profile + toolchain that produced a binary.
+/// `<exe>.holtstamp`, e.g. `out/debug/demo.holtstamp`.
+fn stamp_path(exe: &Path) -> PathBuf {
+    let mut p = exe.as_os_str().to_owned();
+    p.push(".holtstamp");
+    PathBuf::from(p)
+}
+
+fn stamp_contents(release: bool) -> String {
+    format!(
+        "profile={}\ntoolchain=holt {}\n",
+        if release { "release" } else { "debug" },
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn write_build_stamp(exe: &Path, release: bool) {
+    let _ = fs::write(stamp_path(exe), stamp_contents(release));
+}
+
+/// True when `exe` exists, is newer than every source file, and its stamp
+/// matches this profile + toolchain version. Anything else (missing binary
+/// or stamp, profile/version switch, touched source) means rebuild.
+fn is_fresh(exe: &Path, sources: &[PathBuf], release: bool) -> bool {
+    let exe_mtime = match fs::metadata(exe).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    match fs::read_to_string(stamp_path(exe)) {
+        Ok(contents) if contents == stamp_contents(release) => {}
+        _ => return false,
+    }
+    sources.iter().all(|s| {
+        fs::metadata(s)
+            .and_then(|m| m.modified())
+            .map(|t| exe_mtime >= t)
+            .unwrap_or(false)
+    })
 }
 
 fn generate_ir_string(

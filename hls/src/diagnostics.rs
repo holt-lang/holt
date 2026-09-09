@@ -51,10 +51,16 @@ pub fn diagnostics(source: &str, path: Option<&Path>) -> Vec<Diagnostic> {
     if let Some(prog) = parsed {
         // Only entry points must define `main`.
         let require_main = path.map(is_main_file).unwrap_or(true);
-        let (expanded, import_errors) = match path {
+        let expanded = match path {
             Some(p) => compiler::modules::expand_imports(prog, p),
-            None => (prog, Vec::new()),
+            None => compiler::modules::Expanded {
+                program: prog,
+                errors: Vec::new(),
+                files: Vec::new(),
+            },
         };
+        let import_errors = expanded.errors;
+        let expanded = expanded.program;
         // Surface only failures from the open document itself: nested
         // failures belong to the imported file and appear when it is opened.
         if let Some(open) = path {

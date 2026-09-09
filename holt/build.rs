@@ -38,10 +38,10 @@ fn collect_hlt(root: &PathBuf, dir: &PathBuf, out: &mut Vec<String>) {
         let path = entry.path();
         if path.is_dir() {
             collect_hlt(root, &path, out);
-        } else if path.extension().is_some_and(|e| e == "hlt") {
-            if let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
-            }
+        } else if path.extension().is_some_and(|e| e == "hlt")
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
         }
     }
 }

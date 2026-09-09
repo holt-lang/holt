@@ -60,7 +60,7 @@ Actual layout:
 ```
 holt-rs/
 ├── holt/              # main binary `holt build`/`holt run` (single progress bar + #00A693 status lines)
-│   └── src/main.rs    # Commands::Build/Run/Check/Lsp/Setup, single progress bar + status lines (#00A693), generate_ir_string, codegen_to_object (imports via `compiler::modules`)
+│   └── src/main.rs    # Commands::Build/Run/Check/Lsp/Setup/New, single progress bar + status lines (#00A693), generate_ir_string, codegen_to_object (imports via `compiler::modules`; no file arg → project `src/main.hlt`, outputs to `out/debug|release/`)
 ├── compiler/          # library + legacy bin `compiler` (historical `holtc`)
 │   ├── src/lib.rs     # pub mod ast/codegen/error/lexer/parse/sema/token
 │   ├── src/token.rs, lexer.rs

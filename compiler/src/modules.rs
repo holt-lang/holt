@@ -83,11 +83,11 @@ fn workspace_stdlib_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Project root for an entry file: nearest ancestor (starting with the
-/// entry's own directory) containing a `main.hlt`; otherwise the entry's
-/// own directory.
+/// Project root for an entry file: nearest ancestor holding a `holt.toml`
+/// (project manifest), else the nearest ancestor containing a `main.hlt`,
+/// else the entry's own directory.
 pub fn project_root(entry: &Path) -> PathBuf {
-    let mut dir = if entry.is_dir() {
+    let start = if entry.is_dir() {
         entry.to_path_buf()
     } else {
         entry
@@ -95,13 +95,17 @@ pub fn project_root(entry: &Path) -> PathBuf {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     };
-    loop {
-        if dir.join("main.hlt").is_file() {
-            return dir;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent.to_path_buf(),
-            None => break,
+    let mut ancestors = vec![start.clone()];
+    let mut dir = start;
+    while let Some(parent) = dir.parent().map(|p| p.to_path_buf()) {
+        ancestors.push(parent.clone());
+        dir = parent;
+    }
+    for marker in ["holt.toml", "main.hlt"] {
+        for dir in &ancestors {
+            if dir.join(marker).is_file() {
+                return dir.clone();
+            }
         }
     }
     if entry.is_dir() {
@@ -114,19 +118,28 @@ pub fn project_root(entry: &Path) -> PathBuf {
     }
 }
 
-/// Ordered search bases for an entry file: project root, then stdlib roots
-/// (dev checkout first so repo work uses live sources, then `~/.hella/lib`).
+/// Ordered search bases for an entry file: the entry's own directory
+/// (modules next to the entry win), then the project root, then stdlib
+/// roots (dev checkout first so repo work uses live sources, then
+/// `~/.hella/lib`).
 pub fn search_bases(entry: &Path) -> Vec<PathBuf> {
-    let mut bases = vec![project_root(entry)];
-    if let Some(ws) = workspace_stdlib_root(entry) {
-        if !bases.contains(&ws) {
-            bases.push(ws);
+    let mut bases = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !bases.contains(&p) {
+            bases.push(p);
         }
+    };
+    if entry.is_dir() {
+        push(entry.to_path_buf());
+    } else if let Some(parent) = entry.parent() {
+        push(parent.to_path_buf());
+    }
+    push(project_root(entry));
+    if let Some(ws) = workspace_stdlib_root(entry) {
+        push(ws);
     }
     if let Some(home) = hella_lib_dir() {
-        if !bases.contains(&home) {
-            bases.push(home);
-        }
+        push(home);
     }
     bases
 }
@@ -160,10 +173,10 @@ struct Ctx {
 /// error list (spans in the importing file's coordinates) and skipped, so
 /// the LSP can still check the rest of the document. The CLI treats the
 /// first error as fatal, preserving `holt build` behavior.
-pub fn expand_imports(
-    program: Program,
-    importer: &Path,
-) -> (Program, Vec<ImportError>) {
+///
+/// `files` is the entry file plus every successfully resolved import —
+/// the complete source set a build depends on (used for rebuild checks).
+pub fn expand_imports(program: Program, importer: &Path) -> Expanded {
     let mut ctx = Ctx {
         bases: search_bases(importer),
         visited: HashSet::new(),
@@ -171,7 +184,22 @@ pub fn expand_imports(
     };
     let span = program.span;
     let items = expand_items(program.items, importer, &mut ctx);
-    (Program { items, span }, ctx.errors)
+    let mut files: Vec<PathBuf> = ctx.visited.into_iter().collect();
+    files.push(importer.to_path_buf());
+    files.sort();
+    Expanded {
+        program: Program { items, span },
+        errors: ctx.errors,
+        files,
+    }
+}
+
+/// Output of [`expand_imports`].
+pub struct Expanded {
+    pub program: Program,
+    pub errors: Vec<ImportError>,
+    /// Entry file + all resolved imports (sorted, deduplicated).
+    pub files: Vec<PathBuf>,
 }
 
 fn expand_items(
