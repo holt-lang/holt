@@ -5,15 +5,47 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use clap::builder::styling::{AnsiColor, Color as ClapColor, Style, Styles};
 use console::{Color, style};
 use indicatif::{ProgressBar, ProgressStyle};
 use miette::Report;
 
 use compiler::lexer::lex;
 
+/// Holt brand green #00A693 as an ANSI truecolor style.
+fn brand_style() -> Style {
+    Style::new().fg_color(Some(ClapColor::Rgb(anstyle::RgbColor(0x00, 0xA6, 0x93)))).bold()
+}
+
+/// clap help/error styling in the Holt brand palette:
+/// brand-green headers and literals, yellow errors, dim context.
+fn cli_styles() -> Styles {
+    let brand = brand_style();
+    let dim = Style::new().fg_color(Some(ClapColor::Ansi(AnsiColor::BrightBlack)));
+    let yellow = Style::new().fg_color(Some(ClapColor::Ansi(AnsiColor::Yellow)));
+    Styles::styled()
+        .header(brand)
+        .usage(brand)
+        .literal(brand)
+        .placeholder(dim)
+        .context(dim)
+        .context_value(Style::new())
+        .error(yellow.bold())
+        .invalid(yellow.bold())
+        .valid(brand)
+}
+
 /// Holt — main entry point (wraps `compiler` crate)
 #[derive(Parser, Debug)]
-#[command(name = "holt", version = "0.1.0", about = "Holt compiler")]
+#[command(
+    name = "holt",
+    version = "0.1.0",
+    about = "Holt compiler",
+    long_about = "Holt compiler — build, check and run .hlt programs.",
+    styles = cli_styles(),
+    arg_required_else_help = true,
+    propagate_version = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -22,10 +54,13 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Build a .hlt source file (lex → parse → check → codegen → link)
+    #[command(visible_alias = "b")]
     Build(BuildArgs),
     /// Build and run a .hlt source file, removing the binary afterwards
+    #[command(visible_alias = "r")]
     Run(RunArgs),
     /// Check a .hlt source file (lex → parse → check, no codegen)
+    #[command(visible_alias = "c")]
     Check(CheckArgs),
 }
 
@@ -167,6 +202,20 @@ fn brand(prefix: &str) -> String {
     style(prefix)
         .fg(Color::TrueColor(0x00, 0xA6, 0x93))
         .bold()
+        .to_string()
+}
+
+/// Brand-green path for the summary line.
+fn gpath(p: &Path) -> String {
+    style(p.display().to_string())
+        .fg(Color::TrueColor(0x00, 0xA6, 0x93))
+        .to_string()
+}
+
+/// Yellow duration, matching compiler-error yellow accents.
+fn gduration(d: Duration) -> String {
+    style(seconds(d))
+        .fg(Color::Yellow)
         .to_string()
 }
 
@@ -325,20 +374,20 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     };
     let pb = new_progress_bar(quiet, total_steps);
 
-    status(&pb, quiet, "Compiling", &file.display().to_string());
+        status(&pb, quiet, "Compiling", &gpath(file).to_string());
 
     // ── Read ─────────────────────────────────────────────────────────
-    pb.set_message(format!("Reading {}", file.display()));
+    pb.set_message("Reading");
     let source = fs::read_to_string(file).map_err(|e| {
         pb.abandon();
-        miette::miette!("failed to read {}: {e}", file.display())
+        miette::miette!("failed to read {}: {e}", gpath(file))
     })?;
     let filename = file.display().to_string();
     pb.inc(1);
     if opts.verbose {
         status(&pb, quiet,
             "Reading",
-            &format!("{} ({} bytes)", file.display(), source.len()),
+            &format!("{} ({} bytes)", gpath(file), source.len()),
         );
     }
 
@@ -353,7 +402,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
             &format!(
                 "{} tokens in {}",
                 out.tokens.len(),
-                seconds(t_lex.elapsed())
+                gduration(t_lex.elapsed())
             ),
         );
     }
@@ -397,7 +446,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
                         &format!(
                             "{} items in {}",
                             p.items.len(),
-                            seconds(t_parse.elapsed())
+                            gduration(t_parse.elapsed())
                         ),
                     );
                 }
@@ -427,7 +476,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
                     &format!(
                         "{} items in {}",
                         p.items.len(),
-                        seconds(t_import.elapsed())
+                        gduration(t_import.elapsed())
                     ),
                 );
             }
@@ -466,7 +515,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
             "semantic error".into(),
         );
         pb.abandon();
-        fail(Report::new(multi));
+                fail(Report::new(multi));
     }
     if opts.check_only {
         pb.finish_with_message("Finished");
@@ -474,8 +523,8 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
             "Checked",
             &format!(
                 "{} in {}",
-                file.display(),
-                seconds(start_all.elapsed())
+                gpath(file),
+                gduration(start_all.elapsed())
             ),
         );
         return Ok(None);
@@ -485,7 +534,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         &format!("in {}", seconds(t_check.elapsed())),
     );
 
-    // ── Codegen ──────────────────────────────────────────────────────
+        // ── Codegen ──────────────────────────────────────────────────────
     if opts.emit_llvm {
         pb.set_message("Generating LLVM IR");
         status(&pb, quiet, "Generating", "LLVM IR");
@@ -500,19 +549,18 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         pb.inc(1);
         status(&pb, quiet,
             "Generated",
-            &format!("in {}", seconds(t_ir.elapsed())),
+            &format!("in {}", gduration(t_ir.elapsed())),
         );
         if let Some(path) = opts.emit_llvm_file {
-            fs::write(path, &ir)
-                .map_err(|e| miette::miette!("failed to write IR: {e}"))?;
-            status(&pb, quiet, "Exported", &path.display().to_string());
+            fs::write(path, &ir).map_err(|e| miette::miette!("failed to write IR: {e}"))?;
+            status(&pb, quiet, "Exported", &gpath(path).to_string());
         } else {
             println!("{ir}");
         }
         pb.finish_with_message("Finished");
         status(&pb, quiet,
             "Compiled",
-            &format!("in {}", seconds(start_all.elapsed())),
+            &format!("in {}", gduration(start_all.elapsed())),
         );
         return Ok(None);
     }
@@ -521,7 +569,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     let obj_path = obj_path_for_exe(&exe_path);
 
     pb.set_message(format!("Compiling {}", obj_path.display()));
-    status(&pb, quiet, "Compiling", &obj_path.display().to_string());
+    status(&pb, quiet, "Compiling", &gpath(&obj_path).to_string());
     let t_cg = Instant::now();
     if let Err(e) = codegen_to_object(&program, &obj_path, &filename, &source) {
         pb.abandon();
@@ -531,13 +579,11 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     if opts.verbose {
         status(&pb, quiet,
             "Compiled",
-            &format!("{} in {}", obj_path.display(), seconds(t_cg.elapsed())),
+            &format!("{} in {}", gpath(&obj_path), gduration(t_cg.elapsed())),
         );
     }
 
-    // ── Link ─────────────────────────────────────────────────────────
-    // Per-tool timing stays behind `--verbose`: default is `Compiling` …
-    // `Compiled in 0.12s`.
+            // ── Link ─────────────────────────────────────────────────────────
     pb.set_message(format!("Linking {}", exe_path.display()));
     let t_link = Instant::now();
     let link_status = Command::new("clang")
@@ -547,9 +593,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         .status()
         .map_err(|e| {
             pb.abandon();
-            miette::miette!(
-                "failed to invoke clang: {e} — is Xcode CLT installed?"
-            )
+            miette::miette!("failed to invoke clang: {e} — is Xcode CLT installed?")
         })?;
     if !link_status.success() {
         pb.abandon();
@@ -559,7 +603,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     if opts.verbose {
         status(&pb, quiet,
             "Linked",
-            &format!("{} in {}", exe_path.display(), seconds(t_link.elapsed())),
+            &format!("{} in {}", gpath(&exe_path), gduration(t_link.elapsed())),
         );
     }
 
@@ -572,9 +616,9 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         "Compiled",
         &format!(
             "{} → {} in {}",
-            file.display(),
-            exe_path.display(),
-            seconds(start_all.elapsed())
+            gpath(file),
+            gpath(&exe_path),
+            gduration(start_all.elapsed())
         ),
     );
     Ok(Some(exe_path))
