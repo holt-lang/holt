@@ -21,7 +21,7 @@ Guide LLMs building a compiler for **Holt** (draft 0.2 EBNF) using Rust and `ink
 - Phased implementation plan — `references/phases.md` (Phases 0–5 DONE, but see Gap Matrix: many stubs)
 - LLVM lowering map — `references/llvm-mapping.md` (`int→i64`, `bool→i1`, `T[]→[16 x T]`, `T?→{T,bool}`, `T*→ptr`, `defer` stacks)
 - Recommended crates and project layout — `references/toolchain.md` (**OUTDATED**: still lists `chumsky 0.10`, `llvm20-1`, `ariadne`; actual is `logos 0.15` + hand Pratt `compiler/src/parse/mod.rs:1`, `miette 7`, `inkwell 0.10 llvm21-1`, workspace `holt`+`compiler`)
-- Main driver with progress — `holt/src/main.rs:1` (`holt build <file>` `indicatif` spinner `pb_spinner` + `console` `Compiling/Finished`)
+- Main driver with progress — `holt/src/main.rs:1` (`holt build <file>` single `ProgressBar` + status lines in brand green #00A693)
 - Canonical examples — `examples/advanced.hlt` (distinct/extend/init/extern/where/operator/closure/interpolation), `examples/abstraction.hlt` (separate accessors, `open` class), `examples/data_control.hlt` (omitted `has`), `examples/hello_io.hlt` (`import std::io`)
 - Audit Gap Matrix — see `TodoWrite` “Holt 100% EBNF” (38 sections: 21% full, ~47% partial, 6 missing)
 
@@ -39,7 +39,7 @@ When asked to implement any part of the compiler:
    - Semantic checks (`compiler/src/sema/mod.rs` — `resolve_type`, `check_expr`/`check_stmt`, `ClassInfo{operators, conversions}`, merging `prop_map` for separate accessors, `open`-on-method rejection)
    - `inkwell` lowering (`compiler/src/codegen/mod.rs` — `llvm_ty_for`/`llvm_ty_for_sema`, `declare_*`/`codegen_*`, `class_operators` dispatch, `closure_count`/`holt.init`/`strcat`/`sprintf`)
 5. Prefer a compilable, testable increment over a complete but unrunnable design.
-6. Emit via `holt build <file>` (main entry, `holt/src/main.rs:40` `pb_spinner` `indicatif` + `console` cargo-like `Compiling/Lexing/Parsing/Resolving/Checking/Codegen/Linking/Finished` with `Instant` timing) or `cargo run -p compiler` legacy, then object `TargetMachine` + `clang` link to `*.out`. Always `module.verify()` before emission.
+6. Emit via `holt build <file>` (single progress bar + brand-green status lines) or `cargo run -p compiler` legacy, then object `TargetMachine` + `clang` link to a proper binary (extension stripped). Always `module.verify()` before emission.
 7. Update `examples/*.hlt` to exercise the new production and `references/ebnf-0.1.txt` if grammar changed.
 
 ## Architecture Snapshot (actual workspace as of Phase 5 DONE)
@@ -52,15 +52,15 @@ source (.hlt)
   → sema (scopes, types, ClassInfo{operators, conversions}, prop_map merging, open check, compiler/src/sema/mod.rs:1)
   → codegen (inkwell 0.10 llvm21-1 Context/Module/Builder, compiler/src/codegen/mod.rs:1, llvm_ty_for, declare_*/codegen_*, class_operators dispatch, closure_count, holt.init, defer stacks, monomorph T→i64 erasure)
   → LLVM IR → TargetMachine object → clang link → *.out
-          ↖ holt/src/main.rs:1 holt build CLI (clap BuildArgs, indicatif spinner pb_spinner + console, expand_imports, timing)
+          ↖ holt/src/main.rs:1 holt build CLI (subcommands, single progress bar + status lines, expand_imports, timing)
 ```
 
 Actual layout:
 
 ```
 holt-rs/
-├── holt/              # main binary `holt build` (clap, indicatif 0.17, console 0.15, miette, inkwell)
-│   └── src/main.rs    # Commands::Build, find_stdlib_root, expand_imports, generate_ir_string, codegen_to_object, cargo-like progress
+├── holt/              # main binary `holt build`/`holt run` (single progress bar + #00A693 status lines)
+│   └── src/main.rs    # Commands::Build/Run, single progress bar + status lines (#00A693), find_stdlib_root, expand_imports, generate_ir_string, codegen_to_object
 ├── compiler/          # library + legacy bin `compiler` (historical `holtc`)
 │   ├── src/lib.rs     # pub mod ast/codegen/error/lexer/parse/sema/token
 │   ├── src/token.rs, lexer.rs
@@ -120,7 +120,7 @@ Use span-based diagnostics (`miette` `compiler/src/error.rs:1` `SingleDiagnostic
 - Invalid `break`/`continue` target / label (`sema` `loop_stack`)
 - `method cannot be open`, duplicate getter/setter, `field is private` (visibility `sema` `field_vis`/`method_vis`)
 
-Progress like `cargo` is **required** for `holt build` (`holt/src/main.rs:40` `pb_spinner` `indicatif::ProgressBar::new_spinner` green spinner `⠋⠙⠹` + `console::style("Lexing").green().bold()` `{:>12}` alignment, `Instant::now` timing per phase: `Reading`/`Lexing`/`Parsing`/`Resolving`/`Checking`/`Codegen`/`Linking`/`Finished` `holt/src/main.rs:92-304`). Legacy `compiler` bin keeps `miette` without spinner.
+Progress output uses the Holt brand green #00A693 for `holt build`/`holt run` (`holt/src/main.rs` single `ProgressBar` + status lines, `Instant::now` timing per phase: `Reading`/`Lexing`/`Parsing`/`Resolving`/`Checking`/`Codegen`/`Linking`/`Compiled`). Legacy `compiler` bin keeps `miette` without progress output.
 
 ## When the User Asks for a Specific Piece
 
@@ -155,7 +155,7 @@ Progress like `cargo` is **required** for `holt build` (`holt/src/main.rs:40` `p
 - Prefer complete, compilable Rust fragments over pseudocode when implementing a phase.
 - Always state which phase / EBNF § the work belongs to and which `Todo` `T-*` it closes.
 - Cite the relevant EBNF productions when adding syntax (`references/ebnf-0.1.txt:633` etc.).
-- Keep test programs in `examples/` as `.hlt` files and verify with `holt build <file>` (cargo-like progress) *and* `cargo test` (4 lexer tests) before marking `Todo` done.
+- Keep test programs in `examples/` as `.hlt` files and verify with `holt build <file>` *and* `cargo test` (4 lexer tests) before marking `Todo` done.
 - **Todo is law:** Never work outside `TodoWrite` “Holt 100% EBNF”. If user asks for ad-hoc fix, add it as a `T-*` first, then execute.
 
 ### Holt 100% EBNF — Reference Todo (keep in sync with `TodoWrite`)

@@ -11,13 +11,13 @@ miette = { version = "7", features = ["fancy"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 
-# holt crate (main `holt build` CLI)
+# holt crate (main `holt build` / `holt run` CLI)
 [dependencies]
 compiler = { path = "../compiler" }
 clap = { version = "4", features = ["derive"] }
 miette = { version = "7", features = ["fancy"] }
+console = "0.16"
 indicatif = "0.17"
-console = "0.15"
 inkwell = { version = "0.10", features = ["llvm21-1"] }
 ```
 
@@ -38,9 +38,9 @@ Optional later:
 
 ```
 holt-rs/
-├── holt/                 # main binary `holt build` (clap Build subcommand, indicatif spinner, console styling)
-│   ├── Cargo.toml        # compiler = {path="../compiler"}, indicatif, console, inkwell, miette, clap
-│   └── src/main.rs       # Commands::Build, pb_spinner ("{spinner:.green} {msg}"), Compiling/Lexing/Parsing/Resolving/Checking/Codegen/Linking/Finished with Instant timing
+├── holt/                 # main binary `holt build`/`holt run` (clap subcommands, brand-green output, single progress bar)
+│   ├── Cargo.toml        # compiler = {path="../compiler"}, console 0.16, indicatif, inkwell, miette, clap
+│   └── src/main.rs       # Commands::Build/Run, status() lines (brand #00A693, {:>11}) + one ProgressBar, Compiling/Checking/Checked/Compiling/Compiled/Running
 ├── compiler/             # library + legacy bin `compiler`/`holtc`
 │   ├── Cargo.toml        # lib + bin, inkwell llvm21-1, logos, miette, thiserror, clap (no chumsky)
 │   └── src/
@@ -77,11 +77,11 @@ holt-rs/
 
 ## Driver Responsibilities
 
-1. Parse CLI (`clap` `Commands::Build` in `holt`, `Args` in legacy `compiler`).
+1. Parse CLI (`clap` `Commands::Build`/`Commands::Run` in `holt`, `Args` in legacy `compiler`).
 2. Read source.
-3. Lex → Parse → Sema → Codegen with progress like `cargo` (`holt/src/main.rs:40` `pb_spinner` `indicatif` + `console` `{:>12}` green bold `Compiling/Lexing/Parsing/Resolving/Checking/Codegen/Linking/Finished` + `Instant::now` timing).
-4. On success: write object via `inkwell::targets::TargetMachine` + `clang` link to `*.out` (or `--emit-llvm` to stdout/file, `--keep-obj`, `-o`).
-5. On failure: print span-based `miette` diagnostics and exit non-zero.
+3. Lex → Parse → Sema → Codegen with a single progress bar covering the whole pipeline plus static status lines on stderr (`holt/src/main.rs` `new_progress_bar()` + `status()` in brand green #00A693 `{:>11}` `Compiling/Checking/Checked/Compiling/Compiled/Running`; `--verbose` per-phase, `--quiet` silence).
+4. On success: write object via `inkwell::targets::TargetMachine` + `clang` link to a proper binary (extension stripped; `run` deletes it afterwards) (or `--emit-llvm` to stdout/file, `--keep-obj`, `-o`).
+5. On failure: print span-based `miette` diagnostics via the single `fail()` sink on stderr and exit non-zero.
 6. Legacy `compiler` bin (`compiler/src/main.rs:20` `holtc`) still works but `holt build` is canonical.
 
 ## Testing Strategy
