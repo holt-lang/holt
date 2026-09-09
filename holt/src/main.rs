@@ -12,6 +12,10 @@ use miette::Report;
 
 use compiler::lexer::lex;
 
+/// Standard-library sources embedded at build time by `holt/build.rs`
+/// (`stdlib/**/*.hlt`), used by `holt setup` to populate `~/.hella/lib`.
+include!(concat!(env!("OUT_DIR"), "/stdlib_embedded.rs"));
+
 /// Holt brand green #00A693 as an ANSI truecolor style.
 fn brand_style() -> Style {
     Style::new().fg_color(Some(ClapColor::Rgb(anstyle::RgbColor(0x00, 0xA6, 0x93)))).bold()
@@ -65,6 +69,8 @@ enum Commands {
     /// Run the Holt language server (LSP over stdio)
     #[command(visible_alias = "ls")]
     Lsp,
+    /// Install the embedded standard library to `~/.hella/lib`
+    Setup(SetupArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -138,6 +144,13 @@ struct RunArgs {
 }
 
 #[derive(Parser, Debug)]
+struct SetupArgs {
+    /// Overwrite files that already exist in `~/.hella/lib`
+    #[arg(long, default_value_t = false)]
+    force: bool,
+}
+
+#[derive(Parser, Debug)]
 struct CheckArgs {
     /// Source file (.hlt) to check
     file: PathBuf,
@@ -184,7 +197,42 @@ fn main() -> miette::Result<()> {
         // The language server speaks LSP on stdio and terminates itself with
         // its own exit code after the client sends `exit`.
         Commands::Lsp => std::process::exit(hls::server::run()),
+        Commands::Setup(args) => run_setup(args),
     }
+}
+
+/// Install the embedded standard library (`stdlib/**/*.hlt` baked in by
+/// `holt/build.rs`) to `~/.hella/lib`, the directory the compiler searches
+/// for `import`ed libraries. Existing files are kept unless `--force`.
+fn run_setup(args: SetupArgs) -> miette::Result<()> {
+    let Some(dest_root) = compiler::modules::hella_lib_dir() else {
+        return Err(miette::miette!(
+            "`holt setup` is only supported on UNIX-like systems for now"
+        ));
+    };
+    let mut installed = 0usize;
+    let mut skipped = 0usize;
+    for (rel, contents) in STDLIB_FILES {
+        let dest = dest_root.join(rel);
+        if dest.is_file() && !args.force {
+            skipped += 1;
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                miette::miette!("failed to create {}: {e}", parent.display())
+            })?;
+        }
+        fs::write(&dest, contents)
+            .map_err(|e| miette::miette!("failed to write {}: {e}", dest.display()))?;
+        installed += 1;
+    }
+    eprintln!(
+        "{:>11} stdlib → {} ({installed} installed, {skipped} kept)",
+        brand("Setup"),
+        gpath(&dest_root),
+    );
+    Ok(())
 }
 
 /// Toolchain terminal output: a single progress bar covering the whole
@@ -473,31 +521,30 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     // ── Import expansion ─────────────────────────────────────────────
     pb.set_message("Resolving imports");
     let t_import = Instant::now();
-    let program = match expand_imports(program, file) {
-        Ok(p) => {
-            pb.inc(1);
-            if opts.verbose {
-                status(&pb, quiet,
-                    "Resolved",
-                    &format!(
-                        "{} items in {}",
-                        p.items.len(),
-                        gduration(t_import.elapsed())
-                    ),
-                );
-            }
-            p
-        }
-        Err(e) => {
-            let diag = compiler::error::SingleDiagnostic::new(
-                filename.clone(),
-                source.clone(),
-                e.span,
-                e.message,
+    let (program, import_errors) = compiler::modules::expand_imports(program, file);
+    if let Some(first) = import_errors.into_iter().next() {
+        let diag = compiler::error::SingleDiagnostic::new(
+            filename.clone(),
+            source.clone(),
+            first.span,
+            first.message,
+        );
+        pb.abandon();
+        fail(Report::new(diag));
+    }
+    let program = {
+        pb.inc(1);
+        if opts.verbose {
+            status(&pb, quiet,
+                "Resolved",
+                &format!(
+                    "{} items in {}",
+                    program.items.len(),
+                    gduration(t_import.elapsed())
+                ),
             );
-            pb.abandon();
-            fail(Report::new(diag));
         }
+        program
     };
     if opts.print_ast {
         println!("{:#?}", program);
@@ -695,165 +742,3 @@ fn obj_path_for_exe(exe: &Path) -> PathBuf {
     }
 }
 
-fn find_stdlib_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = if start.is_dir() {
-        start.to_path_buf()
-    } else {
-        start
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."))
-    };
-    loop {
-        let candidate = dir.join("stdlib");
-        if candidate.is_dir() {
-            return Some(candidate);
-        }
-        if let Some(parent) = dir.parent() {
-            dir = parent.to_path_buf();
-        } else {
-            break;
-        }
-    }
-    let cwd = PathBuf::from("stdlib");
-    if cwd.is_dir() {
-        return Some(cwd);
-    }
-    let ws = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../stdlib");
-    if ws.is_dir() {
-        return Some(ws);
-    }
-    None
-}
-
-fn expand_imports(
-    mut program: compiler::ast::Program,
-    importer: &Path,
-) -> Result<compiler::ast::Program, compiler::parse::ParseError> {
-    use std::collections::HashSet;
-    let stdlib_root = find_stdlib_root(importer);
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut out_items: Vec<compiler::ast::Item> = Vec::new();
-    let mut pending: Vec<compiler::ast::Item> =
-        std::mem::take(&mut program.items);
-    let mut idx = 0;
-    while idx < pending.len() {
-        let item = pending[idx].clone();
-        if let compiler::ast::Item::Import(imp) = item {
-            let key = imp.path.join("::");
-            if visited.contains(&key) {
-                idx += 1;
-                continue;
-            }
-            visited.insert(key.clone());
-            let rel = imp.path.join("/") + ".hlt";
-            let mut file_path: Option<PathBuf> = None;
-            if let Some(ref root) = stdlib_root {
-                let p = root.join(&rel);
-                if p.is_file() {
-                    file_path = Some(p);
-                }
-            }
-            if file_path.is_none() {
-                if let Some(parent) = importer.parent() {
-                    let p = parent.join(&rel);
-                    if p.is_file() {
-                        file_path = Some(p);
-                    }
-                }
-            }
-            if file_path.is_none() {
-                let p = PathBuf::from(&rel);
-                if p.is_file() {
-                    file_path = Some(p);
-                }
-            }
-            let path =
-                file_path.ok_or_else(|| compiler::parse::ParseError {
-                    message: format!(
-                        "cannot resolve import `{}`",
-                        imp.path.join("::")
-                    ),
-                    span: imp.span,
-                })?;
-            let src = fs::read_to_string(&path).map_err(|e| {
-                compiler::parse::ParseError {
-                    message: format!(
-                        "failed to read import {}: {e}",
-                        path.display()
-                    ),
-                    span: imp.span,
-                }
-            })?;
-            let toks = compiler::lexer::lex(&src);
-            if !toks.errors.is_empty() {
-                return Err(compiler::parse::ParseError {
-                    message: format!("lex error in import {}", path.display()),
-                    span: imp.span,
-                });
-            }
-            let mut sub = compiler::parse::parse(toks.tokens, src.clone())
-                .map_err(|e| compiler::parse::ParseError {
-                    message: format!(
-                        "parse error in {}: {}",
-                        path.display(),
-                        e.message
-                    ),
-                    span: imp.span,
-                })?;
-            sub = expand_imports(sub, &path)?;
-            if let Some(ref syms) = imp.symbols {
-                let wanted: HashSet<String> =
-                    syms.iter().map(|(s, _)| s.clone()).collect();
-                for it in sub.items {
-                    match &it {
-                        compiler::ast::Item::Function(f)
-                            if wanted.contains(&f.name) =>
-                        {
-                            out_items.push(it)
-                        }
-                        compiler::ast::Item::Struct(s)
-                            if wanted.contains(&s.name) =>
-                        {
-                            out_items.push(it)
-                        }
-                        compiler::ast::Item::Class(c)
-                            if wanted.contains(&c.name) =>
-                        {
-                            out_items.push(it)
-                        }
-                        compiler::ast::Item::Enum(e)
-                            if wanted.contains(&e.name) =>
-                        {
-                            out_items.push(it)
-                        }
-                        compiler::ast::Item::Import(_) => {}
-                        // Real stdlib: `extern` blocks are linkage requirements,
-                        // not selectable symbols. A selective import like
-                        // `import std::io::{print}` still needs the libc
-                        // declarations its wrappers call into.
-                        compiler::ast::Item::Extern(_) => {
-                            out_items.push(it)
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                for it in sub
-                    .items
-                    .into_iter()
-                    .filter(|i| !matches!(i, compiler::ast::Item::Import(_)))
-                {
-                    out_items.push(it);
-                }
-            }
-        } else {
-            out_items.push(item);
-        }
-        idx += 1;
-    }
-    Ok(compiler::ast::Program {
-        items: out_items,
-        span: program.span,
-    })
-}

@@ -36,9 +36,11 @@ function name in sema or codegen.
    `RESERVED_RUNTIME`) so user definitions cannot collide with the external
    declarations the compiler emits. Declaring them via `extern` is the only
    legal path, and that path belongs to `stdlib/`.
-5. **Import resolver** — textual inlining `qualified-name → stdlib/<path>.hlt`
-   (`holt/src/main.rs:expand_imports`). Future: caching, cycle detection,
-   visibility enforcement.
+5. **Import resolver** — textual inlining `qualified-name → <root>/<path>.hlt`
+   (`compiler/src/modules.rs`, shared by CLI and LSP): project root around
+   `main.hlt` first (local modules, `mod.hlt` directory entries, cycle guard),
+   then dev-checkout `stdlib/`, then `~/.hella/lib` (UNIX, via `holt setup`).
+   Selective imports always carry the module's `extern` blocks.
 
 ## Stdlib owns (pure Holt under `stdlib/`)
 

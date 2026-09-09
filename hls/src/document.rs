@@ -133,6 +133,48 @@ pub fn span_to_range(text: &str, span: Span) -> Range {
     }
 }
 
+/// Best-effort `file://` URI → filesystem path (percent-decoded) for
+/// project-model lookups (import resolution, the `main`-file gate).
+/// Returns `None` for non-file schemes (untitled buffers, etc.).
+pub fn uri_to_path(uri: &Uri) -> Option<std::path::PathBuf> {
+    let s = uri.as_str();
+    let rest = s.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let decoded = percent_decode(rest);
+    #[cfg(windows)]
+    let decoded = decoded.strip_prefix('/').unwrap_or(&decoded).to_string();
+    Some(std::path::PathBuf::from(decoded))
+}
+
+/// Minimal `%XX` decoding for file URIs (no extra dependency for this).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let (Some(h), Some(l)) = (hex(bytes.get(i + 1)), hex(bytes.get(i + 2)))
+            {
+                out.push(h << 4 | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex(b: Option<&u8>) -> Option<u8> {
+    match b.copied()? {
+        v @ b'0'..=b'9' => Some(v - b'0'),
+        v @ b'a'..=b'f' => Some(v - b'a' + 10),
+        v @ b'A'..=b'F' => Some(v - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

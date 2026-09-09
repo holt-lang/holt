@@ -249,7 +249,10 @@ fn publish(connection: &Connection, state: &State, uri: &lsp_types::Uri) {
     let Some(doc) = state.docs.get(uri) else {
         return;
     };
-    let diags = diagnostics(&doc.text);
+    // Project-model context for import resolution + the `main`-file gate.
+    // `None` (non-file URIs) keeps the legacy single-file behavior.
+    let path = crate::document::uri_to_path(uri);
+    let diags = diagnostics(&doc.text, path.as_deref());
     let params = PublishDiagnosticsParams::new(uri.clone(), diags, Some(doc.version));
     let not = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
     let _ = connection.sender.send(not.into());

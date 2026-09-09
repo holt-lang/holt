@@ -52,7 +52,7 @@ source (.hlt)
   → sema (scopes, types, ClassInfo{operators, conversions}, prop_map merging, open check, compiler/src/sema/mod.rs:1)
   → codegen (inkwell 0.10 llvm21-1 Context/Module/Builder, compiler/src/codegen/mod.rs:1, llvm_ty_for, declare_*/codegen_*, class_operators dispatch, closure_count, holt.init, defer stacks, monomorph T→i64 erasure)
   → LLVM IR → TargetMachine object → clang link → *.out
-          ↖ holt/src/main.rs:1 holt build CLI (subcommands, single progress bar + status lines, expand_imports, timing)
+          ↖ holt/src/main.rs:1 holt build CLI (subcommands incl. `setup`, single progress bar + status lines, timing; imports via `compiler::modules`)
 ```
 
 Actual layout:
@@ -60,7 +60,7 @@ Actual layout:
 ```
 holt-rs/
 ├── holt/              # main binary `holt build`/`holt run` (single progress bar + #00A693 status lines)
-│   └── src/main.rs    # Commands::Build/Run, single progress bar + status lines (#00A693), find_stdlib_root, expand_imports, generate_ir_string, codegen_to_object
+│   └── src/main.rs    # Commands::Build/Run/Check/Lsp/Setup, single progress bar + status lines (#00A693), generate_ir_string, codegen_to_object (imports via `compiler::modules`)
 ├── compiler/          # library + legacy bin `compiler` (historical `holtc`)
 │   ├── src/lib.rs     # pub mod ast/codegen/error/lexer/parse/sema/token
 │   ├── src/token.rs, lexer.rs

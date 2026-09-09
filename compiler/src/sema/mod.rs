@@ -285,6 +285,10 @@ pub struct Checker {
     cur_ret: Option<Ty>,
     cur_class: Option<String>,
     loop_stack: Vec<Option<String>>,
+    /// Whether a missing `main` is an error. The CLI always requires it;
+    /// the LSP only requires it for files named `main` (library modules
+    /// next to `main.hlt` are checked without an entry point).
+    require_main: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -318,7 +322,14 @@ impl Checker {
             cur_ret: None,
             cur_class: None,
             loop_stack: Vec::new(),
+            require_main: true,
         }
+    }
+
+    /// Only require a `main` function when the checked file is an entry
+    /// point (the LSP passes `false` for library modules).
+    pub fn set_require_main(&mut self, require: bool) {
+        self.require_main = require;
     }
 
     fn loop_depth(&self) -> usize { self.loop_stack.len() }
@@ -1417,7 +1428,7 @@ impl Checker {
             {
                 self.errors.push(SemError{message: format!("invalid `main` signature: expected `void main()` or `int main()` or `void main(string[] args)` or `int main(string[] args)`, found `{} main({})`", main.ret, main.params.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")), span: main.span});
             }
-        } else {
+        } else if self.require_main {
             self.errors.push(SemError {
                 message: "missing `main` function".into(),
                 span: prog.span,
@@ -3629,6 +3640,27 @@ impl Checker {
 }
 
 pub fn check(prog: &Program) -> Vec<SemError> {
+    check_with_options(prog, CheckOptions::default())
+}
+
+/// Sema entry point with options (used by the LSP, which expands imports
+/// itself and only requires `main` for files named `main`).
+pub fn check_with_options(prog: &Program, opts: CheckOptions) -> Vec<SemError> {
     let mut c = Checker::new();
+    c.set_require_main(opts.require_main);
     c.check_program(prog)
+}
+
+/// Options for [`check_with_options`].
+#[derive(Clone, Copy, Debug)]
+pub struct CheckOptions {
+    /// Emit `missing `main` function` when no `main` is declared.
+    /// `true` for CLI builds; the LSP sets it only for `main.hlt`.
+    pub require_main: bool,
+}
+
+impl Default for CheckOptions {
+    fn default() -> Self {
+        Self { require_main: true }
+    }
 }
