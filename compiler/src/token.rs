@@ -68,7 +68,7 @@ fn float_callback(lex: &mut logos::Lexer<Token>) -> bool {
 /// All Holt tokens. Keywords are matched before `Ident` via `#[token]` priority.
 #[derive(Logos, Debug, Clone, PartialEq, Eq, Hash)]
 #[logos(skip r"[ \t\f]+")] // whitespace except newline; newlines are significant
-#[logos(skip r"//[^\n]*")] // line comments
+#[logos(skip(r"//[^\n]*", allow_greedy = true))] // line comments
 #[logos(skip r"/\*([^*]|\*[^/])*\*/")] // block comments (non-nested)
 pub enum Token {
     // ── Statement terminator support ──────────────────────────────────
