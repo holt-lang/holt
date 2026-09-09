@@ -116,6 +116,20 @@ impl<'ctx> Codegen<'ctx> {
         self.module.print_to_string().to_string()
     }
 
+    /// Run the standard O3 pipeline over the module via the new pass
+    /// manager (`holt build --release`). Call once, after
+    /// `compile_program` + `verify`, before object emission / IR dump.
+    /// Needs the target machine so passes can query target specifics.
+    pub fn optimize_for_release(
+        &self,
+        machine: &inkwell::targets::TargetMachine,
+    ) -> Result<(), String> {
+        let options = inkwell::passes::PassBuilderOptions::create();
+        self.module
+            .run_passes("default<O3>", machine, options)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn compile_program(
         &mut self,
         prog: &Program,
@@ -6356,6 +6370,7 @@ impl<'ctx> Codegen<'ctx> {
 pub fn compile_to_object(
     program: &Program,
     obj_path: &Path,
+    opt: OptLevel,
 ) -> Result<(), String> {
     let context = Context::create();
     let mut cg = Codegen::new(&context, "holt");
@@ -6363,24 +6378,55 @@ pub fn compile_to_object(
         format!("{} at {}..{}", e.message, e.span.start, e.span.end)
     })?;
     cg.module.verify().map_err(|e| e.to_string())?;
-    inkwell::targets::Target::initialize_all(
-        &inkwell::targets::InitializationConfig::default(),
-    );
-    let triple = inkwell::targets::TargetMachine::get_default_triple();
-    let target = inkwell::targets::Target::from_triple(&triple)
-        .map_err(|e| e.to_string())?;
-    let machine = target
-        .create_target_machine(
-            &triple,
-            "generic",
-            "",
-            inkwell::OptimizationLevel::Default,
-            inkwell::targets::RelocMode::Default,
-            inkwell::targets::CodeModel::Default,
-        )
-        .ok_or("failed to create target machine")?;
+    let machine = target_machine(opt)?;
+    if opt == OptLevel::Release {
+        cg.optimize_for_release(&machine)?;
+    }
     machine
         .write_to_file(&cg.module, inkwell::targets::FileType::Object, obj_path)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Target machine for object emission (also hands target info to the
+/// release pass pipeline). Factored out so `--emit-llvm --release` can run
+/// the same passes before dumping IR.
+pub fn target_machine(
+    opt: OptLevel,
+) -> Result<inkwell::targets::TargetMachine, String> {
+    inkwell::targets::Target::initialize_all(
+        &inkwell::targets::InitializationConfig::default(),
+    );
+    let triple = inkwell::targets::TargetMachine::get_default_triple();
+    let target =
+        inkwell::targets::Target::from_triple(&triple).map_err(|e| e.to_string())?;
+    target
+        .create_target_machine(
+            &triple,
+            "generic",
+            "",
+            opt.machine_level(),
+            inkwell::targets::RelocMode::Default,
+            inkwell::targets::CodeModel::Default,
+        )
+        .ok_or_else(|| "failed to create target machine".to_string())
+}
+
+/// Optimization level for object emission (`holt build [--release]`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OptLevel {
+    /// No IR passes; machine `Default` — fast compiles, debuggable output.
+    Debug,
+    /// Standard O3 IR passes + `Aggressive` machine — slower compiles,
+    /// faster binaries.
+    Release,
+}
+
+impl OptLevel {
+    fn machine_level(self) -> inkwell::OptimizationLevel {
+        match self {
+            OptLevel::Debug => inkwell::OptimizationLevel::Default,
+            OptLevel::Release => inkwell::OptimizationLevel::Aggressive,
+        }
+    }
 }

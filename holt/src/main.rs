@@ -98,6 +98,10 @@ struct BuildArgs {
     #[arg(long, default_value_t = false)]
     print_ast: bool,
 
+    /// Optimized release build (O3 IR passes + aggressive codegen)
+    #[arg(long, default_value_t = false)]
+    release: bool,
+
     /// Only print errors and program stdout (no status lines or progress bar)
     #[arg(long, default_value_t = false)]
     quiet: bool,
@@ -124,6 +128,10 @@ struct RunArgs {
     /// Print AST for debugging
     #[arg(long, default_value_t = false)]
     print_ast: bool,
+
+    /// Optimized release build (O3 IR passes + aggressive codegen)
+    #[arg(long, default_value_t = false)]
+    release: bool,
 
     /// Only print errors and program stdout (no status lines or progress bar)
     #[arg(long, default_value_t = false)]
@@ -180,6 +188,7 @@ struct CompileOptions<'a> {
     emit_llvm_file: Option<&'a Path>,
     keep_obj: bool,
     print_ast: bool,
+    release: bool,
     quiet: bool,
     force_color: bool,
     verbose: bool,
@@ -323,6 +332,7 @@ fn run_build(args: BuildArgs) -> miette::Result<()> {
         emit_llvm_file: args.emit_llvm_file.as_deref(),
         keep_obj: args.keep_obj,
         print_ast: args.print_ast,
+        release: args.release,
         quiet: args.quiet,
         force_color: args.color,
         verbose: args.verbose,
@@ -340,6 +350,7 @@ fn run_check(args: CheckArgs) -> miette::Result<()> {
         emit_llvm_file: None,
         keep_obj: true,
         print_ast: args.print_ast,
+        release: false,
         quiet: args.quiet,
         force_color: args.color,
         verbose: args.verbose,
@@ -370,6 +381,7 @@ fn run_run(args: RunArgs) -> miette::Result<()> {
         emit_llvm_file: None,
         keep_obj: args.keep_obj,
         print_ast: args.print_ast,
+        release: args.release,
         quiet: args.quiet,
         force_color: args.color,
         verbose: args.verbose,
@@ -587,12 +599,18 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
         &format!("in {}", seconds(t_check.elapsed())),
     );
 
+    let opt = if opts.release {
+        compiler::codegen::OptLevel::Release
+    } else {
+        compiler::codegen::OptLevel::Debug
+    };
+
         // ── Codegen ──────────────────────────────────────────────────────
     if opts.emit_llvm {
         pb.set_message("Generating LLVM IR");
         status(&pb, quiet, "Generating", "LLVM IR");
         let t_ir = Instant::now();
-        let ir = match generate_ir_string(&program) {
+        let ir = match generate_ir_string(&program, opt) {
             Ok(ir) => ir,
             Err(e) => {
                 pb.abandon();
@@ -622,9 +640,10 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
     let obj_path = obj_path_for_exe(&exe_path);
 
     pb.set_message(format!("Compiling {}", obj_path.display()));
-    status(&pb, quiet, "Compiling", &gpath(&obj_path).to_string());
+    let build_kind = if opts.release { "release" } else { "debug" };
+    status(&pb, quiet, "Compiling", &format!("{} ({build_kind})", gpath(&obj_path)));
     let t_cg = Instant::now();
-    if let Err(e) = codegen_to_object(&program, &obj_path, &filename, &source) {
+    if let Err(e) = codegen_to_object(&program, &obj_path, &filename, &source, opt) {
         pb.abandon();
         return Err(e);
     }
@@ -679,6 +698,7 @@ fn compile(opts: CompileOptions<'_>) -> miette::Result<Option<PathBuf>> {
 
 fn generate_ir_string(
     program: &compiler::ast::Program,
+    opt: compiler::codegen::OptLevel,
 ) -> miette::Result<String> {
     use inkwell::context::Context;
     let ctx = Context::create();
@@ -691,6 +711,12 @@ fn generate_ir_string(
             e.span.end
         )
     })?;
+    if opt == compiler::codegen::OptLevel::Release {
+        let machine = compiler::codegen::target_machine(opt)
+            .map_err(|e| miette::miette!("failed to create target machine: {e}"))?;
+        cg.optimize_for_release(&machine)
+            .map_err(|e| miette::miette!("release passes failed: {e}"))?;
+    }
     Ok(cg.get_module_ir())
 }
 
@@ -699,8 +725,9 @@ fn codegen_to_object(
     obj_path: &Path,
     filename: &str,
     source: &str,
+    opt: compiler::codegen::OptLevel,
 ) -> miette::Result<()> {
-    if let Err(msg) = compiler::codegen::compile_to_object(program, obj_path) {
+    if let Err(msg) = compiler::codegen::compile_to_object(program, obj_path, opt) {
         let diag = compiler::error::SingleDiagnostic::new(
             filename.to_string(),
             source.to_string(),

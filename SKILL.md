@@ -39,7 +39,7 @@ When asked to implement any part of the compiler:
    - Semantic checks (`compiler/src/sema/mod.rs` — `resolve_type`, `check_expr`/`check_stmt`, `ClassInfo{operators, conversions}`, merging `prop_map` for separate accessors, `open`-on-method rejection)
    - `inkwell` lowering (`compiler/src/codegen/mod.rs` — `llvm_ty_for`/`llvm_ty_for_sema`, `declare_*`/`codegen_*`, `class_operators` dispatch, `closure_count`/`holt.init`/`strcat`/`sprintf`)
 5. Prefer a compilable, testable increment over a complete but unrunnable design.
-6. Emit via `holt build <file>` (single progress bar + brand-green status lines) or `cargo run -p compiler` legacy, then object `TargetMachine` + `clang` link to a proper binary (extension stripped). Always `module.verify()` before emission.
+6. Emit via `holt build <file>` (single progress bar + brand-green status lines, `--release` for O3 + aggressive codegen via `Codegen::optimize_for_release`) or `cargo run -p compiler` legacy, then object `TargetMachine` + `clang` link to a proper binary (extension stripped). Always `module.verify()` before emission.
 7. Update `examples/*.hlt` to exercise the new production and `references/ebnf-0.1.txt` if grammar changed.
 
 ## Architecture Snapshot (actual workspace as of Phase 5 DONE)
