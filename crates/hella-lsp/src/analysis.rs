@@ -245,6 +245,40 @@ fn collect_item(&mut self, item: &Item) {
                     );
                     self.collect_block_locals(&m.body, m.span, &m.params);
                 }
+                for p in &c.properties {
+                    let ty = p
+                        .ty
+                        .as_ref()
+                        .map(|t| t.name())
+                        .unwrap_or_else(|| "any".to_string());
+                    children.push(
+                        make_symbol(
+                            &p.name,
+                            SymKind::Property,
+                            p.name_span,
+                            p.span,
+                            format!("{ty} {} (property)", p.name),
+                            Vec::new(),
+                        )
+                        .with_ty(&ty),
+                    );
+                    // Accessor bodies see the property scope; the setter
+                    // parameter is in scope for its body.
+                    if let Some(g) = &p.getter {
+                        self.collect_block(g, p.span);
+                    }
+                    if let Some((param, body)) = &p.setter {
+                        self.collect_params(std::slice::from_ref(param), p.span);
+                        self.collect_block(body, p.span);
+                    }
+                }
+                // First constructor's parameters drive the call snippet on
+                // the class name (`Rect(${1:int w})$0`).
+                let ctor_params = c
+                    .constructors
+                    .first()
+                    .map(|k| param_pairs(&k.params))
+                    .unwrap_or_default();
                 let sym = make_symbol(
                     &c.name,
                     SymKind::Class,
@@ -252,7 +286,8 @@ fn collect_item(&mut self, item: &Item) {
                     c.span,
                     format!("class {}", c.name),
                     children,
-                );
+                )
+                .with_params(&ctor_params);
                 self.push_top(sym, c.name_span);
             }
             Item::Enum(e) => {
@@ -358,8 +393,36 @@ Item::Trait(t) => {
             Item::Extern(e) => {
                 for m in &e.members {
                     match m {
-                        ast::ExternMember::Function { name, name_span, span, .. }
-                        | ast::ExternMember::Struct { name, name_span, span, .. }
+                        ast::ExternMember::Function {
+                            name,
+                            name_span,
+                            span,
+                            params,
+                            ..
+                        } => {
+                            let pairs: Vec<(String, String)> = params
+                                .iter()
+                                .map(|p| {
+                                    if p.is_variadic && p.name.is_empty() {
+                                        // bare C varargs `...`
+                                        ("...".to_string(), String::new())
+                                    } else {
+                                        (p.name.clone(), p.ty.name())
+                                    }
+                                })
+                                .collect();
+                            let sym = make_symbol(
+                                name,
+                                SymKind::Function,
+                                *name_span,
+                                *span,
+                                format!("extern {}", name),
+                                Vec::new(),
+                            )
+                            .with_params(&pairs);
+                            self.push_top(sym, *name_span);
+                        }
+                        ast::ExternMember::Struct { name, name_span, span, .. }
                         | ast::ExternMember::Enum { name, name_span, span, .. }
                         | ast::ExternMember::Const { name, name_span, span, .. } => {
                             let sym = make_symbol(
@@ -787,34 +850,48 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
         hella_compiler::parse::parse(out.tokens, text.to_string()).ok()
     }
 
-    /// Tolerant parse chain: as-is → balanced unclosed blocks → dummy member
-    /// ident (each on the raw and balanced variants). Offsets are preserved:
-    /// balancing only appends at EOF and the dummy replaces text at the
-    /// cursor.
+    /// Tolerant parse chain for mid-typing buffers. Tries, in order: the
+    /// source as-is; balanced unclosed blocks; dummy identifiers completing
+    /// every line-final dangling dot (`return this.` → `this.__hella_complete`)
+    /// and the member access at the cursor — each on the raw and balanced
+    /// variants. Offsets are preserved (balancing appends at EOF; dummies
+    /// remap the query offset), so the returned analysis lines up with the
+    /// query position.
     fn parse_for_completion(
         source: &str,
         offset: usize,
     ) -> Option<(ast::Program, String, usize)> {
-        if let Some(p) = Self::parsed(source) {
-            return Some((p, source.to_string(), offset));
-        }
+        let mut candidates: Vec<(String, usize)> = vec![(source.to_string(), offset)];
         let balanced = balance_ends(source);
-        let have_balanced = balanced != source;
-        if have_balanced {
-            if let Some(p) = Self::parsed(&balanced) {
-                return Some((p, balanced, offset));
+        if balanced != source {
+            candidates.push((balanced.clone(), offset));
+        }
+        // Repairs that need the cursor, applied to each base (deduped).
+        let mut extra: Vec<(String, usize)> = Vec::new();
+        for (text, adj) in candidates.clone() {
+            if let Some((t, a)) = global_dot_dummy(&text, adj) {
+                extra.push((t, a));
+            }
+            if let Some((t, a)) = dummy_completion_source(&text, adj) {
+                extra.push((t, a));
             }
         }
-        if let Some((text, adjusted)) = dummy_completion_source(source, offset) {
-            if let Some(p) = Self::parsed(&text) {
-                return Some((p, text, adjusted));
+        // Combined: buffer-wide dots first, then the cursor access.
+        for (text, adj) in extra.clone() {
+            if let Some((t, a)) = dummy_completion_source(&text, adj) {
+                extra.push((t, a));
             }
         }
-        if have_balanced {
-            if let Some((text, adjusted)) = dummy_completion_source(&balanced, offset) {
-                if let Some(p) = Self::parsed(&text) {
-                    return Some((p, text, adjusted));
-                }
+        candidates.extend(extra);
+        // Parse each distinct text once (repairs often converge).
+        let mut seen: Vec<&str> = Vec::new();
+        for (text, adjusted) in &candidates {
+            if seen.contains(&text.as_str()) {
+                continue;
+            }
+            seen.push(text.as_str());
+            if let Some(p) = Self::parsed(text) {
+                return Some((p, text.clone(), *adjusted));
             }
         }
         None
@@ -1181,7 +1258,12 @@ fn symbol_item(sym: &Symbol, tier: u8, snippets: bool) -> CompletionItem {
         sort_text: Some(format!("{tier}_{}", sym.name)),
         ..Default::default()
     };
-    if snippets && matches!(sym.kind, SymKind::Function | SymKind::Method) {
+    // Functions/methods always snippet to calls; types snippet only when
+    // they carry constructor parameters (`Rect(${1:int w})$0`). Properties
+    // complete as plain names (`c.count`, never `c.count()`).
+    if snippets
+        && (matches!(sym.kind, SymKind::Function | SymKind::Method) || !sym.params.is_empty())
+    {
         item.insert_text = Some(call_snippet(&sym.name, &sym.params));
         item.insert_text_format = Some(InsertTextFormat::SNIPPET);
     }
@@ -1225,6 +1307,46 @@ fn keyword_item(kw: &str, snippets: bool) -> CompletionItem {
     }
 }
 
+/// Dummy identifier used to repair incomplete member access for parsing.
+const COMPLETE_DUMMY: &str = "__hella_complete";
+
+/// Repair every line-final dangling dot in the buffer (`return this.` →
+/// `return this.__hella_complete`), so one half-typed access doesn't sink
+/// completion elsewhere in the file. Insertions inside strings/comments are
+/// harmless (they stay inside the literal). Returns the new source and the
+/// remapped query offset.
+fn global_dot_dummy(source: &str, offset: usize) -> Option<(String, usize)> {
+    let mut result = String::with_capacity(source.len() + 32);
+    let mut last = 0;
+    let mut pos = 0; // byte offset of the current line start
+    let mut adjusted = offset;
+    let mut any = false;
+    for line in source.split_inclusive('\n') {
+        let line_end = pos + line.len();
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let body = body.strip_suffix('\r').unwrap_or(body);
+        let stripped = body.trim_end_matches([' ', '\t']);
+        if stripped.ends_with('.') && !stripped.ends_with("..") {
+            // Byte index of the dot: `stripped` ends with ASCII `.`.
+            let dot = pos + stripped.len() - 1;
+            let insert_at = dot + 1;
+            result.push_str(&source[last..insert_at]);
+            result.push_str(COMPLETE_DUMMY);
+            last = insert_at;
+            if insert_at < offset {
+                adjusted += COMPLETE_DUMMY.len();
+            }
+            any = true;
+        }
+        pos = line_end;
+    }
+    if !any {
+        return None;
+    }
+    result.push_str(&source[last..]);
+    Some((result, adjusted))
+}
+
 /// Retry source for incomplete member access: replaces the partial member
 /// name (or inserts) at the cursor with a dummy identifier so the buffer
 /// parses (`return p.fo|` → `return p.__hella_complete`). Returns the new
@@ -1241,10 +1363,9 @@ fn dummy_completion_source(source: &str, offset: usize) -> Option<(String, usize
     if lo == 0 || bytes[lo - 1] != b'.' {
         return None;
     }
-    const DUMMY: &str = "__hella_complete";
-    let mut text = String::with_capacity(source.len() + DUMMY.len());
+    let mut text = String::with_capacity(source.len() + COMPLETE_DUMMY.len());
     text.push_str(&source[..lo]);
-    text.push_str(DUMMY);
+    text.push_str(COMPLETE_DUMMY);
     text.push_str(&source[offset..]);
     Some((text, lo))
 }
@@ -1777,6 +1898,57 @@ mod tests {
         let items3 = Analysis::complete_with_path(src3, Some(&main), off3, false);
         assert_eq!(labels(&items3), vec!["r"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_property_members() {
+        let src = "class Counter has\n  private int _count\n  int count get do\n    return this._count\n  end\n  int count set(int v) do\n    this._count = v\n  end\nend";
+        let off = src.find("this._count").unwrap() + 5;
+        let items = Analysis::complete(src, off, true);
+        let names = labels(&items);
+        assert!(names.contains(&"_count"), "fields: {names:?}");
+        assert!(names.contains(&"count"), "properties: {names:?}");
+        // properties complete as plain names — never call snippets
+        let prop = items.iter().find(|i| i.label == "count").unwrap();
+        assert!(prop.insert_text.is_none(), "no parens on properties");
+    }
+
+    #[test]
+    fn completion_constructor_snippet() {
+        let src = "class Rect has\n  public int w\n  Rect(int w) initialize\nend\nvoid main() do\n  Re\nend";
+        let off = src.find("\n  Re").unwrap() + 4;
+        let items = Analysis::complete(src, off, true);
+        let rect = items.iter().find(|i| i.label == "Rect").unwrap();
+        assert_eq!(
+            rect.insert_text.as_deref(),
+            Some("Rect(${1:int w})$0"),
+            "ctor call snippet"
+        );
+        // structs (struct-literal init, no call syntax) get no snippet
+        let src2 = "struct Point has\n  int x\nend\nvoid main() do\n  Po\nend";
+        let off2 = src2.find("\n  Po").unwrap() + 4;
+        let items2 = Analysis::complete(src2, off2, true);
+        let point = items2.iter().find(|i| i.label == "Point").unwrap();
+        assert!(point.insert_text.is_none());
+    }
+
+    #[test]
+    fn completion_ctor_name_global() {
+        let src = "class Counter has\n    private int _count\n    int count get do\n        return this._count\n    end\n    int count set(int v) do\n        this._count = v\n    end\n    Counter(int c) initialize\nend\nvoid main() do\n    Counter\nend\n";
+        // sanity: it parses
+        let out = hella_compiler::lexer::lex(src);
+        assert!(out.errors.is_empty());
+        let prog = hella_compiler::parse::parse(out.tokens, src.to_string()).unwrap();
+        let a = Analysis::from_program(&prog);
+        assert!(a.top_symbols().iter().any(|s| s.name == "Counter"));
+        let off = src.find("\n    Counter\n").unwrap() + 12;
+        assert_eq!(&src[off - 7..off], "Counter");
+        let items = Analysis::complete(src, off, true);
+        assert!(
+            items.iter().any(|i| i.label == "Counter"),
+            "class name completes: {:?}",
+            labels(&items)
+        );
     }
 
     #[test]
