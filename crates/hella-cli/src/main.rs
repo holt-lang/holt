@@ -74,6 +74,8 @@ enum Commands {
     Setup(SetupArgs),
     /// Create a new Hella project (binary by default, `--lib` for a library)
     New(NewArgs),
+    /// Format Hella source files (canonical style, in place)
+    Fmt(FmtArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -180,6 +182,17 @@ struct SetupArgs {
 }
 
 #[derive(Parser, Debug)]
+struct FmtArgs {
+    /// Files or directories to format (directories recurse for `.hll`
+    /// files; defaults to the current directory)
+    paths: Vec<PathBuf>,
+
+    /// Report files that would change without modifying them
+    #[arg(long, default_value_t = false)]
+    check: bool,
+}
+
+#[derive(Parser, Debug)]
 struct CheckArgs {
     /// Source file (.hll) to check (default: project `src/main.hll` or `src/lib.hll`)
     file: Option<PathBuf>,
@@ -234,6 +247,7 @@ fn main() -> miette::Result<()> {
         Commands::Lsp => std::process::exit(hella_lsp::server::run()),
         Commands::Setup(args) => run_setup(args),
         Commands::New(args) => run_new(args),
+        Commands::Fmt(args) => run_fmt(args),
     }
 }
 
@@ -485,6 +499,89 @@ fn run_new(args: NewArgs) -> miette::Result<()> {
         brand("Next"),
         args.path.display(),
         if args.lib { "hella check" } else { "hella run" }
+    );
+    Ok(())
+}
+
+/// Format Hella source files in place (`hella fmt [paths...]`).
+///
+/// Accepts individual `.hll` files and directories (recursed for `.hll`
+/// files). Formatting is deterministic and idempotent; with `--check` files
+/// that would change are reported without modification and the process
+/// exits non-zero when any file is unformatted.
+fn run_fmt(args: FmtArgs) -> miette::Result<()> {
+    let roots: Vec<PathBuf> = if args.paths.is_empty() {
+        vec![PathBuf::from(".")]
+    } else {
+        args.paths.clone()
+    };
+    for root in &roots {
+        if !root.exists() {
+            return Err(miette::miette!("no such file or directory: {}", root.display()));
+        }
+    }
+    let files = hella_fmt::collect_sources(&roots);
+    if files.is_empty() {
+        // An explicit single file that is not `.hll` is almost certainly a
+        // user mistake — say so instead of silently doing nothing.
+        if roots.len() == 1 && roots[0].is_file() {
+            return Err(miette::miette!(
+                "not a Hella source file: {} (expected `.hll`)",
+                roots[0].display()
+            ));
+        }
+        eprintln!("{:>11} no .hll files found", brand("Fmt"));
+        return Ok(());
+    }
+    let mut changed = 0usize;
+    let mut failed = 0usize;
+    for path in &files {
+        let source = fs::read_to_string(path)
+            .map_err(|e| miette::miette!("failed to read {}: {e}", path.display()))?;
+        match hella_fmt::format_source(&source) {
+            Ok(formatted) => {
+                if formatted != source {
+                    changed += 1;
+                    if args.check {
+                        println!("{}", path.display());
+                    } else {
+                        fs::write(path, formatted).map_err(|e| {
+                            miette::miette!("failed to write {}: {e}", path.display())
+                        })?;
+                        eprintln!("{:>11} {}", brand("Formatted"), path.display());
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                let diag = hella_compiler::error::SingleDiagnostic::new(
+                    path.display().to_string(),
+                    source.clone(),
+                    e.span.unwrap_or(hella_compiler::token::Span::new(0, 0)),
+                    e.message.clone(),
+                );
+                eprintln!("{:?}", Report::new(diag));
+            }
+        }
+    }
+    if args.check {
+        if failed > 0 {
+            return Err(miette::miette!("{failed} file(s) failed to parse"));
+        }
+        if changed > 0 {
+            return Err(miette::miette!("{changed} file(s) would be reformatted"));
+        }
+        eprintln!("{:>11} {} file(s) already formatted", brand("Checked"), files.len());
+        return Ok(());
+    }
+    if failed > 0 {
+        return Err(miette::miette!("{failed} file(s) failed to format"));
+    }
+    eprintln!(
+        "{:>11} {} file(s), {} reformatted",
+        brand("Finished"),
+        files.len(),
+        changed,
     );
     Ok(())
 }

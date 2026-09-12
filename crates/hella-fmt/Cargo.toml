@@ -1,0 +1,7 @@
+[package]
+name = "hella-fmt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hella-compiler = { path = "../hella-compiler" }

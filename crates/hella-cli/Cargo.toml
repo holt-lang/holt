@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 hella-compiler = { path = "../hella-compiler" }
+hella-fmt = { path = "../hella-fmt" }
 hella-lsp = { path = "../hella-lsp" }
 clap = { version = "4", features = ["derive"] }
 anstyle = "1"

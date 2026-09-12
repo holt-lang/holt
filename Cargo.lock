@@ -294,6 +294,7 @@ dependencies = [
  "clap",
  "console",
  "hella-compiler",
+ "hella-fmt",
  "hella-lsp",
  "indicatif",
  "inkwell",
@@ -309,6 +310,13 @@ dependencies = [
  "logos",
  "miette",
  "thiserror",
+]
+
+[[package]]
+name = "hella-fmt"
+version = "0.1.0"
+dependencies = [
+ "hella-compiler",
 ]
 
 [[package]]
