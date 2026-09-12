@@ -1,19 +1,25 @@
 //! Embeds the `stdlib/` sources into the `hella` binary so `hella setup` can
 //! install them to `~/.hella/lib` on machines without a repo checkout.
-//! The file list is generated (sorted `**/*.hll` under `../stdlib`), so
-//! adding a module needs no build-script change.
+//! The file list is generated (sorted `**/*.hll` under `../../stdlib`),
+//! so adding a module needs no build-script change.
 
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-changed=../stdlib");
+    println!("cargo:rerun-if-changed=../../stdlib");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let stdlib = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-        .join("../stdlib");
+        .join("../../stdlib");
 
     let mut rels: Vec<String> = Vec::new();
     collect_hll(&stdlib, &stdlib, &mut rels);
     rels.sort();
+    if rels.is_empty() {
+        println!(
+            "cargo:warning=stdlib not found at {} — `hella setup` will install nothing",
+            stdlib.display()
+        );
+    }
 
     let mut out = String::from(
         "/// Embedded standard-library sources: `(relative path, contents)`.\n\
@@ -22,7 +28,7 @@ fn main() {
     );
     for rel in &rels {
         out.push_str(&format!(
-            "    ({rel:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../stdlib/{rel}\"))),\n"
+            "    ({rel:?}, include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../stdlib/{rel}\"))),\n"
         ));
     }
     out.push_str("];\n");
