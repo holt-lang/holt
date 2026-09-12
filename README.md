@@ -1,4 +1,6 @@
-# Hella
+<div align="center">
+    <img src="assets/main-1.png" style="height: 230px"/>
+</div>
 
 Hella is a small, statically-typed programming language with a compiler written in Rust that produces native binaries via LLVM.
 
@@ -10,7 +12,7 @@ void main() do
 end
 ```
 
-No curly braces, no `let` — blocks are `do … end` and declarations are type-first (`int x = 1`).
+No curly braces, no `let`; blocks are `do … end` and declarations are type-first (`int x = 1`).
 
 ## Quick start
 
@@ -88,7 +90,7 @@ cargo run -p hella -- build examples/basics.hll && ./examples/basics; echo $?
 | `advanced.hll` | Generics, closures, interpolation, operators, `extern`, `distinct` |
 | `variadic.hll` | Variadic functions (`...`) |
 
-The exit code of each example is its answer — `basics` exits with `230`, `abstraction` with `233`, and so on.
+The exit code of each example is its answer; `basics` exits with `230`, `abstraction` with `233`, and so on.
 
 ## Project layout
 
@@ -111,4 +113,8 @@ The grammar in `references/ebnf-0.1.txt` is authoritative. Also see `references/
 
 ## Status
 
-The core language (phases 0–5) compiles to native code: structs, classes, traits, enums, pattern matching, generics, closures, string interpolation, and C interop all work end to end. The gap list in `SKILL.md` tracks what remains.
+The core language (phases 0-5) compiles to native code: structs, classes, traits, enums, pattern matching, generics, closures, string interpolation, and C interop all work end to end. The gap list in `SKILL.md` tracks what remains.
+
+## License
+
+Apache-2.0 ... see [`LICENSE`](/LICENSE).
