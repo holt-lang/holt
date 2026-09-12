@@ -1,5 +1,5 @@
-<div align="center">
-    <img src="assets/main-1.png" style="height: 230px"/>
+<div align="center" style="height: 230px;">
+    <img src="assets/main-1.png" style="object-fit: cover"/>
 </div>
 
 Hella is a small, statically-typed programming language with a compiler written in Rust that produces native binaries via LLVM.
