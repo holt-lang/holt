@@ -1,23 +1,23 @@
-# Holt Type System
+# Hella Type System
 
 ## Purpose
 
-This document defines Holt's type-system architecture and the boundary between:
+This document defines Hella's type-system architecture and the boundary between:
 
-* types provided by the Holt standard library, and
+* types provided by the Hella standard library, and
 * language-level type forms and syntax understood directly by the compiler.
 
-The Holt standard library is distributed alongside the Holt compiler.
+The Hella standard library is distributed alongside the Hella compiler.
 
 Fundamental types are standard-library types. They are **not user-facing compiler keywords** and do not require explicit imports.
 
-Collection type forms that are intrinsic to Holt's type syntax remain compiler constructs.
+Collection type forms that are intrinsic to Hella's type syntax remain compiler constructs.
 
 ---
 
 # 1. Fundamental Types
 
-The following are fundamental Holt types provided by the standard library:
+The following are fundamental Hella types provided by the standard library:
 
 ```text
 bool
@@ -43,11 +43,11 @@ double
 
 These names must **not** be implemented as compiler keywords.
 
-They are standard-library definitions that the compiler automatically makes available to every Holt source file.
+They are standard-library definitions that the compiler automatically makes available to every Hella source file.
 
 For example:
 
-```holt
+```hella
 int age = 25
 string name = "John"
 bool active = true
@@ -65,7 +65,7 @@ From the programmer's perspective, these are standard-library types.
 
 # 2. Integer Types
 
-Holt provides the following signed integer types:
+Hella provides the following signed integer types:
 
 ```text
 i8
@@ -104,7 +104,7 @@ The compiler may use platform-specific representations for these types.
 
 # 3. Floating-Point Types
 
-Holt provides two floating-point types:
+Hella provides two floating-point types:
 
 ```text
 float
@@ -118,7 +118,7 @@ float  → f32
 double → f64
 ```
 
-`f32` and `f64` are not the user-facing Holt type names.
+`f32` and `f64` are not the user-facing Hella type names.
 
 ---
 
@@ -132,7 +132,7 @@ bool
 
 Example:
 
-```holt
+```hella
 bool enabled = true
 bool finished = false
 ```
@@ -151,7 +151,7 @@ string
 
 Example:
 
-```holt
+```hella
 string name = "John"
 ```
 
@@ -163,7 +163,7 @@ The standard library provides the relevant string operations and methods.
 
 # 6. Compiler Keywords vs Standard-Library Types
 
-Holt must maintain a strict distinction between **types** and **language-level type forms**.
+Hella must maintain a strict distinction between **types** and **language-level type forms**.
 
 ## Standard-library types
 
@@ -191,7 +191,7 @@ float
 double
 ```
 
-These are ordinary Holt type names.
+These are ordinary Hella type names.
 
 They must not be reserved as compiler keywords.
 
@@ -206,7 +206,7 @@ arr
 vec
 ```
 
-These are part of Holt's type grammar and are understood directly by the compiler.
+These are part of Hella's type grammar and are understood directly by the compiler.
 
 Maps are **not** represented by a `map` keyword.
 
@@ -226,7 +226,7 @@ When an array is initialized with an array literal, its size is inferred from th
 
 Example:
 
-```holt
+```hella
 int arr numbers = [1, 2, 3, 4]
 ```
 
@@ -234,7 +234,7 @@ This creates an array of four integers.
 
 A string array:
 
-```holt
+```hella
 string arr names = ["John", "Jane", "Abbas"]
 ```
 
@@ -244,7 +244,7 @@ creates an array of three strings.
 
 An array may specify its size explicitly:
 
-```holt
+```hella
 int arr[5] numbers
 ```
 
@@ -276,7 +276,7 @@ TYPE arr[SIZE] variable
 
 Examples:
 
-```holt
+```hella
 int arr numbers = [1, 2, 3, 4]
 
 int arr[5] numbers
@@ -300,7 +300,7 @@ The element type precedes `vec`.
 
 Example:
 
-```holt
+```hella
 int vec numbers = [1, 2, 3, 4]
 ```
 
@@ -316,7 +316,7 @@ The standard library provides the vector implementation and its methods, while t
 
 An empty vector may be created using:
 
-```holt
+```hella
 any names = vec[]
 ```
 
@@ -326,7 +326,7 @@ The first compatible insertion establishes its element type.
 
 Example:
 
-```holt
+```hella
 any names = vec[]
 
 names.push("John")
@@ -350,7 +350,7 @@ element type remains fixed
 
 Another example:
 
-```holt
+```hella
 any values = vec[]
 
 values.push(42)
@@ -361,7 +361,7 @@ creates an integer vector.
 
 The following is invalid:
 
-```holt
+```hella
 any values = vec[]
 
 values.push(42)
@@ -380,7 +380,7 @@ It does **not** mean that the vector becomes a permanently heterogeneous collect
 
 For example:
 
-```holt
+```hella
 any values = vec[]
 
 values.push(42)
@@ -400,7 +400,7 @@ The language-level rule is that the element type becomes fixed after it is estab
 
 # 12. Maps
 
-Holt does **not** have a `map` keyword.
+Hella does **not** have a `map` keyword.
 
 Map types are expressed using the `TYPE:TYPE` syntax:
 
@@ -414,7 +414,7 @@ The type after `:` is the value type.
 
 For example:
 
-```holt
+```hella
 string:int ages
 ```
 
@@ -422,7 +422,7 @@ represents a map from `string` keys to `int` values.
 
 Another example:
 
-```holt
+```hella
 string:bool admins
 ```
 
@@ -438,7 +438,7 @@ Map literals use the `has ... end` construction syntax.
 
 A multiline map:
 
-```holt
+```hella
 string:int ages = has
     "John": 25
     "Jane": 30
@@ -447,7 +447,7 @@ end
 
 A compact map:
 
-```holt
+```hella
 string:bool admins = has "John": false, "Jane": true end
 ```
 
@@ -463,7 +463,7 @@ The value must be compatible with the map's value type.
 
 For example:
 
-```holt
+```hella
 string:int ages = has
     "John": 25
     "Jane": 30
@@ -522,7 +522,7 @@ map    → associative key/value collection
 
 Slices may reference compatible contiguous storage such as arrays or vectors.
 
-The compiler must enforce the type and lifetime rules required by Holt's memory-management model.
+The compiler must enforce the type and lifetime rules required by Hella's memory-management model.
 
 The standard library provides relevant slice operations and methods.
 
@@ -530,7 +530,7 @@ The standard library provides relevant slice operations and methods.
 
 # 16. Standard-Library Responsibility
 
-All fundamental Holt types are defined by the standard library:
+All fundamental Hella types are defined by the standard library:
 
 ```text
 bool
@@ -565,7 +565,7 @@ The compiler may provide intrinsic implementation support where necessary for:
 * LLVM lowering;
 * memory operations;
 * runtime integration;
-* other operations that cannot reasonably be implemented entirely in Holt.
+* other operations that cannot reasonably be implemented entirely in Hella.
 
 Compiler support does not make these types compiler keywords.
 
@@ -573,11 +573,11 @@ Compiler support does not make these types compiler keywords.
 
 # 17. Automatic Availability
 
-The fundamental standard-library types are part of Holt's implicit initial type environment.
+The fundamental standard-library types are part of Hella's implicit initial type environment.
 
 A source file must be able to use:
 
-```holt
+```hella
 int
 uint
 i32
@@ -592,7 +592,7 @@ without importing anything.
 
 For example:
 
-```holt
+```hella
 int main() {
     string message = "Hello"
     bool valid = true
@@ -607,7 +607,7 @@ This automatic availability applies to the designated fundamental types.
 
 It does not imply that every standard-library type or module is automatically imported.
 
-Other standard-library facilities may require explicit imports according to Holt's module system.
+Other standard-library facilities may require explicit imports according to Hella's module system.
 
 ---
 
@@ -664,7 +664,7 @@ KEY_TYPE:VALUE_TYPE
 
 Examples:
 
-```holt
+```hella
 int arr numbers = [1, 2, 3]
 
 int arr[5] numbers
@@ -689,7 +689,7 @@ Map types are expressed through the `TYPE:TYPE` syntax.
 
 # 20. Design Principle
 
-Holt should avoid unnecessary compiler magic in its user-facing type system.
+Hella should avoid unnecessary compiler magic in its user-facing type system.
 
 The guiding rule is:
 
@@ -716,13 +716,13 @@ The standard library remains responsible for the actual implementations and APIs
 
 The compiler remains responsible for the language syntax and semantics that cannot simply be represented as ordinary library declarations.
 
-The standard library and compiler are distributed together, so fundamental types feel like built-in parts of Holt to the programmer while remaining architecturally separated from the compiler's language keywords.
+The standard library and compiler are distributed together, so fundamental types feel like built-in parts of Hella to the programmer while remaining architecturally separated from the compiler's language keywords.
 
 ---
 
 # 21. Collection and String Methods
 
-The compiler validates and lowers these methods directly (they operate on compiler-managed storage that Holt source cannot address):
+The compiler validates and lowers these methods directly (they operate on compiler-managed storage that Hella source cannot address):
 
 ```text
 vectors: len(), is_empty(), push(x), pop(), clear(),
@@ -754,7 +754,7 @@ code, user functions may not be named `strlen`, `strcmp`, `abort`,
 
 `for` binds one variable by default and optionally a second:
 
-```holt
+```hella
 for name in names do
     println(name)
 end
@@ -769,7 +769,7 @@ Over arrays, vectors, and strings the second variable is the `int`
 index. Over maps the first variable binds keys and the second binds
 values:
 
-```holt
+```hella
 string:int users = has
     "John": 1
     "Jane": 2

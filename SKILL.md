@@ -1,87 +1,90 @@
 ---
-name: holt-compiler
-description: Build or extend a compiler for the Holt programming language in Rust with an LLVM backend (inkwell). Use when the user asks to implement, design, parse, typecheck, or codegen any part of Holt, references the Holt EBNF or language spec, or wants phased compiler construction for this language.
+name: hella-compiler
+description: Build or extend a compiler for the Hella programming language in Rust with an LLVM backend (inkwell). Use when the user asks to implement, design, parse, typecheck, or codegen any part of Hella, references the Hella EBNF or language spec, or wants phased compiler construction for this language.
 ---
 
-# Holt Compiler (Rust + LLVM)
+# Hella Compiler (Rust + LLVM)
 
-Guide LLMs building a compiler for **Holt** (draft 0.2 EBNF) using Rust and `inkwell`. Workspace is `holo-rs` with two crates: `holt` (main `holt build` CLI + progress) and `compiler` (library + legacy `holtc` bin).
+Guide LLMs building a compiler for **Hella** (draft 0.2 EBNF) using Rust and `inkwell`. Workspace `hella` has three crates under `crates/`: `hella-cli` (the `hella build` CLI + progress), `hella-compiler` (library: lexer, parser, sema, codegen), and `hella-lsp` (language server).
 
 ## Core Principles
 
-1. **Phase, do not boil the ocean.** Full Holt (classes, traits, generics, match, defer, FFI, interpolation, …) is large. Always implement a working subset that emits native code before expanding. Phases 0–5 are DONE (`references/phases.md`) but many EBNF productions remain stubs — consult the Audit Gap Matrix before claiming 100%.
+1. **Phase, do not boil the ocean.** Full Hella (classes, traits, generics, match, defer, FFI, interpolation, …) is large. Always implement a working subset that emits native code before expanding. Phases 0–5 are DONE (`references/phases.md`) but many EBNF productions remain stubs — consult the Audit Gap Matrix before claiming 100%.
 2. **Spec is authoritative.** The EBNF in `references/ebnf-0.1.txt` (Draft 0.2) is the source of truth for syntax. Do not invent syntax that contradicts it. Recent fixes: `get`/`set` are `public` by default and may be declared in two separate `property-declaration`s that merge; `open` is only for `class` (`open int bar()` is ill-formed); `struct-expression` allows `[type] has` with inferred `Type` for `User u2 = has … end` (not `any`).
 3. **Spans everywhere.** Every AST node and diagnostic must carry source spans from day one (`miette` + `token::Span`).
-4. **LLVM via inkwell.** Prefer `inkwell` over raw `llvm-sys`. Match the Cargo feature to the installed LLVM (`llvm-config --version` → `llvm21-1` in both `compiler/Cargo.toml:7` and `holt/Cargo.toml:12`).
-5. **Monomorphize generics early.** Do not build a full trait solver or lifetime system before a working monomorphizing backend exists. Current MVP erases `T` → `i64` / `ptr` (`compiler/src/codegen/mod.rs:596`) — `where` bounds are parsed but unchecked (`compiler/src/parse/mod.rs:1092` / `sema` ignored).
+4. **LLVM via inkwell.** Prefer `inkwell` over raw `llvm-sys`. Match the Cargo feature to the installed LLVM (`llvm-config --version` → `llvm21-1` in both `crates/hella-compiler/Cargo.toml:7` and `crates/hella-cli/Cargo.toml:12`).
+5. **Monomorphize generics early.** Do not build a full trait solver or lifetime system before a working monomorphizing backend exists. Current MVP erases `T` → `i64` / `ptr` (`crates/hella-compiler/src/codegen/mod.rs:596`) — `where` bounds are parsed but unchecked (`crates/hella-compiler/src/parse/mod.rs:1092` / `sema` ignored).
 
 ## Required Reading (check before any edit)
 
 - Full language grammar — `references/ebnf-0.1.txt` (Draft 0.2: `get`/`set` public default + separate merge, `open` class-only, optional `Type` in `has`)
 - Phased implementation plan — `references/phases.md` (Phases 0–5 DONE, but see Gap Matrix: many stubs)
 - LLVM lowering map — `references/llvm-mapping.md` (`int→i64`, `bool→i1`, `T[]→[16 x T]`, `T?→{T,bool}`, `T*→ptr`, `defer` stacks)
-- Recommended crates and project layout — `references/toolchain.md` (**OUTDATED**: still lists `chumsky 0.10`, `llvm20-1`, `ariadne`; actual is `logos 0.15` + hand Pratt `compiler/src/parse/mod.rs:1`, `miette 7`, `inkwell 0.10 llvm21-1`, workspace `holt`+`compiler`)
-- Main driver with progress — `holt/src/main.rs:1` (`holt build <file>` single `ProgressBar` + status lines in brand green #00A693)
-- Canonical examples — `examples/advanced.hlt` (distinct/extend/init/extern/where/operator/closure/interpolation), `examples/abstraction.hlt` (separate accessors, `open` class), `examples/data_control.hlt` (omitted `has`), `examples/hello_io.hlt` (`import std::io`)
-- Audit Gap Matrix — see `TodoWrite` “Holt 100% EBNF” (38 sections: 21% full, ~47% partial, 6 missing)
+- Recommended crates and project layout — `references/toolchain.md` (**OUTDATED**: still lists `chumsky 0.10`, `llvm20-1`, `ariadne`; actual is `logos 0.15` + hand Pratt `crates/hella-compiler/src/parse/mod.rs:1`, `miette 7`, `inkwell 0.10 llvm21-1`, workspace `crates/hella-cli`+`crates/hella-compiler`+`crates/hella-lsp`)
+- Main driver with progress — `crates/hella-cli/src/main.rs:1` (`hella build <file>` single `ProgressBar` + status lines in brand green #00A693)
+- Canonical examples — `examples/advanced.hll` (distinct/extend/init/extern/where/operator/closure/interpolation), `examples/abstraction.hll` (separate accessors, `open` class), `examples/data_control.hll` (omitted `has`), `examples/hello_io.hll` (`import std::io`)
+- Audit Gap Matrix — see `TodoWrite` “Hella 100% EBNF” (38 sections: 21% full, ~47% partial, 6 missing)
 
 ## Default Workflow
 
 When asked to implement any part of the compiler:
 
-1. Consult `TodoWrite` “Holt 100% EBNF” — it is the single source of truth for remaining work. Never work outside it.
+1. Consult `TodoWrite` “Hella 100% EBNF” — it is the single source of truth for remaining work. Never work outside it.
 2. Identify the smallest phase / EBNF § that contains the requested feature (see `references/phases.md` + `references/ebnf-0.1.txt`).
 3. Confirm the relevant EBNF productions and check the Gap Matrix (Token? Parse? Sema? Codegen? Example?) before touching code.
 4. Produce or extend (in order):
-   - Token / lexer (`compiler/src/token.rs` — logos, keywords before `Ident`)
-   - AST nodes (`compiler/src/ast.rs` — mirrors EBNF, `Span` on every node, `Type::__inferred__` for omitted `has`)
-   - Parser rules (`compiler/src/parse/mod.rs` — recursive-descent + Pratt `parse_assignment` → `parse_postfix` → `parse_primary`; `try_parse_struct_literal`, `parse_class_decl`, `parse_extension_decl`, `parse_var_decl` for omitted `has`)
-   - Semantic checks (`compiler/src/sema/mod.rs` — `resolve_type`, `check_expr`/`check_stmt`, `ClassInfo{operators, conversions}`, merging `prop_map` for separate accessors, `open`-on-method rejection)
-   - `inkwell` lowering (`compiler/src/codegen/mod.rs` — `llvm_ty_for`/`llvm_ty_for_sema`, `declare_*`/`codegen_*`, `class_operators` dispatch, `closure_count`/`holt.init`/`strcat`/`sprintf`)
+   - Token / lexer (`crates/hella-compiler/src/token.rs` — logos, keywords before `Ident`)
+   - AST nodes (`crates/hella-compiler/src/ast.rs` — mirrors EBNF, `Span` on every node, `Type::__inferred__` for omitted `has`)
+   - Parser rules (`crates/hella-compiler/src/parse/mod.rs` — recursive-descent + Pratt `parse_assignment` → `parse_postfix` → `parse_primary`; `try_parse_struct_literal`, `parse_class_decl`, `parse_extension_decl`, `parse_var_decl` for omitted `has`)
+   - Semantic checks (`crates/hella-compiler/src/sema/mod.rs` — `resolve_type`, `check_expr`/`check_stmt`, `ClassInfo{operators, conversions}`, merging `prop_map` for separate accessors, `open`-on-method rejection)
+   - `inkwell` lowering (`crates/hella-compiler/src/codegen/mod.rs` — `llvm_ty_for`/`llvm_ty_for_sema`, `declare_*`/`codegen_*`, `class_operators` dispatch, `closure_count`/`hella.init`/`strcat`/`sprintf`)
 5. Prefer a compilable, testable increment over a complete but unrunnable design.
-6. Emit via `holt build <file>` (single progress bar + brand-green status lines, `--release` for O3 + aggressive codegen via `Codegen::optimize_for_release`) or `cargo run -p compiler` legacy, then object `TargetMachine` + `clang` link to a proper binary (extension stripped). Always `module.verify()` before emission.
-7. Update `examples/*.hlt` to exercise the new production and `references/ebnf-0.1.txt` if grammar changed.
+6. Emit via `hella build <file>` (single progress bar + brand-green status lines, `--release` for O3 + aggressive codegen via `Codegen::optimize_for_release`), then object `TargetMachine` + `clang` link to a proper binary (extension stripped). Always `module.verify()` before emission.
+7. Update `examples/*.hll` to exercise the new production and `references/ebnf-0.1.txt` if grammar changed.
 
 ## Architecture Snapshot (actual workspace as of Phase 5 DONE)
 
 ```
-source (.hlt)
-  → logos lexer (compiler/src/lexer.rs:1, token.rs:43 skip ws/comments, Newline/Semicolon terminators)
-  → parser (hand-rolled recursive-descent + Pratt, compiler/src/parse/mod.rs:1, NOT chumsky — chumsky = dead dep compiler/Cargo.toml:9)
-  → AST (mirrors EBNF Draft 0.2, compiler/src/ast.rs:1, Span on every node, Type::__inferred__ for omitted has, ExprKind::Closure/InterpolatedString)
-  → sema (scopes, types, ClassInfo{operators, conversions}, prop_map merging, open check, compiler/src/sema/mod.rs:1)
-  → codegen (inkwell 0.10 llvm21-1 Context/Module/Builder, compiler/src/codegen/mod.rs:1, llvm_ty_for, declare_*/codegen_*, class_operators dispatch, closure_count, holt.init, defer stacks, monomorph T→i64 erasure)
-  → LLVM IR → TargetMachine object → clang link → *.out
-          ↖ holt/src/main.rs:1 holt build CLI (subcommands incl. `setup`, single progress bar + status lines, timing; imports via `compiler::modules`)
+source (.hll)
+  → logos lexer (crates/hella-compiler/src/lexer.rs:1, token.rs:43 skip ws/comments, Newline/Semicolon terminators)
+  → parser (hand-rolled recursive-descent + Pratt, crates/hella-compiler/src/parse/mod.rs:1, NOT chumsky — chumsky = dead dep crates/hella-compiler/Cargo.toml:9)
+  → AST (mirrors EBNF Draft 0.2, crates/hella-compiler/src/ast.rs:1, Span on every node, Type::__inferred__ for omitted has, ExprKind::Closure/InterpolatedString)
+  → sema (scopes, types, ClassInfo{operators, conversions}, prop_map merging, open check, crates/hella-compiler/src/sema/mod.rs:1)
+  → codegen (inkwell 0.10 llvm21-1 Context/Module/Builder, crates/hella-compiler/src/codegen/mod.rs:1, llvm_ty_for, declare_*/codegen_*, class_operators dispatch, closure_count, hella.init, defer stacks, monomorph T→i64 erasure)
+  → LLVM IR → TargetMachine object → clang link → binary (extension stripped)
+          ↖ crates/hella-cli/src/main.rs:1 hella build CLI (subcommands incl. `setup`, single progress bar + status lines, timing; imports via `hella_compiler::modules`)
 ```
 
 Actual layout:
 
 ```
-holt-rs/
-├── holt/              # main binary `holt build`/`holt run` (single progress bar + #00A693 status lines)
-│   └── src/main.rs    # Commands::Build/Run/Check/Lsp/Setup/New, single progress bar + status lines (#00A693), generate_ir_string, codegen_to_object (imports via `compiler::modules`; no file arg → project `src/main.hlt`, outputs to `out/debug|release/`)
-├── compiler/          # library + legacy bin `compiler` (historical `holtc`)
-│   ├── src/lib.rs     # pub mod ast/codegen/error/lexer/parse/sema/token
-│   ├── src/token.rs, lexer.rs
-│   ├── src/ast.rs
-│   ├── src/parse/mod.rs # 2919 lines, parse_program, try_parse_struct_literal (omitted has), parse_class_decl (operator/convert), parse_extension_decl, parse_var_decl
-│   ├── src/sema/mod.rs  # 1861 lines, check_program, ClassInfo merging
-│   ├── src/codegen/mod.rs # 2919 lines, llvm_ty_for, compile_program (Attributed unwrapping, Typedef/Distinct/Extension/Extern/Init), Codegen{vars,funcs,struct_types,class_operators,closure_count}
-│   ├── src/error.rs   # miette Single/MultiDiagnostic
-│   └── src/main.rs    # legacy Args (lex/show_spans/emit_llvm/keep_obj/output/print_ast) — use holt build instead
-├── examples/          # top-level .hlt (empty, basics, data_control with User omitted has, abstraction with separate accessors, advanced with all Phase 5, hello_io)
-├── stdlib/std/io.hlt  # pure-Holt stdlib (import std::io)
-├── references/        # ebnf-0.1.txt Draft 0.2, phases.md DONE, llvm-mapping.md, toolchain.md (OUTDATED)
-└── holt-syntax.nvim/
+hella/
+├── crates/
+│   ├── hella-cli/       # `hella build`/`hella run` binary (single progress bar + #00A693 status lines)
+│   │   ├── src/main.rs  # Commands::Build/Run/Check/Lsp/Setup/New, single progress bar + status lines (#00A693), generate_ir_string, codegen_to_object (imports via `hella_compiler::modules`; no file arg → project `src/main.hll`, outputs to `out/debug|release/`)
+│   │   └── build.rs     # embeds `stdlib/**/*.hll` for `hella setup`
+│   ├── hella-compiler/  # compiler library (`hella_compiler`)
+│   │   ├── src/lib.rs   # pub mod ast/codegen/error/lexer/modules/parse/sema/token
+│   │   ├── src/token.rs, lexer.rs
+│   │   ├── src/ast.rs
+│   │   ├── src/parse/mod.rs # 2919 lines, parse_program, try_parse_struct_literal (omitted has), parse_class_decl (operator/convert), parse_extension_decl, parse_var_decl
+│   │   ├── src/sema/mod.rs  # 1861 lines, check_program, ClassInfo merging
+│   │   ├── src/codegen/mod.rs # 2919 lines, llvm_ty_for, compile_program (Attributed unwrapping, Typedef/Distinct/Extension/Extern/Init), Codegen{vars,funcs,struct_types,class_operators,closure_count}
+│   │   ├── src/modules.rs   # import resolution (`hella.toml` / `main.hll` project root, `~/.hella/lib`)
+│   │   └── src/error.rs     # miette Single/MultiDiagnostic
+│   └── hella-lsp/       # language server library (`hella_lsp`, LSP over stdio)
+│       └── src/         # server.rs, analysis.rs, diagnostics.rs, document.rs, lib.rs
+├── examples/          # top-level .hll (basics, data_control with User omitted has, abstraction with separate accessors, advanced with all Phase 5, hello_io)
+├── stdlib/std/io.hll  # pure-Hella stdlib (import std::io)
+└── references/        # ebnf-0.1.txt Draft 0.2, phases.md DONE, llvm-mapping.md, toolchain.md (OUTDATED)
 ```
 
-Do not add new crates without updating both `compiler/Cargo.toml` and `holt/Cargo.toml` workspace members.
+Do not add new crates without adding them to workspace `members` in the root `Cargo.toml`.
 
 ## Critical Language Design Points (do not ignore — recent fixes)
 
 - Blocks are `do` … `end` (not `{}`).
-- Variable declarations are type-first — `int x = 1` (no `let`). For `struct` or constructor-less `class`, initializer may be `has field = expr … end` with inferred `Type`: `User u2 = has name = "bbb" end` (`compiler/src/parse/mod.rs:1339`, EBNF §11 `[type] has`, not `any`).
+- Variable declarations are type-first — `int x = 1` (no `let`). For `struct` or constructor-less `class`, initializer may be `has field = expr … end` with inferred `Type`: `User u2 = has name = "bbb" end` (`crates/hella-compiler/src/parse/mod.rs:1339`, EBNF §11 `[type] has`, not `any`).
 - Statement terminators are newline **or** `;` (`token.rs:48` `Newline`/`Semicolon`, `parse/mod.rs:92` `consume_newlines`/`expect_terminator`).
 - Class/struct/enum/trait bodies use `has` … `end`.
 - Struct literals: `Type has field = expr … end` **or** omitted `has … end` (see above). `Type::Named("__inferred__")` placeholder resolved in `sema` via `decl_ty`.
@@ -104,14 +107,14 @@ Do not add new crates without updating both `compiler/Cargo.toml` and `holt/Carg
 - Classes → explicit `this` as first `ptr` param (`declare_class:176` `param_llvm = vec![this_ty]`), mangled `Class__method` / `Class__op_plus` (`declare_class:263`), `__get_/__set_` for properties (`codegen_property:1129`), `__ctor` for constructors (`310`), `class_operators:44` dispatch for `BinOp` (`codegen/mod.rs:1831`), static `this` load/store. No vtables yet — `open`/`override`/`sealed` only validation (`sema` `564-605`), not dispatch.
 - `distinct` → `opaque_struct_type { inner }` `Map value:0` (`codegen/mod.rs:425`), `typedef` → no-op.
 - `extend` → declare as `Target__method` with `this` (`declare_extension:439`), `codegen_extension:521`.
-- `extern` → `declare_extern:496` `module.add_function` with `llvm_ty_for_sema` for `Float->f32`/`Double->f64` etc., `Call` fallback `module.get_function` (`codegen/mod.rs:2147`), link via `clang` without `-lm` (`holt/src/main.rs:277`).
+- `extern` → `declare_extern:496` `module.add_function` with `llvm_ty_for_sema` for `Float->f32`/`Double->f64` etc., `Call` fallback `module.get_function` (`codegen/mod.rs:2147`), link via `clang` without `-lm` (`crates/hella-cli/src/main.rs:277`).
 - Strings → `ptr` (`i8*`), `StringLit` via `build_global_string_ptr` (`codegen/mod.rs:586`), `InterpolatedString` via `strcpy`/`strcat`/`sprintf`/`strdup` into 512-byte `alloca` (`codegen/mod.rs:2354`).
 - `float` literal → `f64.const_float` (`codegen/mod.rs:1734`, `ast.rs:494` `FloatLit(String)` kept `Eq`), `char` as `i32` but `codegen_expr CharLit` missing → `todo!()` (`codegen/mod.rs:2453` only remaining `todo!`).
-- Never skip `module.verify()` before emission (`compile_program:125` / `holt/src/main.rs:256`).
+- Never skip `module.verify()` before emission (`compile_program:125` / `crates/hella-cli/src/main.rs:256`).
 
 ## Error Handling & Progress
 
-Use span-based diagnostics (`miette` `compiler/src/error.rs:1` `SingleDiagnostic`/`MultiDiagnostic`, `Report::new`, `token::Span::to_source_span`). Report:
+Use span-based diagnostics (`miette` `crates/hella-compiler/src/error.rs:1` `SingleDiagnostic`/`MultiDiagnostic`, `Report::new`, `token::Span::to_source_span`). Report:
 
 - Unexpected token / incomplete construct (`lex:64`, `parse:104` `expect_terminator`, `SingleDiagnostic`)
 - Undefined name / type (`sema` `undefined variable`, `unknown type`, `unknown struct T` `codegen/mod.rs:596`)
@@ -120,7 +123,7 @@ Use span-based diagnostics (`miette` `compiler/src/error.rs:1` `SingleDiagnostic
 - Invalid `break`/`continue` target / label (`sema` `loop_stack`)
 - `method cannot be open`, duplicate getter/setter, `field is private` (visibility `sema` `field_vis`/`method_vis`)
 
-Progress output uses the Holt brand green #00A693 for `holt build`/`holt run` (`holt/src/main.rs` single `ProgressBar` + status lines, `Instant::now` timing per phase: `Reading`/`Lexing`/`Parsing`/`Resolving`/`Checking`/`Codegen`/`Linking`/`Compiled`). Legacy `compiler` bin keeps `miette` without progress output.
+Progress output uses the Hella brand green #00A693 for `hella build`/`hella run` (`crates/hella-cli/src/main.rs` single `ProgressBar` + status lines, `Instant::now` timing per phase: `Reading`/`Lexing`/`Parsing`/`Resolving`/`Checking`/`Codegen`/`Linking`/`Compiled`).
 
 ## When the User Asks for a Specific Piece
 
@@ -135,12 +138,12 @@ Progress output uses the Holt brand green #00A693 for `holt build`/`holt run` (`
 | Match | EBNF §10 + §16 (Phase 2+) | T-7: `tuple-pattern`, `\|` alternative chain |
 | Defer | EBNF §19 + control-flow exits | Done (see defer stacks) |
 | FFI | EBNF §36 | T-8: `extern-struct/enum/const` only `function` parsed |
-| Full driver | `holt build` `holt/src/main.rs:18` | T-9: `top-level var/const` not parsed, `int main(string[] args)` rejected, `assert` missing, `super`/`Self` parsing |
+| Full driver | `hella build` `crates/hella-cli/src/main.rs:18` | T-9: `top-level var/const` not parsed, `int main(string[] args)` rejected, `assert` missing, `super`/`Self` parsing |
 
 ## Anti-Patterns (and what already went wrong)
 
-- Implementing the entire language before any executable exists — use `TodoWrite` “Holt 100% EBNF” and do one `T-*` at a time.
-- Skipping name resolution / type checking and lowering untyped AST (`sema` must run before `codegen`, see `holt/src/main.rs:197` `check(&program)`).
+- Implementing the entire language before any executable exists — use `TodoWrite` “Hella 100% EBNF” and do one `T-*` at a time.
+- Skipping name resolution / type checking and lowering untyped AST (`sema` must run before `codegen`, see `crates/hella-cli/src/main.rs:197` `check(&program)`).
 - Using SSA values for mutable locals instead of allocas (`codegen` `alloca` in entry block `codegen/mod.rs:989`).
 - Inventing `{}` blocks or `let` bindings that are not in the EBNF (`do … end`, `int x = 1` type-first).
 - Ignoring statement-terminator rules (`Newline`/`Semicolon` `token.rs:48`, `consume_newlines`/`expect_terminator`).
@@ -148,17 +151,17 @@ Progress output uses the Holt brand green #00A693 for `holt build`/`holt run` (`
 - Adding `open` to methods (`parse_class_decl:401` now correctly rejects `method cannot be open`).
 - Making `get`/`set` private by default (now `public` default `parse/mod.rs:500` + merging `sema`/`codegen` `HashMap`).
 - Forgetting `has` optional `Type` inference (`parse_var_decl:1339` `ty.clone()` for `User u2 = has …`).
-- Leaving dead deps (`chumsky` `compiler/Cargo.toml:9` unused, `cargo` still pulls `Cargo.lock:159`) or stale docs (`references/toolchain.md:9` `llvm20-1` vs `llvm21-1`, `ariadne` vs `miette`).
+- Leaving dead deps (`chumsky` `crates/hella-compiler/Cargo.toml:9` unused, `cargo` still pulls `Cargo.lock:159`) or stale docs (`references/toolchain.md:9` `llvm20-1` vs `llvm21-1`, `ariadne` vs `miette`).
 
 ## Output Expectations & Todo Discipline
 
 - Prefer complete, compilable Rust fragments over pseudocode when implementing a phase.
 - Always state which phase / EBNF § the work belongs to and which `Todo` `T-*` it closes.
 - Cite the relevant EBNF productions when adding syntax (`references/ebnf-0.1.txt:633` etc.).
-- Keep test programs in `examples/` as `.hlt` files and verify with `holt build <file>` *and* `cargo test` (4 lexer tests) before marking `Todo` done.
-- **Todo is law:** Never work outside `TodoWrite` “Holt 100% EBNF”. If user asks for ad-hoc fix, add it as a `T-*` first, then execute.
+- Keep test programs in `examples/` as `.hll` files and verify with `hella build <file>` *and* `cargo test` (4 lexer tests) before marking `Todo` done.
+- **Todo is law:** Never work outside `TodoWrite` “Hella 100% EBNF”. If user asks for ad-hoc fix, add it as a `T-*` first, then execute.
 
-### Holt 100% EBNF — Reference Todo (keep in sync with `TodoWrite`)
+### Hella 100% EBNF — Reference Todo (keep in sync with `TodoWrite`)
 
 *Generated from audit 2026-09-08 (38 sections: 21% full, 47% partial, 6 missing). See `references/ebnf-0.1.txt`.*
 
@@ -185,7 +188,7 @@ T-19 Functions: int main(string[] args) signature per EBNF §37 (sema currently 
 T-20 FFI: extern-struct has {field} end / extern-enum / extern-const const T N;
 T-21 Extensions: field/operator/property/conversion members (currently only Function)
 T-22 Top-level: variable-declaration / constant-declaration as top-level (parse_program fallback is Function)
-T-23 Docs/examples: keep README Build & Run (holt build) and examples advanced/data_control/abstraction/variadic in sync
+T-23 Docs/examples: keep README Build & Run (hella build) and examples advanced/data_control/abstraction/variadic in sync
 ```
 
-Check off via `TodoWrite` and `cargo run -p holt -- build examples/<file>` for each.
+Check off via `TodoWrite` and `cargo run -p hella -- build examples/<file>` for each.

@@ -1,0 +1,14 @@
+// hello_io.hll — stdlib import and IO (Phase 1 + stdlib)
+// Demonstrates `import std::io`: `print`-family calls resolve to pure Hella
+// wrappers in `stdlib/std/io.hll` over `extern "c"` libc declarations.
+
+import std::io
+
+void main() do
+    println("Hello, Hella!")
+    print("no newline: ")
+    println("continued")
+    printInt(2026)
+    putChar('!')
+    println("")
+end

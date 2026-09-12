@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["compiler", "hls", "holt"]
+members = ["crates/hella-compiler", "crates/hella-cli", "crates/hella-lsp"]

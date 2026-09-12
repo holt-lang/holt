@@ -1,8 +1,8 @@
-# Holt → LLVM Mapping
+# Hella → LLVM Mapping
 
 ## Primitive Types
 
-| Holt     | Recommended LLVM | Notes |
+| Hella     | Recommended LLVM | Notes |
 |----------|------------------|-------|
 | `int`    | `i64`            | Fix width early; do not change later |
 | `bool`   | `i1`             | |
@@ -15,7 +15,7 @@
 
 ## Type Modifiers
 
-| Holt | LLVM approach |
+| Hella | LLVM approach |
 |------|----------------|
 | `T?` | Optional: `{ T, i1 }` or nullable pointer |
 | `T*` | `ptr` (opaque pointers) |

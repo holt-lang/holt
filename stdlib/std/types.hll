@@ -1,0 +1,26 @@
+// std::types — fundamental Hella types (types skill §1-2, §16-18).
+//
+// These types are provided by the standard library and distributed with the
+// compiler. They are automatically available to every Hella source file —
+// no import is required:
+//
+//   int age = 25
+//   string name = "John"
+//   bool active = true
+//   i32 count = 42
+//   u8 flags = 255
+//
+// Full list: bool, string,
+//   i8 i16 i32 i64 i128 int,
+//   u8 u16 u32 u64 u128 uint,
+//   float double.
+//
+// `int`/`uint` are pointer-sized (i64 width on 64-bit).
+// The compiler has intrinsic knowledge of their representations
+// (see llvm_int_for_bits in crates/hella-compiler/src/codegen/mod.rs) but they are
+// architecturally standard-library types, not compiler keywords:
+// sized names lex as Ident and resolve via Ty::from_stdlib_name
+// (crates/hella-compiler/src/sema/mod.rs) with no import needed.
+//
+// This module intentionally declares nothing: importing it is a no-op.
+// It exists so the implicit environment has a canonical home.

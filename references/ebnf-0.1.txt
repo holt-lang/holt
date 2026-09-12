@@ -1,5 +1,5 @@
 (* ================================================================ *)
-(* Holt Language Specification                                      *)
+(* Hella Language Specification                                      *)
 (* Draft 0.2 — updated for Phase 5 fixes: accessors public by       *)
 (* default, separate get/set merging, `open` class-only, omitted    *)
 (* `Type` in `has` literals, T-17: `|`/`or` alternative chains +    *)

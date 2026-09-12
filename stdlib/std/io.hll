@@ -1,0 +1,72 @@
+// std::io — terminal IO for Hella (real stdlib: pure Hella + extern FFI).
+// Import via: import std::io
+// or selective: import std::io::{print, println, printInt, putChar}
+//
+// Contract (REAL_STDLIB.md): the compiler knows only `extern "c"` lowering
+// and internal libc helpers for its own codegen (assert, interpolation).
+// Every user-facing IO name below is an ordinary Hella function defined here.
+// If you call `print` without `import std::io`, sema must report an
+// undefined name — that is the intended boundary, not a bug.
+//
+// Hella `string` is a null-terminated `ptr (i8*)`; `char` is `i32`.
+// ABIs match C exactly. `write` targets fd 2 (stderr) directly so no `FILE*`
+// global is needed (portable across macOS/Linux, unlike `stderr`/`stdin`
+// globals). Input buffers come zeroed from `calloc`, so a short/failed read
+// still yields a valid empty string.
+
+extern "c" from "libc" do
+    i32 puts(string s)
+    i32 printf(string fmt, ...)
+    i32 putchar(char c)
+    int write(int fd, string buf, int count)
+    string calloc(int n, int size)
+    int scanf(string fmt, ...)
+end
+
+// print — no trailing newline.
+void print(string s) do
+    printf("%s", s)
+end
+
+// println — with trailing newline (libc `puts` appends `\n`).
+void println(string s) do
+    puts(s)
+end
+
+// printInt — decimal with trailing newline.
+void printInt(int n) do
+    printf("%ld\n", n)
+end
+
+// putChar — single character, no newline.
+void putChar(char c) do
+    putchar(c)
+end
+
+// eprint — no trailing newline, to stderr (fd 2).
+void eprint(string s) do
+    write(2, s, s.len())
+end
+
+// eprintln — with trailing newline, to stderr (fd 2).
+void eprintln(string s) do
+    eprint(s)
+    eprint("\n")
+end
+
+// readLine — one stdin line, WITHOUT the trailing newline.
+// Capped at 255 bytes (overlong lines continue on the next call).
+// EOF yields "".
+string readLine() do
+    string buf = calloc(1, 256)
+    scanf("%255[^\n]%*c", buf)
+    return buf
+end
+
+// readInt — one stdin integer (leading whitespace skipped, one trailing
+// character consumed). EOF yields 0.
+int readInt() do
+    int n = 0
+    scanf("%ld%*c", out n)
+    return n
+end

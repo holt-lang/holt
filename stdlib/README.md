@@ -1,15 +1,15 @@
-# Holt Standard Library
+# Hella Standard Library
 
-Pure Holt sources. See `.opencode/skills/stdlib/SKILL.md` for import semantics (EBNF §32),
+Pure Hella sources. See `.opencode/skills/stdlib/SKILL.md` for import semantics (EBNF §32),
 `.opencode/skills/stdlib/REAL_STDLIB.md` for the bare-minimum compiler contract, and roadmap.
 
-The compiler knows no user-facing IO names. Every symbol below is an ordinary Holt
+The compiler knows no user-facing IO names. Every symbol below is an ordinary Hella
 function defined in `stdlib/` on top of `extern "c"` libc declarations. Calling one
 without its `import` is a sema error (`undefined function`) by design.
 
 ## Modules
 
-- `std::io` — `stdlib/std/io.hlt`
+- `std::io` — `stdlib/std/io.hll`
   - `void print(string s)` — no newline (`printf("%s", s)`)
   - `void println(string s)` — with newline (`puts(s)`)
   - `void printInt(int n)` — decimal with newline (`printf("%ld\n", n)`)
@@ -23,7 +23,7 @@ without its `import` is a sema error (`undefined function`) by design.
     `i32 puts(string s)`, `i32 printf(string fmt, ...)`, `i32 putchar(char c)`,
     `int write(int fd, string buf, int count)`, `string calloc(int n, int size)`,
     `int scanf(string fmt, ...)`
-- `std::types` — `stdlib/std/types.hlt` (doc-only manifest of the implicit
+- `std::types` — `stdlib/std/types.hll` (doc-only manifest of the implicit
   environment: `bool string i8…u128 int uint float double`; importing is a no-op)
 
 Import examples:
@@ -38,7 +38,7 @@ requirements, not selectable symbols).
 
 ## Build
 
-`./target/debug/holt build examples/stdlib_io.hlt` inlines `stdlib/std/io.hlt` and links against libc. The input half needs piped stdin:
+`./target/debug/hella build examples/stdlib_io.hll` inlines `stdlib/std/io.hll` and links against libc. The input half needs piped stdin:
 
 ```
 printf 'Ada\n42\n' | ./stdlib_io

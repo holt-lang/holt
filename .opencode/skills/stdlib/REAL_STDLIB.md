@@ -1,19 +1,19 @@
 ---
-name: holt-stdlib-real
-description: Real Holt standard library — compiler owns only primitives + extern FFI; all user-facing types, methods and terminal IO live in pure Holt under stdlib/. Use when implementing or extending any std:: module, removing compiler intrinsics, or deciding where a builtin belongs.
+name: hella-stdlib-real
+description: Real Hella standard library — compiler owns only primitives + extern FFI; all user-facing types, methods and terminal IO live in pure Hella under stdlib/. Use when implementing or extending any std:: module, removing compiler intrinsics, or deciding where a builtin belongs.
 ---
 
 # Real Stdlib — Bare-Minimum Compiler Contract
 
-Companion to `holt-stdlib` (import mechanics, EBNF §32) and `holt-compiler`
+Companion to `hella-stdlib` (import mechanics, EBNF §32) and `hella-compiler`
 (lowerings). This file answers one question: **does this builtin belong in
 the compiler or in `stdlib/`?**
 
 ## Rule
 
-**The compiler knows only what Holt cannot say.** Everything a user can call
+**The compiler knows only what Hella cannot say.** Everything a user can call
 by name — types-as-API, methods, terminal IO — lives in `stdlib/` as pure
-Holt on top of `extern "c"` FFI. The compiler never hardcodes a stdlib
+Hella on top of `extern "c"` FFI. The compiler never hardcodes a stdlib
 function name in sema or codegen.
 
 ## Compiler owns (bare minimum)
@@ -32,43 +32,43 @@ function name in sema or codegen.
    (`assert` messages, string interpolation/concat). They must never dispatch
    on user-visible names (`print`, `println`, …).
 4. **Reserved runtime names** — `strlen strcmp abort puts printf putchar
-   strcat sprintf` are rejected as Holt `function` names (sema
+   strcat sprintf` are rejected as Hella `function` names (sema
    `RESERVED_RUNTIME`) so user definitions cannot collide with the external
    declarations the compiler emits. Declaring them via `extern` is the only
    legal path, and that path belongs to `stdlib/`.
-5. **Import resolver** — textual inlining `qualified-name → <root>/<path>.hlt`
-   (`compiler/src/modules.rs`, shared by CLI and LSP): project root around
-   `main.hlt` first (local modules, `mod.hlt` directory entries, cycle guard),
-   then dev-checkout `stdlib/`, then `~/.hella/lib` (UNIX, via `holt setup`).
+5. **Import resolver** — textual inlining `qualified-name → <root>/<path>.hll`
+   (`crates/hella-compiler/src/modules.rs`, shared by CLI and LSP): project root around
+   `main.hll` first (local modules, `mod.hll` directory entries, cycle guard),
+   then dev-checkout `stdlib/`, then `~/.hella/lib` (UNIX, via `hella setup`).
    Selective imports always carry the module's `extern` blocks.
 
-## Stdlib owns (pure Holt under `stdlib/`)
+## Stdlib owns (pure Hella under `stdlib/`)
 
-- **`std::io`** (`stdlib/std/io.hlt`) — `print`, `println`, `printInt`,
+- **`std::io`** (`stdlib/std/io.hll`) — `print`, `println`, `printInt`,
   `putChar`, `eprint`/`eprintln` (stderr via `write(2, …)` — no `FILE*`
   global), `readLine` (`calloc` + `scanf` scanset), `readInt`
   (`scanf` + `out` arg). All thin wrappers over the `extern` block. No compiler
   intrinsic: sema resolves them as ordinary functions from the import; codegen
   lowers ordinary calls (including calls into `extern` fns).
-- **`std::types`** (`stdlib/std/types.hlt`) — doc-only manifest of the
+- **`std::types`** (`stdlib/std/types.hll`) — doc-only manifest of the
   implicit environment (`bool string i8…u128 int uint float double`). Declares
   nothing; importing is a no-op.
 - **Future facades** — `std::string` / `std::vec` / `std::map` / `std::math` /
-  `std::fs` / `std::env`: thin Holt wrappers or `extend` blocks over the
+  `std::fs` / `std::env`: thin Hella wrappers or `extend` blocks over the
   primitive layouts. The compiler provides the layout + indexing/iteration
   mechanics; the *named method surface* (`len`, `push`, …) is documented and
   where possible fronted in stdlib. Full migration of `vec/map/string`
   methods off hardcoded `Family` dispatch is tracked, not attempted in one
-  pass (fixed-capacity `[16 x E]` buffers cannot be re-expressed in pure Holt
+  pass (fixed-capacity `[16 x E]` buffers cannot be re-expressed in pure Hella
   today).
 
 ## Anti-patterns (real-stdlib era)
 
 - No `is_stdlib_io_intrinsic` / `codegen_stdlib_io_body` / call-site
-  shortcuts on user names in `compiler/src/codegen/mod.rs`.
+  shortcuts on user names in `crates/hella-compiler/src/codegen/mod.rs`.
 - No sema shortcut that returns `Ty::Void` for `print`-family names without
-  resolving a real signature (`compiler/src/sema/mod.rs`).
-- No empty-body `void print(string s) do end` stubs in `stdlib/std/io.hlt`
+  resolving a real signature (`crates/hella-compiler/src/sema/mod.rs`).
+- No empty-body `void print(string s) do end` stubs in `stdlib/std/io.hll`
   that only typecheck because the compiler replaces the body.
 - No example calling `print*` without `import std::io` (rely on import, not
   on ambient intrinsics).
@@ -77,16 +77,16 @@ function name in sema or codegen.
 
 ## Workflow: moving a builtin to stdlib
 
-1. Write the pure-Holt implementation in `stdlib/std/<mod>.hlt` using only
-   EBNF-stable syntax + `extern` for what Holt cannot say.
+1. Write the pure-Hella implementation in `stdlib/std/<mod>.hll` using only
+   EBNF-stable syntax + `extern` for what Hella cannot say.
 2. Delete the compiler intrinsic (sema shortcut + codegen body + call-site
    fast path). Keep internal helpers used by compiler lowering.
 3. Add `import std::<mod>` to every example that uses the moved names.
-4. Verify: `cargo build -p holt && ./target/debug/holt build examples/hello_io.hlt
+4. Verify: `cargo build -p hella && ./target/debug/hella build examples/hello_io.hll
    && ./examples/hello_io` (+ `advanced`, `variadic`, `abstraction`), and
    `cargo test -p compiler`.
 5. Update `stdlib/README.md` symbol index and this contract if the boundary
    moved.
 
-Base directory for this skill: /Users/rivethorn/Dev/Holt/holt-rs/.opencode/skills/stdlib
+Base directory for this skill: /Users/rivethorn/Dev/Hella/hella/.opencode/skills/stdlib
 Relative paths (`stdlib/`, `compiler/`, `examples/`) are relative to workspace root unless noted.

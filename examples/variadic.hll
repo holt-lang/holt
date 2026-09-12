@@ -1,0 +1,50 @@
+// variadic.hll — demonstrates `...` for both extern C varargs and Hella `...T vda` array
+// Hella-side logging helpers use the real stdlib (`import std::io`); the
+// `printf` extern below exercises a user-declared C varargs symbol alongside it.
+import std::io
+
+extern "c" from "stdio.h" do
+    int printf(string fmt, ...);
+end
+
+int log(string fmt, ...int vda) do
+    // vda is `int[]` array of remaining ints
+    printInt(vda[0])
+    return vda[0]
+end
+
+int logStr(string fmt, ...string vda) do
+    print(vda[0])
+    return 0
+end
+
+int logGen<T>(string fmt, ...T vda) where T: int do
+    // `printInt(int)` is typed stdlib: a generic `T` does not coerce.
+    // C varargs leave extras unchecked, and `T` erases to `i64` — same
+    // layout `printInt` itself prints with `%ld`.
+    printf("%ld\n", vda[0])
+    return 0
+end
+
+// `... vda` derived from previous `string fmt` → `string[]`
+int logDerived(string fmt, ... vda) do
+    print(vda[0])
+    return 0
+end
+
+// `...string vda` can be in middle when explicit type: `...string vda, bool cond`
+int logMid(string fmt, ...string vda, bool cond) do
+    print(vda[0])
+    print(vda[1])
+    return 0
+end
+
+void main() do
+    printf("%d %s\n", 42, "hi")
+    int x = log("x", 10, 20, 30)
+    printInt(x)
+    logStr("s", "a", "b")
+    logGen<int>("g", 1, 2, 3)
+    logDerived("hi", "a", "b")
+    logMid("hi", "a", "b", true)
+end

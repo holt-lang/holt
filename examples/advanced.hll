@@ -1,0 +1,123 @@
+// advanced.hll — Phase 5: generics, closures, interpolation, operators, FFI, distinct, extensions, etc.
+// Demonstrates all four recent fixes:
+// 1) getters/setters public by default, 2) separate getter/setter, 3) `open` only on class, 4) omitted Type in `has`
+// IO (`println`/`printInt`) comes from the real stdlib — no compiler intrinsics.
+
+import std::io
+
+distinct MyInt = int
+typedef Alias = int
+
+struct User has
+    string name
+    int age
+end
+
+extend int do
+end
+
+init do
+end
+
+extern "c" from "m" do
+    double sqrt(double x)
+end
+
+extern "c" from "libc" do
+    int printf(string arg, ...)
+end
+
+@inline
+T foo<T>(T x) where T: int do
+    return x
+end
+
+// `open` only on class — not on methods (see `open class Shape` in abstraction.hll)
+open class Base has
+    public int baseVal
+end
+
+extend Base do
+    public int doubled() do
+        return this.baseVal * 2
+    end
+end
+
+class Vec has
+    int x
+    int y
+    operator +(Vec other) do
+        return this.x + other.x
+    end
+    convert Vec to int do
+        return this.x
+    end
+end
+
+// Separate getter/setter — public by default, can be declared apart
+class CounterEx has
+    private int _n
+    int n get do
+        return this._n
+    end
+
+    int n set(int v) do
+        this._n = v
+    end
+end
+
+int main() do
+    // 1 & 2: distinct + generics
+    MyInt a = MyInt has
+        value = 5
+    end
+    int b = foo<int>(10)
+
+    // 4: omitted Type — second variable infers from `User`
+    User u1 = User has
+        name = "hsn"
+        age = 20
+    end
+    User u2 = has
+        name = "bbb"
+        age = 25
+    end
+
+    // operator
+    Vec v1 = Vec has
+        x = 1
+        y = 2
+    end
+    Vec v2 = Vec has
+        x = 3
+        y = 4
+    end
+    int sum = v1 + v2
+
+    // 2: separate getter/setter, public by default
+    CounterEx ce = CounterEx has
+        _n = 7
+    end
+    int before = ce.n
+    ce.n = 9
+    int after = ce.n
+
+    // closure
+    any f = |int x| => x + 1
+    int y = f(5)
+
+    // interpolation
+    string s = "hello {b + y} world {sum}"
+    println(s)
+
+    // float + extern
+    double d = sqrt(4.0)
+    printInt(b + y + sum)
+
+    // use u1/u2 to avoid unused warnings (and show omitted Type worked)
+    int aged = u1.age + u2.age // 45, not used in return to keep exit 20 stable
+
+    printf("Hello from %s!\n", "printf")
+
+    return b + y + sum
+end

@@ -287,32 +287,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hls"
-version = "0.1.0"
-dependencies = [
- "holt-compiler",
- "lsp-server",
- "lsp-types",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "holt"
+name = "hella"
 version = "0.1.0"
 dependencies = [
  "anstyle",
  "clap",
  "console",
- "hls",
- "holt-compiler",
+ "hella-compiler",
+ "hella-lsp",
  "indicatif",
  "inkwell",
  "miette",
 ]
 
 [[package]]
-name = "holt-compiler"
+name = "hella-compiler"
 version = "0.1.0"
 dependencies = [
  "clap",
@@ -320,6 +309,17 @@ dependencies = [
  "logos",
  "miette",
  "thiserror",
+]
+
+[[package]]
+name = "hella-lsp"
+version = "0.1.0"
+dependencies = [
+ "hella-compiler",
+ "lsp-server",
+ "lsp-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

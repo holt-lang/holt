@@ -1,18 +1,22 @@
-# Holt — Rust + LLVM Compiler
+# Hella — Rust + LLVM Compiler
 
-Holt is a small, statically-typed language (draft 0.1 EBNF in `references/ebnf-0.1.txt`) with `do … end` blocks, type-first declarations, and `has … end` for struct/class/trait/enum bodies. The compiler is written in Rust and lowers to LLVM via `inkwell`.
+Hella is a small, statically-typed language (draft 0.1 EBNF in `references/ebnf-0.1.txt`) with `do … end` blocks, type-first declarations, and `has … end` for struct/class/trait/enum bodies. The compiler is written in Rust and lowers to LLVM via `inkwell`.
 
 ## Layout
 
 ```
-holt/
-├── holt/              # `holt` main binary — `holt build`/`holt run`
-│   └── src/main.rs    # subcommands, status lines + single progress bar, delegates to `compiler` lib
-├── compiler/          # `compiler` library + legacy `holtc` bin (lexer, parser, sema, codegen)
-│   └── src/           # token.rs, lexer.rs, ast.rs, parse/, sema/, codegen/, lib.rs
-├── examples/          # .hlt programs (see below)
-├── stdlib/std/io.hlt  # pure-Holt standard library (import std::io)
-└── references/        # EBNF, phases, llvm-mapping, toolchain
+hella/
+├── crates/
+│   ├── hella-cli/       # `hella` binary — `hella build`/`hella run`
+│   │   ├── src/main.rs  # subcommands, status lines + single progress bar, delegates to `hella-compiler`
+│   │   └── build.rs     # embeds `stdlib/**/*.hll` for `hella setup`
+│   ├── hella-compiler/  # compiler library (lexer, parser, sema, codegen)
+│   │   └── src/         # token.rs, lexer.rs, ast.rs, parse/, sema/, codegen/, modules.rs, lib.rs
+│   └── hella-lsp/       # language server library (`hella-lsp`, LSP over stdio)
+│       └── src/         # server.rs, analysis.rs, diagnostics.rs, document.rs, lib.rs
+├── examples/            # .hll programs (see below)
+├── stdlib/std/io.hll   # pure-Hella standard library (import std::io)
+└── references/          # EBNF, phases, llvm-mapping, toolchain
 ```
 
 ## Prerequisites
@@ -25,14 +29,13 @@ holt/
 
 ```sh
 cargo build
-cargo run -p holt -- build examples/hello_io.hlt        # status lines + progress bar
-cargo run -p holt -- run examples/hello_io.hlt          # build, run, delete binary
-cargo run -p holt -- build examples/empty.hlt --help    # build subcommand
-cargo run -p compiler -- examples/hello_io.hlt         # legacy direct driver
+cargo run -p hella -- build examples/hello_io.hll        # status lines + progress bar
+cargo run -p hella -- run examples/hello_io.hll          # build, run, keep binary
+cargo run -p hella -- build --help                       # build subcommand
 cargo test
 ```
 
-`holt build <file>` is the main entry point (workspace member `holt`). It shows a
+`hella build <file>` is the main entry point (package `hella` in `crates/hella-cli`). It shows a
 single progress bar covering the whole compile plus static status lines on
 stderr with a right-aligned brand-green (#00A693) prefix: `Compiling` …
 `Checking`/`Checked` … `Compiling <obj>` … `Compiled <src> → <exe> in 0.12s`.
@@ -42,23 +45,20 @@ The driver lexes → parses → resolves imports → type-checks → emits LLVM 
 
 ## Examples
 
-Moved out of `compiler/examples/` into top-level `examples/` — fewer, more comprehensive (now 7):
+Top-level `examples/` — fewer, more comprehensive:
 
 | File | Covers |
 |------|--------|
-| `empty.hlt` | Phase 0 empty file |
-| `basics.hlt` | Phase 1: `int`/`bool`/`void`, arithmetic, `and`/`or`/`not`, `if`/`else`, `while`, functions, recursion |
-| `data_control.hlt` | Phase 2–3: `struct` (`public`/`private` + `= expr` default, `User u2 = has … end` omitted `Type`), field access, literals, `T[]`, `match` (`|`/`or` + `(a,b)` tuple), `string`, `break`/`continue`, `loop`, `for … in`, `defer` |
-| `abstraction.hlt` | Phase 4: `class` + `this`, constructors (`initialize` sugar), `open` (class only) / `override` / `sealed`, `trait` + `implements`, `enum` with payloads, `get`/`set` properties (public by default, separate allowed), `public`/`private` |
-| `hello_io.hlt` | `import std::io` (`print`/`println`/`printInt`/`putChar`) |
-| `advanced.hlt` | Phase 5: `distinct`/`typedef`, `extend` (`open class` + `extend` `field`/`operator`/`property`/`conversion`), `init`, `extern` (`struct`/`enum`/`const` + `extern "c" printf`), generics + `where`, `operator`/`convert`, closures (`\|…\|`), string interpolation (`{expr}`), `float`/`double`, `any`, plus `struct User` omitted `has` and `CounterEx` separate accessors |
-| `variadic.hlt` | T-14: variadic `...` (`...int vda`→`int[]`, `...T vda` `where`, `... vda` derived last, `...string vda, bool cond` middle), generics + `extern` `...` |
+| `basics.hll` | Phase 1: `int`/`bool`/`void`, arithmetic, `and`/`or`/`not`, `if`/`else`, `while`, functions, recursion |
+| `data_control.hll` | Phase 2–3: `struct` (`public`/`private` + `= expr` default, `User u2 = has … end` omitted `Type`), field access, literals, `T[]`, `match` (`|`/`or` + `(a,b)` tuple), `string`, `break`/`continue`, `loop`, `for … in`, `defer` |
+| `abstraction.hll` | Phase 4: `class` + `this`, constructors (`initialize` sugar), `open` (class only) / `override` / `sealed`, `trait` + `implements`, `enum` with payloads, `get`/`set` properties (public by default, separate allowed), `public`/`private` |
+| `hello_io.hll` | `import std::io` (`print`/`println`/`printInt`/`putChar`) |
+| `advanced.hll` | Phase 5: `distinct`/`typedef`, `extend` (`open class` + `extend` `field`/`operator`/`property`/`conversion`), `init`, `extern` (`struct`/`enum`/`const` + `extern "c" printf`), generics + `where`, `operator`/`convert`, closures (`\|…\|`), string interpolation (`{expr}`), `float`/`double`, `any`, plus `struct User` omitted `has` and `CounterEx` separate accessors |
+| `variadic.hll` | T-14: variadic `...` (`...int vda`→`int[]`, `...T vda` `where`, `... vda` derived last, `...string vda, bool cond` middle), generics + `extern` `...` |
 
 ```sh
-cargo run -p holt -- build examples/basics.hlt && ./examples/basics.out; echo $?
-cargo run -p holt -- build examples/abstraction.hlt && ./examples/abstraction.out; echo $?
-# legacy:
-cargo run -p compiler -- examples/basics.hlt && ./examples/basics.out; echo $?
+cargo run -p hella -- build examples/basics.hll && ./examples/basics; echo $?
+cargo run -p hella -- build examples/abstraction.hll && ./examples/abstraction; echo $?
 ```
 
 ## Language Notes (do not ignore)
@@ -77,4 +77,4 @@ Spec is authoritative: `references/ebnf-0.1.txt`. Phases: `references/phases.md`
 
 ## Status
 
-Phase 5 (Advanced) is complete — all language features lower to LLVM and are exercised by `advanced.hlt` (generics, closures, interpolation, operators, `extern` `struct`/`enum`/`const`, `distinct` etc., exit 20), `variadic.hlt` (T-14 `...`), `data_control.hlt` (T-15 `struct` visibility/default, T-17 `match` `|`/`or`/`(a,b)`), `abstraction.hlt` (T-15 `class` fields, T-20 `extend` `field`/`operator`/`property`), `hello_io.hlt` (T-21 `import std::io`), `basics.hlt` (T-1..T-4) and `empty.hlt`. Earlier phases: `abstraction.hlt` (exit 233), `basics.hlt` (exit 230), `data_control.hlt` (exit 72), `variadic.hlt` (exit 0), `hello_io.hlt` (exit 0).
+Phase 5 (Advanced) is complete — all language features lower to LLVM and are exercised by `advanced.hll` (generics, closures, interpolation, operators, `extern` `struct`/`enum`/`const`, `distinct` etc., exit 20), `variadic.hll` (T-14 `...`), `data_control.hll` (T-15 `struct` visibility/default, T-17 `match` `|`/`or`/`(a,b)`), `abstraction.hll` (T-15 `class` fields, T-20 `extend` `field`/`operator`/`property`), `hello_io.hll` (T-21 `import std::io`), `basics.hll` (T-1..T-4). Earlier phases: `abstraction.hll` (exit 233), `basics.hll` (exit 230), `data_control.hll` (exit 72), `variadic.hll` (exit 0), `hello_io.hll` (exit 0).

@@ -1,0 +1,27 @@
+// stdlib_io.hll — regression for the real stdlib (`REAL_STDLIB.md`).
+// Every IO name here resolves to pure Hella in `stdlib/std/io.hll` on top of
+// `extern "c"` libc declarations. No compiler intrinsic is involved: removing
+// the `import` must fail sema with `undefined function`.
+//
+// Run with piped stdin for the input half:
+//   printf 'Ada\n42\n' | ./stdlib_io
+
+import std::io
+
+int main() do
+    print("io:")
+    println(" ok")
+    printInt(42)
+    putChar('A')
+    println("")
+    eprint("err:")
+    eprintln(" ok")
+    print("name? ")
+    string name = readLine()
+    print("hello ")
+    println(name)
+    print("age? ")
+    int age = readInt()
+    printInt(age)
+    return 0
+end

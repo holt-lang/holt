@@ -1,4 +1,4 @@
-# Holt Compiler Phases
+# Hella Compiler Phases
 
 Always advance one phase at a time. Each phase must produce runnable code (JIT or object file) before the next begins.
 
@@ -8,7 +8,7 @@ Always advance one phase at a time. Each phase must produce runnable code (JIT o
 - Token enum covering keywords + operators needed later
 - Empty driver that reads a file and prints tokens
 
-**Exit criteria:** `cargo run -- examples/empty.hlt` tokenizes without crash.
+**Exit criteria:** `cargo run -- examples/empty.hll` tokenizes without crash.
 
 ## Phase 1 — MVP Executable (highest priority) - DONE
 
@@ -68,7 +68,7 @@ Always advance one phase at a time. Each phase must produce runnable code (JIT o
 - Conversions (`convert … to …`)
 - `extern` FFI blocks (`extern "c" from "m"`)
 - Modules / `import` (qualified `::` + `{a,b}` lists)
-- `init` blocks (`holt.init`)
+- `init` blocks (`hella.init`)
 - Attributes (`@inline` etc.)
 - Distinct types / typedefs (`distinct` wraps struct, `typedef` alias)
 - Extensions (`extend Type do … end`)
