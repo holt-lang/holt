@@ -21,6 +21,7 @@ use lsp_types::{
 use crate::analysis::Analysis;
 use crate::diagnostics::diagnostics;
 use crate::document::{position_to_offset, DocumentManager};
+use crate::progress::{self, ProgressState};
 
 const SERVER_NAME: &str = "hella-lsp";
 const SERVER_VERSION: &str = "0.1.0";
@@ -30,6 +31,12 @@ const SERVER_VERSION: &str = "0.1.0";
 struct State {
     docs: DocumentManager,
     analysis: HashMap<String, Analysis>,
+    /// Workspace roots (from `workspaceFolders`, falling back to `rootUri`).
+    workspace_roots: Vec<std::path::PathBuf>,
+    /// Server-initiated progress token lifecycle (`$/progress`).
+    progress: ProgressState,
+    /// Counter for server→client request ids (`hella/progress/<n>`).
+    next_request_id: u64,
 }
 
 /// Blocking entry point: runs the LSP loop until `exit`.
@@ -44,8 +51,11 @@ pub fn run() -> i32 {
             return 1;
         }
     };
-    let _init: lsp_types::InitializeParams =
+    let init: lsp_types::InitializeParams =
         serde_json::from_value(init_params).unwrap_or_default();
+
+    let mut state = State::default();
+    state.workspace_roots = workspace_roots(&init);
 
     let result = InitializeResult {
         capabilities: server_capabilities(),
@@ -61,7 +71,10 @@ pub fn run() -> i32 {
         return 1;
     }
 
-    let mut state = State::default();
+    // NOTE: `initialize_finish` already consumed the client's `initialized`
+    // notification, so the progress handshake starts here rather than in
+    // the notification dispatcher below.
+    request_startup_progress(&connection, &mut state);
 
     for msg in &connection.receiver {
         match msg {
@@ -81,7 +94,9 @@ pub fn run() -> i32 {
                 }
                 handle_notification(&connection, &mut state, not);
             }
-            Message::Response(_) => {}
+            Message::Response(resp) => {
+                handle_response(&connection, &mut state, resp);
+            }
         }
     }
 
@@ -184,6 +199,91 @@ fn extract<P: serde::de::DeserializeOwned>(
 fn send_ok(connection: &Connection, id: RequestId, result: serde_json::Value) {
     let resp = Response::new_ok(id, result);
     let _ = connection.sender.send(resp.into());
+}
+
+/// Workspace roots for progress reporting: `workspaceFolders` first,
+/// falling back to `rootUri`. Non-file URIs are skipped.
+#[allow(deprecated)] // `rootUri` fallback for older clients
+fn workspace_roots(init: &lsp_types::InitializeParams) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(folders) = &init.workspace_folders {
+        for f in folders {
+            if let Some(p) = crate::document::uri_to_path(&f.uri) {
+                roots.push(p);
+            }
+        }
+    }
+    if roots.is_empty() {
+        if let Some(root) = &init.root_uri {
+            if let Some(p) = crate::document::uri_to_path(root) {
+                roots.push(p);
+            }
+        }
+    }
+    roots
+}
+
+/// Ask the client to create our progress token once, right after the
+/// `initialized` handshake. The indexing report itself runs when the client
+/// acknowledges the token (see `handle_response`).
+fn request_startup_progress(connection: &Connection, state: &mut State) {
+    if !matches!(state.progress, ProgressState::Idle) {
+        return;
+    }
+    state.next_request_id += 1;
+    let id = RequestId::from(format!("hella/progress/{}", state.next_request_id));
+    let req = progress::create_request(id.clone());
+    if connection.sender.send(req.into()).is_err() {
+        return;
+    }
+    state.progress = ProgressState::Creating(id);
+}
+
+/// Complete the `window/workDoneProgress/create` handshake: on success run
+/// the (fast, bounded) workspace scan wrapped in begin/report/end so the
+/// editor shows a loading indicator that dismisses itself; on rejection
+/// stay silent for the rest of the session.
+fn handle_response(connection: &Connection, state: &mut State, resp: Response) {
+    let creating_id = match &state.progress {
+        ProgressState::Creating(id) => id.clone(),
+        _ => return,
+    };
+    if resp.id != creating_id {
+        return;
+    }
+    if resp.response_result.is_err() {
+        state.progress = ProgressState::Unsupported;
+        return;
+    }
+    state.progress = ProgressState::Ready;
+    run_indexing_progress(connection, state);
+}
+
+/// `Indexing Hella workspace` progress around the startup `.hll` scan.
+fn run_indexing_progress(connection: &Connection, state: &State) {
+    if !state.progress.is_ready() {
+        return;
+    }
+    let _ = connection.sender.send(
+        progress::begin(
+            "Indexing Hella workspace",
+            Some("Scanning for Hella files"),
+            Some(0),
+        )
+        .into(),
+    );
+    let count = progress::count_hella_files(&state.workspace_roots);
+    let files = if count == 1 {
+        "1 Hella file".to_string()
+    } else {
+        format!("{count} Hella files")
+    };
+    let _ = connection.sender.send(
+        progress::report(Some(&format!("Found {files}")), Some(100)).into(),
+    );
+    let _ = connection.sender.send(
+        progress::end(Some(&format!("Indexed {files}"))).into(),
+    );
 }
 
 fn handle_notification(connection: &Connection, state: &mut State, not: Notification) {

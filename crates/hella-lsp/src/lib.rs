@@ -11,4 +11,5 @@
 pub mod analysis;
 pub mod diagnostics;
 pub mod document;
+pub mod progress;
 pub mod server;

@@ -27,4 +27,5 @@ Protocol over stdio, reusing the `compiler` crate for lex/parse/sema.
 - [ ] Diagnostics: lex/parse/sema errors -> `textDocument/publishDiagnostics`.
 - [ ] Symbol table from AST (functions, structs, classes, enums, consts, locals, params).
 - [ ] Features: hover, goto-definition, completion, document symbols.
+- [x] Server-initiated work-done progress (`src/progress.rs`): `window/workDoneProgress/create` after the initialize handshake, then `$/progress` begin/report/end around the startup `.hll` workspace scan ("Indexing Hella workspace"); silent on clients that reject `create`.
 - [ ] Tests + manual verification with a driver script.
