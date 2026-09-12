@@ -1069,25 +1069,30 @@ impl Checker {
                         }
                     }
                 }
-                // For class target, add to class; for struct target, add to struct
+                // For class target, add to class; for struct target, add to struct.
+                // Extension members are public by default: an absent
+                // modifier normalizes to `Public` (explicit `private` is
+                // kept). Mirrors the struct-branch method merge below.
                 if let Some(cls) = self.classes.get_mut(&target_name) {
                     for (name, sig, vis) in pending_ext {
+                        let vis_pub = if vis == crate::ast::Visibility::Default { crate::ast::Visibility::Public } else { vis };
                         cls.methods.insert(name.clone(), sig);
-                        cls.method_vis.insert(name, vis);
+                        cls.method_vis.insert(name, vis_pub);
                     }
                     for (fname, fty, vis, def) in pending_fields {
                         if cls.fields.iter().any(|(n,_)| n == &fname) {
                             self.errors.push(SemError{message: format!("duplicate field `{}` in `extend {}`", fname, target_name), span: Span::new(0,0)});
                         } else {
+                            let vis_pub = if vis == crate::ast::Visibility::Default { crate::ast::Visibility::Public } else { vis };
                             let idx = cls.fields.len();
                             cls.fields.push((fname.clone(), fty.clone()));
                             cls.field_map.insert(fname.clone(), (idx, fty.clone()));
-                            cls.field_vis.insert(fname.clone(), vis);
+                            cls.field_vis.insert(fname.clone(), vis_pub);
                             // also update structs map for field access
                             if let Some(sinfo) = self.structs.get_mut(&target_name) {
                                 sinfo.fields.push((fname.clone(), fty.clone()));
                                 sinfo.field_map.insert(fname.clone(), (idx, fty.clone()));
-                                sinfo.field_vis.insert(fname.clone(), vis);
+                                sinfo.field_vis.insert(fname.clone(), vis_pub);
                                 sinfo.field_defaults.insert(fname.clone(), def);
                             }
                         }
@@ -1103,7 +1108,8 @@ impl Checker {
                             let merged_vis = existing.visibility;
                             cls.properties.insert(pname.clone(), PropertyInfo{ty: merged_ty, has_get: merged_has_get, has_set: merged_has_set, visibility: merged_vis, span: pinfo.span});
                         } else {
-                            cls.properties.insert(pname, pinfo);
+                            let vis_pub = if pinfo.visibility == crate::ast::Visibility::Default { crate::ast::Visibility::Public } else { pinfo.visibility };
+                            cls.properties.insert(pname, PropertyInfo{ty: pinfo.ty.clone(), has_get: pinfo.has_get, has_set: pinfo.has_set, visibility: vis_pub, span: pinfo.span});
                         }
                     }
                     for (from, to, _) in pending_convs {
@@ -1143,7 +1149,8 @@ impl Checker {
                                 let merged_ty = if existing.ty != Ty::Void { existing.ty.clone() } else { pinfo.ty.clone() };
                                 cls.properties.insert(pname.clone(), PropertyInfo{ty: merged_ty, has_get: merged_has_get, has_set: merged_has_set, visibility: existing.visibility, span: pinfo.span});
                             } else {
-                                cls.properties.insert(pname, pinfo);
+                                let vis_pub = if pinfo.visibility == crate::ast::Visibility::Default { crate::ast::Visibility::Public } else { pinfo.visibility };
+                                cls.properties.insert(pname, PropertyInfo{ty: pinfo.ty.clone(), has_get: pinfo.has_get, has_set: pinfo.has_set, visibility: vis_pub, span: pinfo.span});
                             }
                         }
                         for (from, to, _) in pending_convs {

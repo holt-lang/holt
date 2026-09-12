@@ -133,6 +133,8 @@ pub struct Symbol {
     /// `(name, type)` pairs for function/method parameters. Used for
     /// snippet placeholders in call completions.
     pub params: Vec<(String, String)>,
+    /// Superclass name for classes (`extends` target). Used for `super.`.
+    pub parent: Option<String>,
 }
 
 impl Symbol {
@@ -151,9 +153,24 @@ impl Symbol {
         self.params = params.to_vec();
         self
     }
+    fn with_parent(mut self, parent: &str) -> Self {
+        self.parent = Some(parent.to_string());
+        self
+    }
     fn kind_heading(&self) -> &'static str {
         self.kind.heading()
     }
+}
+
+/// Members added to a type by an `extend` block, pending link to the
+/// target type's symbol.
+#[derive(Debug, Clone)]
+struct ExtensionInfo {
+    target: String,
+    members: Vec<Symbol>,
+    span: Span,
+    /// True once merged into a same-file (or imported) target's children.
+    linked: bool,
 }
 
 /// Full-file analysis: top-level symbols plus all lexically scoped locals.
@@ -163,6 +180,9 @@ pub struct Analysis {
     locals: Vec<Symbol>,
     /// Top-level symbols of directly imported files (single level).
     imported: Vec<Symbol>,
+    /// `extend` blocks by target type name (linked ones also merged into
+    /// the target's children; see `link_extensions`).
+    extensions: Vec<ExtensionInfo>,
 }
 impl Analysis {
     /// Build a symbol table from a successfully parsed program.
@@ -171,7 +191,18 @@ impl Analysis {
         for item in &prog.items {
             a.collect_item(item);
         }
+        a.link_extensions();
         a
+    }
+
+    /// Merge extension members into their target type's children (cloned;
+    /// the originals stay listed for span lookup). Marks merged entries.
+    fn link_extensions(&mut self) {
+        for ext in &mut self.extensions {
+            if link_extension_into(&mut self.top, ext) {
+                ext.linked = true;
+            }
+        }
     }
 
     fn push_top(&mut self, sym: Symbol, name_span: Span) {
@@ -180,6 +211,132 @@ impl Analysis {
             self.top.push(sym);
         }
     }
+    /// Shared member builders used by both class and `extend` collection,
+    /// so the two stay identical. Each pushes the member symbol and walks
+    /// its bodies for locals.
+    fn collect_field_sym(&mut self, f: &ast::StructField, children: &mut Vec<Symbol>) {
+        children.push(
+            make_symbol(
+                &f.name,
+                SymKind::Field,
+                f.name_span,
+                f.span,
+                format!("{} {}", f.ty.name(), f.name),
+                Vec::new(),
+            )
+            .with_ty(&f.ty.name()),
+        );
+    }
+
+    fn collect_method_sym(&mut self, m: &ast::Function, children: &mut Vec<Symbol>) {
+        let detail = format!(
+            "fn {}({}) -> {}",
+            m.name,
+            format_params(&m.params),
+            m.ret_ty.name()
+        );
+        children.push(
+            make_symbol(
+                &m.name,
+                SymKind::Method,
+                m.name_span,
+                m.span,
+                detail,
+                Vec::new(),
+            )
+            .with_params(&param_pairs(&m.params)),
+        );
+        self.collect_block_locals(&m.body, m.span, &m.params);
+    }
+
+    fn collect_property_sym(&mut self, p: &ast::PropertyDecl, children: &mut Vec<Symbol>) {
+        let ty = p
+            .ty
+            .as_ref()
+            .map(|t| t.name())
+            .unwrap_or_else(|| "any".to_string());
+        children.push(
+            make_symbol(
+                &p.name,
+                SymKind::Property,
+                p.name_span,
+                p.span,
+                format!("{ty} {} (property)", p.name),
+                Vec::new(),
+            )
+            .with_ty(&ty),
+        );
+        // Accessor bodies see the property scope; the setter
+        // parameter is in scope for its body.
+        if let Some(g) = &p.getter {
+            self.collect_block(g, p.span);
+        }
+        if let Some((param, body)) = &p.setter {
+            self.collect_params(std::slice::from_ref(param), p.span);
+            self.collect_block(body, p.span);
+        }
+    }
+
+    fn collect_ctor_sym(&mut self, k: &ast::ConstructorDecl, children: &mut Vec<Symbol>) {
+        children.push(
+            make_symbol(
+                &k.name,
+                SymKind::Constructor,
+                k.name_span,
+                k.span,
+                format!("{}({})", k.name, format_params(&k.params)),
+                Vec::new(),
+            )
+            .with_params(&param_pairs(&k.params)),
+        );
+        self.collect_params(&k.params, k.span);
+        if let Some(b) = &k.body {
+            self.collect_block(b, k.span);
+        }
+    }
+
+    fn collect_dtor_sym(&mut self, d: &ast::DestructorDecl, children: &mut Vec<Symbol>) {
+        children.push(make_symbol(
+            &format!("~{}", d.name),
+            SymKind::Destructor,
+            d.name_span,
+            d.span,
+            format!("~{}()", d.name),
+            Vec::new(),
+        ));
+        self.collect_block(&d.body, d.span);
+    }
+
+    fn collect_operator_body(&mut self, o: &ast::OperatorDecl) {
+        self.collect_block_locals(&o.body, o.span, &o.params);
+    }
+
+    fn collect_conversion_body(&mut self, cv: &ast::ConversionDecl) {
+        self.collect_block(&cv.body, cv.span);
+    }
+
+    /// Collect an `extend` block with the exact same member treatment as a
+    /// class. Members are staged for linking into the target type; bodies
+    /// are walked immediately so locals resolve inside extensions.
+    fn collect_extension(&mut self, e: &ast::ExtensionDecl) {
+        let mut members = Vec::new();
+        for m in &e.members {
+            match m {
+                ast::ExtensionMember::Field(f) => self.collect_field_sym(f, &mut members),
+                ast::ExtensionMember::Function(f) => self.collect_method_sym(f, &mut members),
+                ast::ExtensionMember::Operator(o) => self.collect_operator_body(o),
+                ast::ExtensionMember::Property(p) => self.collect_property_sym(p, &mut members),
+                ast::ExtensionMember::Conversion(c) => self.collect_conversion_body(c),
+            }
+        }
+        self.extensions.push(ExtensionInfo {
+            target: e.ty.name(),
+            members,
+            span: e.span,
+            linked: false,
+        });
+    }
+
 fn collect_item(&mut self, item: &Item) {
         match item {
             Item::Function(f) => {
@@ -230,98 +387,25 @@ fn collect_item(&mut self, item: &Item) {
             Item::Class(c) => {
                 let mut children = Vec::new();
                 for f in &c.fields {
-                    children.push(
-                        make_symbol(
-                            &f.name,
-                            SymKind::Field,
-                            f.name_span,
-                            f.span,
-                            format!("{} {}", f.ty.name(), f.name),
-                            Vec::new(),
-                        )
-                        .with_ty(&f.ty.name()),
-                    );
+                    self.collect_field_sym(f, &mut children);
                 }
                 for m in &c.methods {
-                    let detail = format!(
-                        "fn {}({}) -> {}",
-                        m.name,
-                        format_params(&m.params),
-                        m.ret_ty.name()
-                    );
-                    children.push(
-                        make_symbol(
-                            &m.name,
-                            SymKind::Method,
-                            m.name_span,
-                            m.span,
-                            detail,
-                            Vec::new(),
-                        )
-                        .with_params(&param_pairs(&m.params)),
-                    );
-                    self.collect_block_locals(&m.body, m.span, &m.params);
+                    self.collect_method_sym(m, &mut children);
                 }
                 for p in &c.properties {
-                    let ty = p
-                        .ty
-                        .as_ref()
-                        .map(|t| t.name())
-                        .unwrap_or_else(|| "any".to_string());
-                    children.push(
-                        make_symbol(
-                            &p.name,
-                            SymKind::Property,
-                            p.name_span,
-                            p.span,
-                            format!("{ty} {} (property)", p.name),
-                            Vec::new(),
-                        )
-                        .with_ty(&ty),
-                    );
-                    // Accessor bodies see the property scope; the setter
-                    // parameter is in scope for its body.
-                    if let Some(g) = &p.getter {
-                        self.collect_block(g, p.span);
-                    }
-                    if let Some((param, body)) = &p.setter {
-                        self.collect_params(std::slice::from_ref(param), p.span);
-                        self.collect_block(body, p.span);
-                    }
+                    self.collect_property_sym(p, &mut children);
                 }
                 for k in &c.constructors {
-                    children.push(
-                        make_symbol(
-                            &k.name,
-                            SymKind::Constructor,
-                            k.name_span,
-                            k.span,
-                            format!("{}({})", k.name, format_params(&k.params)),
-                            Vec::new(),
-                        )
-                        .with_params(&param_pairs(&k.params)),
-                    );
-                    self.collect_params(&k.params, k.span);
-                    if let Some(b) = &k.body {
-                        self.collect_block(b, k.span);
-                    }
+                    self.collect_ctor_sym(k, &mut children);
                 }
                 for d in &c.destructors {
-                    children.push(make_symbol(
-                        &format!("~{}", d.name),
-                        SymKind::Destructor,
-                        d.name_span,
-                        d.span,
-                        format!("~{}()", d.name),
-                        Vec::new(),
-                    ));
-                    self.collect_block(&d.body, d.span);
+                    self.collect_dtor_sym(d, &mut children);
                 }
                 for o in &c.operators {
-                    self.collect_block_locals(&o.body, o.span, &o.params);
+                    self.collect_operator_body(o);
                 }
                 for cv in &c.conversions {
-                    self.collect_block(&cv.body, cv.span);
+                    self.collect_conversion_body(cv);
                 }
                 // First constructor's parameters drive the call snippet on
                 // the class name (`Rect(${1:int w})$0`).
@@ -330,7 +414,7 @@ fn collect_item(&mut self, item: &Item) {
                     .first()
                     .map(|k| param_pairs(&k.params))
                     .unwrap_or_default();
-                let sym = make_symbol(
+                let mut sym = make_symbol(
                     &c.name,
                     SymKind::Class,
                     c.name_span,
@@ -339,6 +423,9 @@ fn collect_item(&mut self, item: &Item) {
                     children,
                 )
                 .with_params(&ctor_params);
+                if let Some(ext) = &c.extends {
+                    sym = sym.with_parent(&ext.name());
+                }
                 self.push_top(sym, c.name_span);
             }
             Item::Enum(e) => {
@@ -490,7 +577,9 @@ Item::Trait(t) => {
                 }
             }
             Item::Init(b) => self.collect_block_locals(b, b.span, &[]),
-            Item::Extension(_) => {}
+            Item::Extension(e) => {
+                self.collect_extension(e);
+            }
             Item::Attributed { item, .. } => self.collect_item(item),
         }
     }
@@ -985,8 +1074,8 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
                 .symbols
                 .as_ref()
                 .map(|v| v.iter().map(|(s, _)| s.as_str()).collect());
-            let sub_analysis = Self::from_program(&sub);
-            for s in sub_analysis.top {
+            let mut sub_analysis = Self::from_program(&sub);
+            for s in std::mem::take(&mut sub_analysis.top) {
                 if s.kind == SymKind::Module {
                     continue;
                 }
@@ -996,6 +1085,18 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
                     }
                 }
                 self.imported.push(s);
+            }
+            // Imported extensions apply to local targets too (mirroring
+            // sema inlining): link what matches, keep the rest listed.
+            // Sub-internal links already happened in `from_program`.
+            for mut ext in std::mem::take(&mut sub_analysis.extensions) {
+                if ext.linked
+                    || link_extension_into(&mut self.top, &ext)
+                    || link_extension_into(&mut self.imported, &ext)
+                {
+                    ext.linked = true;
+                }
+                self.extensions.push(ext);
             }
         }
     }
@@ -1065,7 +1166,17 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
         snippets: bool,
     ) -> Option<Vec<CompletionItem>> {
         let members: Vec<&Symbol> = if receiver == "this" {
-            self.enclosing_class(offset)?.children.iter().collect()
+            if let Some(c) = self.enclosing_class(offset) {
+                let mut out: Vec<&Symbol> = c.children.iter().collect();
+                out.extend(self.unlinked_members(&c.name));
+                out
+            } else if let Some(ext) = self.enclosing_extension(offset) {
+                self.type_members(&ext.target.clone())
+            } else {
+                return None;
+            }
+        } else if receiver == "super" {
+            self.super_chain_members(offset)?
         } else if let Some(local) = self
             .locals
             .iter()
@@ -1075,7 +1186,11 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
             let ty = local.ty.as_deref()?;
             let resolved = self.resolve_named_type(ty)?;
             match resolved.kind {
-                SymKind::Struct | SymKind::Class => resolved.children.iter().collect(),
+                SymKind::Struct | SymKind::Class => {
+                    let mut out: Vec<&Symbol> = resolved.children.iter().collect();
+                    out.extend(self.unlinked_members(ty));
+                    out
+                }
                 // Variants belong to the enum *type* (`Status.Ok`), not a value.
                 _ => return None,
             }
@@ -1125,6 +1240,71 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
             stack.extend(s.children.iter());
         }
         best
+    }
+
+    /// Innermost `extend` block containing `offset` (for `this.` inside
+    /// extensions, where no class span covers the cursor).
+    fn enclosing_extension(&self, offset: usize) -> Option<&ExtensionInfo> {
+        self.extensions
+            .iter()
+            .filter(|e| e.span.start <= offset && offset <= e.span.end)
+            .min_by_key(|e| e.span.end - e.span.start)
+    }
+
+    /// Extension members that were not linked into a target's children.
+    fn unlinked_members(&self, name: &str) -> Vec<&Symbol> {
+        self.extensions
+            .iter()
+            .filter(|e| !e.linked && e.target == name)
+            .flat_map(|e| e.members.iter())
+            .collect()
+    }
+
+    /// Members of a named struct/class/enum type: declaration children
+    /// (which already include linked extension members) plus unlinked
+    /// extension members targeting it.
+    fn type_members(&self, name: &str) -> Vec<&Symbol> {
+        let mut out = Vec::new();
+        if let Some(sym) = self.resolve_named_type(name) {
+            if matches!(
+                sym.kind,
+                SymKind::Struct | SymKind::Class | SymKind::Enum
+            ) {
+                out.extend(sym.children.iter());
+            }
+        }
+        out.extend(self.unlinked_members(name));
+        out
+    }
+
+    /// Members visible through `super.`: walks the `extends` chain from the
+    /// enclosing class (nearest first — stable sort + dedup keep the
+    /// shadowing member), with a cycle guard and depth cap. `None` when
+    /// there is no chain to resolve (caller falls back to globals).
+    fn super_chain_members(&self, offset: usize) -> Option<Vec<&Symbol>> {
+        let mut out: Vec<&Symbol> = Vec::new();
+        let mut seen_types: HashSet<String> = HashSet::new();
+        let mut next: Option<String> = self
+            .enclosing_class(offset)
+            .and_then(|c| c.parent.clone());
+        let mut resolved_any = false;
+        for _ in 0..8 {
+            let name = match next {
+                Some(n) => n,
+                None => break,
+            };
+            if !seen_types.insert(name.clone()) {
+                break;
+            }
+            let Some(sym) = self.resolve_named_type(&name) else {
+                break;
+            };
+            resolved_any = true;
+            out.extend(sym.children.iter());
+            out.extend(self.unlinked_members(&name));
+            next = sym.parent.clone();
+        }
+        if resolved_any { Some(out) } else { None }
     }
 
     /// Resolve a type name to its declaration (own file first, then
@@ -1177,6 +1357,7 @@ fn make_symbol(
         children,
         ty: None,
         params: Vec::new(),
+        parent: None,
     }
 }
 
@@ -1203,6 +1384,19 @@ fn format_params(params: &[ast::Param]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Merge an extension's members into the same-named struct/class target's
+/// children. Returns true when a target matched.
+fn link_extension_into(tops: &mut [Symbol], ext: &ExtensionInfo) -> bool {
+    let mut linked = false;
+    for top in tops.iter_mut() {
+        if matches!(top.kind, SymKind::Struct | SymKind::Class) && top.name == ext.target {
+            top.children.extend(ext.members.iter().cloned());
+            linked = true;
+        }
+    }
+    linked
 }
 
 /// All symbols in a list plus descendants (pre-order).
@@ -2028,6 +2222,78 @@ mod tests {
         let names = labels(&items);
         assert!(names.contains(&"c"), "ctor params: {names:?}");
         assert!(names.contains(&"n"), "fields visible in ctor: {names:?}");
+    }
+
+    #[test]
+    fn completion_this_in_extension() {
+        let src = "struct Point has\n  int x\nend\nextend Point do\n  int doubled() do\n    return this.\n  end\nend";
+        let off = src.find("this.").unwrap() + 5;
+        let items = Analysis::complete(src, off, false);
+        let names = labels(&items);
+        assert!(names.contains(&"x"), "target fields: {names:?}");
+        assert!(names.contains(&"doubled"), "extension methods: {names:?}");
+    }
+
+    #[test]
+    fn completion_extension_body_locals() {
+        let src = "struct Point has\n  int x\nend\nextend Point do\n  int doubled() do\n    int two = 2\n    two\n  end\nend";
+        let off = src.rfind("\n    two").unwrap() + 7;
+        let items = Analysis::complete(src, off, false);
+        assert_eq!(labels(&items), vec!["two"]);
+    }
+
+    #[test]
+    fn completion_unlinked_extension() {
+        // Target declared nowhere: members still resolve by target name.
+        let src = "extend Elsewhere do\n  int helper() do\n    return this.\n  end\nend";
+        let off = src.find("this.").unwrap() + 5;
+        let items = Analysis::complete(src, off, false);
+        assert_eq!(labels(&items), vec!["helper"]);
+    }
+
+    #[test]
+    fn completion_super_chain() {
+        let src = "class A has\n  int a\n  int who() do\n    return 1\n  end\nend\nclass B extends A has\n  int b\n  int who() do\n    return 2\n  end\nend\nclass C extends B has\n  int c\n  int test() do\n    return super.\n  end\nend";
+        let off = src.find("super.").unwrap() + 6;
+        let items = Analysis::complete(src, off, false);
+        let names = labels(&items);
+        assert!(names.contains(&"a"), "grandparent members: {names:?}");
+        assert!(names.contains(&"b"), "parent members: {names:?}");
+        assert!(names.contains(&"who"), "parent methods: {names:?}");
+        assert!(!names.contains(&"c"), "own members excluded: {names:?}");
+        assert!(!names.contains(&"test"), "own methods excluded: {names:?}");
+        // `super` without a chain falls back to globals
+        let src2 = "class Solo has\n  int n\n  int f() do\n    return super.\n  end\nend";
+        let off2 = src2.find("super.").unwrap() + 6;
+        let fallback = Analysis::complete(src2, off2, false);
+        assert!(labels(&fallback).contains(&"if"), "fallback offers keywords");
+    }
+
+    #[test]
+    fn extension_members_merge_into_target_outline() {
+        let src = "struct Point has\n  int x\nend\nextend Point do\n  int doubled() do\n    return this.x\n  end\nend";
+        let out = hella_compiler::lexer::lex(src);
+        let prog = hella_compiler::parse::parse(out.tokens, src.to_string()).unwrap();
+        let a = Analysis::from_program(&prog);
+        let point = a
+            .top_symbols()
+            .iter()
+            .find(|s| s.name == "Point")
+            .unwrap();
+        let names: Vec<_> = point.children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"x"), "own fields: {names:?}");
+        assert!(names.contains(&"doubled"), "extension methods: {names:?}");
+        let symbols = a.document_symbols(src);
+        let point_sym = symbols.iter().find(|s| s.name == "Point").unwrap();
+        #[allow(deprecated)]
+        let kids: Vec<_> = point_sym
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(kids.contains(&"doubled"), "outline merged: {kids:?}");
     }
 
     #[test]

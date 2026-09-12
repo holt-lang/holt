@@ -1021,6 +1021,13 @@ impl Parser {
         let mut members = Vec::new();
         while !self.is_eof() && self.peek_token() != Some(&Token::End) {
             if matches!(self.peek_token(), Some(Token::Newline) | Some(Token::Semicolon)) { self.advance(); continue; }
+            // Extern members are always public: an explicit `public` is
+            // accepted and ignored, `private` is rejected. (No visibility is
+            // stored — nothing downstream gates on extern visibility.)
+            let mvis = self.parse_visibility();
+            if mvis == crate::ast::Visibility::Private {
+                return Err(ParseError{message: "extern members are always public; remove `private`".into(), span: self.peek_span()});
+            }
             // Check for extern-struct / extern-enum / extern-const before extern-function
             if self.peek_token() == Some(&Token::Struct) {
                 let start = self.advance().unwrap().span.start;

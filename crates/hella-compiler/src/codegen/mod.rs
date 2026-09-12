@@ -1478,7 +1478,16 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     let _ = self.codegen_block(&f.body)?;
                     if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
-                        self.builder.build_return(Some(&self.context.i64_type().const_int(0,false))).unwrap();
+                        // Same implicit-return rule as class methods: `void`
+                        // gets a bare `ret`, anything else a zero value.
+                        // (Unconditional `ret i64 0` used to fail module
+                        // verification for `void` extension methods.)
+                        let ret_raw: crate::sema::Ty = (&f.ret_ty).into();
+                        let ret_ty = self.resolve_ty_for_codegen(&ret_raw);
+                        match self.default_return_value(&ret_ty) {
+                            Some(zero) => { self.builder.build_return(Some(&zero)).unwrap(); }
+                            None => { self.builder.build_return(None).unwrap(); }
+                        }
                     }
                     self.vars.pop();
                     self.cur_fn = None;
@@ -3037,6 +3046,64 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
+    /// Default value for an implicit function return (`None` for `void`).
+    /// Used to terminate bodies that fall off the end without an explicit
+    /// `return` (class methods and extension functions share it).
+    fn default_return_value(&self, ret: &crate::sema::Ty) -> Option<BasicValueEnum<'ctx>> {
+        match ret {
+            crate::sema::Ty::Void => None,
+            crate::sema::Ty::Int => Some(self.context.i64_type().const_int(0, false).into()),
+            crate::sema::Ty::UInt => Some(self.context.i64_type().const_int(0, false).into()),
+            crate::sema::Ty::SizedInt { bits, .. } => Some(self.llvm_int_for_bits(*bits).const_int(0, false).into()),
+            crate::sema::Ty::Bool => Some(self.context.bool_type().const_int(0, false).into()),
+            crate::sema::Ty::Char => Some(self.context.i32_type().const_int(0, false).into()),
+            crate::sema::Ty::String => Some(self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into()),
+            crate::sema::Ty::Struct(n) => Some(self.struct_types.get(n).unwrap().const_zero().into()),
+            crate::sema::Ty::Array(_) => Some(self.context.i64_type().array_type(16).const_zero().into()),
+            crate::sema::Ty::FixedArray { elem, size } => {
+                let n = size.unwrap_or(16) as u32;
+                match self.llvm_ty_for_sema(elem.as_ref()) {
+                    Some(BasicTypeEnum::IntType(it)) => Some(it.array_type(n).const_zero().into()),
+                    Some(BasicTypeEnum::FloatType(ft)) => Some(ft.array_type(n).const_zero().into()),
+                    Some(BasicTypeEnum::PointerType(pt)) => Some(pt.array_type(n).const_zero().into()),
+                    Some(BasicTypeEnum::StructType(st)) => Some(st.array_type(n).const_zero().into()),
+                    Some(BasicTypeEnum::ArrayType(at)) => Some(at.array_type(n).const_zero().into()),
+                    _ => Some(self.context.i64_type().array_type(n).const_zero().into()),
+                }
+            },
+            crate::sema::Ty::Vec(elem) => {
+                let inner = match elem.as_ref() {
+                    crate::sema::Ty::Any => self.context.i64_type().into(),
+                    _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
+                };
+                Some(self.vec_struct_ty(inner).const_zero().into())
+            },
+            crate::sema::Ty::Map { key, value } => {
+                let k = match key.as_ref() {
+                    crate::sema::Ty::Any => self.context.i64_type().into(),
+                    _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                };
+                let v = match value.as_ref() {
+                    crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
+                    _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
+                };
+                Some(self.map_struct_ty(k, v).const_zero().into())
+            },
+            crate::sema::Ty::Pointer(_) => Some(self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into()),
+            crate::sema::Ty::Optional(el) => {
+                let inner = self.llvm_ty_for_sema(el).unwrap();
+                Some(self.context.struct_type(&[inner.into(), self.context.bool_type().into()], false).const_zero().into())
+            }
+            crate::sema::Ty::Enum(n) => Some(self.enum_types.get(n).unwrap().const_zero().into()),
+            crate::sema::Ty::Float => Some(self.context.f32_type().const_float(0.0).into()),
+            crate::sema::Ty::Double => Some(self.context.f64_type().const_float(0.0).into()),
+            crate::sema::Ty::Generic(_, _) => Some(self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into()),
+            crate::sema::Ty::Tuple(_) => Some(self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into()),
+            crate::sema::Ty::Any => Some(self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into()),
+            crate::sema::Ty::Function(_, _) => Some(self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into()),
+        }
+    }
+
     fn codegen_class_method(&mut self, class: &ClassDecl, method: &Function) -> Result<(), CodegenError> {
         let methods = self.class_methods.get(&class.name).ok_or(CodegenError{message: format!("unknown class {}", class.name), span: class.name_span})?;
         let (func, info) = methods.get(&method.name).cloned().ok_or(CodegenError{message: format!("unknown method {}", method.name), span: method.name_span})?;
@@ -3088,62 +3155,9 @@ impl<'ctx> Codegen<'ctx> {
         }
         let always_returns = self.codegen_block(&method.body)?;
         if !always_returns && self.builder.get_insert_block().unwrap().get_terminator().is_none() {
-            if info.ret == crate::sema::Ty::Void {
-                self.builder.build_return(None).unwrap();
-            } else {
-                let zero: BasicValueEnum = match info.ret {
-                    crate::sema::Ty::Int => self.context.i64_type().const_int(0, false).into(),
-                    crate::sema::Ty::UInt => self.context.i64_type().const_int(0, false).into(),
-                    crate::sema::Ty::SizedInt { bits, .. } => self.llvm_int_for_bits(bits).const_int(0, false).into(),
-                    crate::sema::Ty::Bool => self.context.bool_type().const_int(0, false).into(),
-                    crate::sema::Ty::Char => self.context.i32_type().const_int(0, false).into(),
-                    crate::sema::Ty::String => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
-                    crate::sema::Ty::Struct(ref n) => self.struct_types.get(n).unwrap().const_zero().into(),
-                    crate::sema::Ty::Array(_) => self.context.i64_type().array_type(16).const_zero().into(),
-                    crate::sema::Ty::FixedArray { elem: ref elem, size: ref size } => {
-                        let n = size.unwrap_or(16) as u32;
-                        match self.llvm_ty_for_sema(elem.as_ref()) {
-                            Some(BasicTypeEnum::IntType(it)) => it.array_type(n).const_zero().into(),
-                            Some(BasicTypeEnum::FloatType(ft)) => ft.array_type(n).const_zero().into(),
-                            Some(BasicTypeEnum::PointerType(pt)) => pt.array_type(n).const_zero().into(),
-                            Some(BasicTypeEnum::StructType(st)) => st.array_type(n).const_zero().into(),
-                            Some(BasicTypeEnum::ArrayType(at)) => at.array_type(n).const_zero().into(),
-                            _ => self.context.i64_type().array_type(n).const_zero().into(),
-                        }
-                    },
-                    crate::sema::Ty::Vec(ref elem) => {
-                        let inner = match elem.as_ref() {
-                            crate::sema::Ty::Any => self.context.i64_type().into(),
-                            _ => self.llvm_ty_for_sema(elem).unwrap_or_else(|| self.context.i64_type().into()),
-                        };
-                        self.vec_struct_ty(inner).const_zero().into()
-                    },
-                    crate::sema::Ty::Map { key: ref key, value: ref value } => {
-                        let k = match key.as_ref() {
-                            crate::sema::Ty::Any => self.context.i64_type().into(),
-                            _ => self.llvm_ty_for_sema(key.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
-                        };
-                        let v = match value.as_ref() {
-                            crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
-                            _ => self.llvm_ty_for_sema(value.as_ref()).unwrap_or_else(|| self.context.i64_type().into()),
-                        };
-                        self.map_struct_ty(k, v).const_zero().into()
-                    },
-                    crate::sema::Ty::Pointer(_) => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
-                    crate::sema::Ty::Optional(ref el) => {
-                        let inner = self.llvm_ty_for_sema(el).unwrap();
-                        self.context.struct_type(&[inner.into(), self.context.bool_type().into()], false).const_zero().into()
-                    }
-                    crate::sema::Ty::Void => unreachable!(),
-                crate::sema::Ty::Enum(ref n) => self.enum_types.get(n).unwrap().const_zero().into(),
-                crate::sema::Ty::Float => self.context.f32_type().const_float(0.0).into(),
-                crate::sema::Ty::Double => self.context.f64_type().const_float(0.0).into(),
-                crate::sema::Ty::Generic(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
-                crate::sema::Ty::Tuple(_) => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
-                crate::sema::Ty::Any => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
-                crate::sema::Ty::Function(_, _) => self.context.ptr_type(inkwell::AddressSpace::default()).const_null().into(),
-                };
-                self.builder.build_return(Some(&zero)).unwrap();
+            match self.default_return_value(&info.ret) {
+                Some(zero) => { self.builder.build_return(Some(&zero)).unwrap(); }
+                None => { self.builder.build_return(None).unwrap(); }
             }
         }
         self.vars.pop();
@@ -6546,5 +6560,37 @@ impl OptLevel {
             OptLevel::Debug => inkwell::OptimizationLevel::Default,
             OptLevel::Release => inkwell::OptimizationLevel::Aggressive,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compile_src(src: &str) {
+        let lexed = crate::lexer::lex(src);
+        assert!(lexed.errors.is_empty(), "lex errors: {:?}", lexed.errors);
+        let prog = crate::parse::parse(lexed.tokens, src.to_string()).unwrap();
+        let ctx = inkwell::context::Context::create();
+        let mut cg = Codegen::new(&ctx, "test");
+        cg.compile_program(&prog)
+            .expect("codegen failed");
+    }
+
+    /// Regression: `void` extension methods used to emit `ret i64 0`,
+    /// failing module verification (`extension U::ex verify failed`).
+    #[test]
+    fn void_extension_method_verifies() {
+        compile_src("class U has\nend\nextend U do\nvoid ex() do\nreturn\nend\nend\n");
+    }
+
+    #[test]
+    fn void_extension_method_fallthrough_verifies() {
+        compile_src("class U has\nend\nextend U do\nvoid ex() do\nint x = 1\nend\nend\n");
+    }
+
+    #[test]
+    fn int_extension_method_verifies() {
+        compile_src("class U has\nend\nextend U do\nint ex() do\nreturn 1\nend\nend\n");
     }
 }
