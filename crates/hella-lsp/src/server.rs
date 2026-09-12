@@ -37,6 +37,9 @@ struct State {
     progress: ProgressState,
     /// Counter for server→client request ids (`hella/progress/<n>`).
     next_request_id: u64,
+    /// Client advertised `completionItem/snippetSupport`: enables call
+    /// snippets and `end`-closing block templates in completion.
+    snippet_support: bool,
 }
 
 /// Blocking entry point: runs the LSP loop until `exit`.
@@ -56,6 +59,14 @@ pub fn run() -> i32 {
 
     let mut state = State::default();
     state.workspace_roots = workspace_roots(&init);
+    state.snippet_support = init
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|t| t.completion.as_ref())
+        .and_then(|c| c.completion_item.as_ref())
+        .and_then(|i| i.snippet_support)
+        .unwrap_or(false);
 
     let result = InitializeResult {
         capabilities: server_capabilities(),
@@ -391,12 +402,18 @@ impl State {
     }
 
     fn completions(&self, params: &CompletionParams) -> Option<CompletionResponse> {
+        let uri = &params.text_document_position.text_document.uri;
         let (doc, offset) = self.doc_at(
-            &params.text_document_position.text_document.uri,
+            uri,
             &params.text_document_position.position,
         )?;
-        let a = self.analysis.get(doc.uri.as_str())?;
-        let items = a.completions(&doc.text, offset);
+        // Completion parses error-tolerantly on its own (mid-typing
+        // buffers with an incomplete `receiver.|` rarely parse cleanly),
+        // so it does not use the cached analysis. The document path drives
+        // import-path completion and loading imported names.
+        let path = crate::document::uri_to_path(uri);
+        let items =
+            Analysis::complete_with_path(&doc.text, path.as_deref(), offset, self.snippet_support);
         Some(CompletionResponse::Array(items))
     }
 

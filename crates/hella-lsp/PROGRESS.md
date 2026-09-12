@@ -27,5 +27,7 @@ Protocol over stdio, reusing the `compiler` crate for lex/parse/sema.
 - [ ] Diagnostics: lex/parse/sema errors -> `textDocument/publishDiagnostics`.
 - [ ] Symbol table from AST (functions, structs, classes, enums, consts, locals, params).
 - [ ] Features: hover, goto-definition, completion, document symbols.
+  - [x] Completion: tiered locals/symbols/keywords; member completion after `.` (locals' struct/class types, `this`, enum variants, typedef resolution, unresolvable → global fallback); error-tolerant dummy-ident retry for mid-typing buffers; call snippets + `end`-closing block templates when the client advertises `snippetSupport`.
+  - [x] Completion robustness: `end`-balancing for unclosed mid-typing blocks; import-path completion (`import std::|` lists modules/subdirs from the project + stdlib roots); names from directly imported files complete as globals (selective `::{a, b}` respected) and feed member-type resolution.
 - [x] Server-initiated work-done progress (`src/progress.rs`): `window/workDoneProgress/create` after the initialize handshake, then `$/progress` begin/report/end around the startup `.hll` workspace scan ("Indexing Hella workspace"); silent on clients that reject `create`.
 - [ ] Tests + manual verification with a driver script.
