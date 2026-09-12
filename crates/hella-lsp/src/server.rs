@@ -149,7 +149,13 @@ fn handle_request(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match req.method.as_str() {
         HoverRequest::METHOD => {
-            let (id, params) = extract::<HoverParams>(req, HoverRequest::METHOD)?;
+            let (id, params) = match extract::<HoverParams>(req, HoverRequest::METHOD) {
+                Ok(v) => v,
+                Err((id, msg)) => {
+                    send_err(connection, id, msg);
+                    return Ok(());
+                }
+            };
             let result = state
                 .hover(&params)
                 .map(|h| serde_json::to_value(h))
@@ -158,7 +164,13 @@ fn handle_request(
             send_ok(connection, id, result);
         }
         GotoDefinition::METHOD => {
-            let (id, params) = extract::<GotoDefinitionParams>(req, GotoDefinition::METHOD)?;
+            let (id, params) = match extract::<GotoDefinitionParams>(req, GotoDefinition::METHOD) {
+                Ok(v) => v,
+                Err((id, msg)) => {
+                    send_err(connection, id, msg);
+                    return Ok(());
+                }
+            };
             let result = state
                 .definition(&params)
                 .map(|d| serde_json::to_value(d))
@@ -167,7 +179,13 @@ fn handle_request(
             send_ok(connection, id, result);
         }
         Completion::METHOD => {
-            let (id, params) = extract::<CompletionParams>(req, Completion::METHOD)?;
+            let (id, params) = match extract::<CompletionParams>(req, Completion::METHOD) {
+                Ok(v) => v,
+                Err((id, msg)) => {
+                    send_err(connection, id, msg);
+                    return Ok(());
+                }
+            };
             let result = state
                 .completions(&params)
                 .map(|c| serde_json::to_value(c))
@@ -176,8 +194,14 @@ fn handle_request(
             send_ok(connection, id, result);
         }
         DocumentSymbolRequest::METHOD => {
-            let (id, params) =
-                extract::<DocumentSymbolParams>(req, DocumentSymbolRequest::METHOD)?;
+            let (id, params) = match extract::<DocumentSymbolParams>(req, DocumentSymbolRequest::METHOD)
+            {
+                Ok(v) => v,
+                Err((id, msg)) => {
+                    send_err(connection, id, msg);
+                    return Ok(());
+                }
+            };
             let result = state
                 .document_symbols(&params)
                 .map(|d| serde_json::to_value(d))
@@ -197,14 +221,27 @@ fn handle_request(
     Ok(())
 }
 
+/// Deserialize request params without consuming the request, so a malformed
+/// payload can still be answered with `InvalidParams` (same `id`) instead
+/// of hanging the client with silence.
 fn extract<P: serde::de::DeserializeOwned>(
     req: Request,
     method: &str,
-) -> Result<(RequestId, P), Box<dyn std::error::Error>> {
-    let (id, params) = req
-        .extract::<P>(method)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-    Ok((id, params))
+) -> Result<(RequestId, P), (RequestId, String)> {
+    if req.method != method {
+        let id = req.id.clone();
+        return Err((id, format!("method mismatch: expected {method}")));
+    }
+    let id = req.id.clone();
+    match serde_json::from_value(req.params) {
+        Ok(params) => Ok((id, params)),
+        Err(e) => Err((id, format!("invalid params for {method}: {e}"))),
+    }
+}
+
+fn send_err(connection: &Connection, id: RequestId, msg: String) {
+    let resp = Response::new_err(id, lsp_server::ErrorCode::InvalidParams as i32, msg);
+    let _ = connection.sender.send(resp.into());
 }
 
 fn send_ok(connection: &Connection, id: RequestId, result: serde_json::Value) {

@@ -26,6 +26,8 @@ use crate::document::span_to_range;
 pub enum SymKind {
     Function,
     Method,
+    Constructor,
+    Destructor,
     Struct,
     Class,
     Enum,
@@ -46,7 +48,9 @@ impl SymKind {
         use SymKind::*;
         match self {
             Function => SymbolKind::FUNCTION,
-            Method => SymbolKind::METHOD,
+            Constructor => SymbolKind::CONSTRUCTOR,
+            // LSP has no destructor kind; destructors are method-like.
+            Method | Destructor => SymbolKind::METHOD,
             Struct => SymbolKind::STRUCT,
             Class => SymbolKind::CLASS,
             Enum => SymbolKind::ENUM,
@@ -65,6 +69,10 @@ impl SymKind {
         use SymKind::*;
         match self {
             Function | Method => CompletionItemKind::FUNCTION,
+            Constructor => CompletionItemKind::CONSTRUCTOR,
+            // No destructor kind exists; completed via filtering (see
+            // `completes_as_expression`) — this arm is unreachable there.
+            Destructor => CompletionItemKind::METHOD,
             Struct | Class | Enum | Trait => CompletionItemKind::STRUCT,
             Typedef | Distinct => CompletionItemKind::TYPE_PARAMETER,
             Constant => CompletionItemKind::CONSTANT,
@@ -75,10 +83,19 @@ impl SymKind {
         }
     }
 
+    /// Whether a symbol may appear as an expression completion item.
+    /// Constructors/destructors are outline-only (`Rect(...)` completes via
+    /// the class snippet; `this.~C` is not syntax).
+    fn completes_as_expression(self) -> bool {
+        !matches!(self, SymKind::Constructor | SymKind::Destructor)
+    }
+
     fn heading(self) -> &'static str {
         use SymKind::*;
         match self {
             Function | Method => "function/method",
+            Constructor => "constructor",
+            Destructor => "destructor",
             Struct => "struct",
             Class => "class",
             Enum => "enum",
@@ -271,6 +288,40 @@ fn collect_item(&mut self, item: &Item) {
                         self.collect_params(std::slice::from_ref(param), p.span);
                         self.collect_block(body, p.span);
                     }
+                }
+                for k in &c.constructors {
+                    children.push(
+                        make_symbol(
+                            &k.name,
+                            SymKind::Constructor,
+                            k.name_span,
+                            k.span,
+                            format!("{}({})", k.name, format_params(&k.params)),
+                            Vec::new(),
+                        )
+                        .with_params(&param_pairs(&k.params)),
+                    );
+                    self.collect_params(&k.params, k.span);
+                    if let Some(b) = &k.body {
+                        self.collect_block(b, k.span);
+                    }
+                }
+                for d in &c.destructors {
+                    children.push(make_symbol(
+                        &format!("~{}", d.name),
+                        SymKind::Destructor,
+                        d.name_span,
+                        d.span,
+                        format!("~{}()", d.name),
+                        Vec::new(),
+                    ));
+                    self.collect_block(&d.body, d.span);
+                }
+                for o in &c.operators {
+                    self.collect_block_locals(&o.body, o.span, &o.params);
+                }
+                for cv in &c.conversions {
+                    self.collect_block(&cv.body, cv.span);
                 }
                 // First constructor's parameters drive the call snippet on
                 // the class name (`Rect(${1:int w})$0`).
@@ -980,16 +1031,17 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
                 items.push(symbol_item(l, 0, snippets));
             }
         }
-        // Top-level + nested symbols.
+        // Top-level + nested symbols (constructors/destructors are
+        // outline-only, not expressions).
         for s in self.top_recursive() {
-            if matches(&s.name) {
+            if s.kind.completes_as_expression() && matches(&s.name) {
                 items.push(symbol_item(s, 1, snippets));
             }
         }
         // Names from directly imported files (same tier: imports are
         // textually inlined before sema, so these are in-scope names).
         for s in self.imported_recursive() {
-            if matches(&s.name) {
+            if s.kind.completes_as_expression() && matches(&s.name) {
                 items.push(symbol_item(s, 1, snippets));
             }
         }
@@ -1039,7 +1091,10 @@ fn collect_stmt(&mut self, stmt: &Stmt, scope: Span) {
         let prefix = prefix.to_lowercase();
         let mut items: Vec<CompletionItem> = members
             .into_iter()
-            .filter(|m| prefix.is_empty() || m.name.to_lowercase().starts_with(&prefix))
+            .filter(|m| {
+                m.kind.completes_as_expression()
+                    && (prefix.is_empty() || m.name.to_lowercase().starts_with(&prefix))
+            })
             .map(|m| symbol_item(m, 0, snippets))
             .collect();
         sort_completions(&mut items);
@@ -1949,6 +2004,30 @@ mod tests {
             "class name completes: {:?}",
             labels(&items)
         );
+    }
+
+    #[test]
+    fn completion_destructor_body_locals() {
+        let src = "class C has\n  int n\n  ~C() do\n    int x = n\n    x\n  end\nend";
+        let off = src.rfind("\n    x").unwrap() + 6; // right after `x`
+        let items = Analysis::complete(src, off, false);
+        assert_eq!(labels(&items), vec!["x"], "local filtered by prefix");
+        // fields are visible in the same scope with an empty prefix
+        let off2 = src.find("do\n").unwrap() + 3;
+        let items2 = Analysis::complete(src, off2, false);
+        let names2 = labels(&items2);
+        assert!(names2.contains(&"n"), "fields visible in dtor: {names2:?}");
+        assert!(!names2.contains(&"x"), "later local not visible: {names2:?}");
+    }
+
+    #[test]
+    fn completion_constructor_body_params() {
+        let src = "class C has\n  int n\n  C(int c) initialize do\n    this.n = c\n  end\nend";
+        let off = src.find("= c").unwrap() + 2;
+        let items = Analysis::complete(src, off, false);
+        let names = labels(&items);
+        assert!(names.contains(&"c"), "ctor params: {names:?}");
+        assert!(names.contains(&"n"), "fields visible in ctor: {names:?}");
     }
 
     #[test]

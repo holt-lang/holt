@@ -43,10 +43,16 @@ pub struct Codegen<'ctx> {
     enum_variant_tags: HashMap<String, HashMap<String, u32>>,
     class_methods: HashMap<String, HashMap<String, (FunctionValue<'ctx>, TyInfo)>>,
     class_constructors: HashMap<String, Vec<(FunctionValue<'ctx>, TyInfo)>>,
+    class_destructors: HashMap<String, Vec<(FunctionValue<'ctx>, TyInfo)>>,
     class_properties: HashMap<String, HashMap<String, PropertyCG<'ctx>>>,
     class_operators: HashMap<String, HashMap<String, (FunctionValue<'ctx>, TyInfo)>>,
     loop_stack: Vec<LoopContext<'ctx>>,
     defer_stack: Vec<Vec<DeferStmt>>,
+    /// Locals requiring destructor calls at scope exit, in declaration order.
+    /// Parallel to `defer_stack`: pushed/popped together with each
+    /// `codegen_block` scope (plus the manual `for`-var scope). Each entry
+    /// is `(alloca, class_name)`.
+    scope_dtors: Vec<Vec<(PointerValue<'ctx>, String)>>,
     cur_fn: Option<FunctionValue<'ctx>>,
     cur_is_main: bool,
     cur_class: Option<String>,
@@ -98,11 +104,13 @@ impl<'ctx> Codegen<'ctx> {
             enum_variant_tags: HashMap::new(),
             class_methods: HashMap::new(),
             class_constructors: HashMap::new(),
+            class_destructors: HashMap::new(),
             class_properties: HashMap::new(),
             class_operators: HashMap::new(),
             closure_count: 0,
             loop_stack: Vec::new(),
             defer_stack: Vec::new(),
+            scope_dtors: Vec::new(),
             cur_fn: None,
             cur_is_main: false,
             cur_class: None,
@@ -169,6 +177,7 @@ impl<'ctx> Codegen<'ctx> {
                 Item::Class(c) => {
                     for m in &c.methods { self.codegen_class_method(c, m)?; }
                     for (idx, ctor) in c.constructors.iter().enumerate() { self.codegen_constructor(c, ctor, idx)?; }
+                    for (idx, dtor) in c.destructors.iter().enumerate() { self.codegen_destructor(c, dtor, idx)?; }
                     for prop in &c.properties { self.codegen_property(c, prop)?; }
                     for op in &c.operators { self.codegen_operator(c, op)?; }
                     for conv in &c.conversions { self.codegen_conversion(c, conv)?; }
@@ -505,6 +514,16 @@ impl<'ctx> Codegen<'ctx> {
             ctors.push((func, TyInfo{ret: crate::sema::Ty::Void, params: param_semas.clone(), param_modes: full_modes, param_names: full_names, param_is_variadic: full_variadic}));
         }
         if !ctors.is_empty() { self.class_constructors.insert(c.name.clone(), ctors); }
+        // Declare destructors: `void (ptr this)`, mangled `Class__dtor`
+        let mut dtors = Vec::new();
+        for (idx, _dtor) in c.destructors.iter().enumerate() {
+            let this_ty: inkwell::types::BasicMetadataTypeEnum = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+            let fn_ty = self.context.void_type().fn_type(&[this_ty], false);
+            let mangled = format!("{}__dtor{}", c.name, if c.destructors.len()>1 { format!("{}", idx)} else {"".to_string()});
+            let func = self.module.add_function(&mangled, fn_ty, None);
+            dtors.push((func, TyInfo{ret: crate::sema::Ty::Void, params: vec![crate::sema::Ty::Struct(c.name.clone())], param_modes: vec![ParamMode::None], param_names: vec!["this".to_string()], param_is_variadic: vec![false]}));
+        }
+        if !dtors.is_empty() { self.class_destructors.insert(c.name.clone(), dtors); }
         // Declare properties: getter/setter — allow separate declarations that merge
         let mut props = HashMap::new();
         for prop in &c.properties {
@@ -3210,6 +3229,79 @@ impl<'ctx> Codegen<'ctx> {
         Ok(())
     }
 
+    fn codegen_destructor(&mut self, class: &ClassDecl, dtor: &DestructorDecl, idx: usize) -> Result<(), CodegenError> {
+        let mangled = format!("{}__dtor{}", class.name, if class.destructors.len()>1 { format!("{}", idx)} else { "".to_string()});
+        let func = self.module.get_function(&mangled).ok_or(CodegenError{message: format!("dtor not declared {}", mangled), span: dtor.span})?;
+        self.cur_fn = Some(func);
+        self.cur_class = Some(class.name.clone());
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        self.vars.push(HashMap::new());
+        let this_ty: BasicTypeEnum<'ctx> = self.context.ptr_type(inkwell::AddressSpace::default()).into();
+        let this_param = func.get_nth_param(0).unwrap();
+        let this_alloca = self.create_entry_block_alloca("this", this_ty);
+        self.builder.build_store(this_alloca, this_param).unwrap();
+        self.vars.last_mut().unwrap().insert("this".to_string(), (this_alloca, this_ty));
+        let _ = self.codegen_block(&dtor.body)?;
+        if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+            self.builder.build_return(None).unwrap();
+        }
+        self.vars.pop();
+        self.cur_fn = None;
+        self.cur_class = None;
+        if !func.verify(true) { return Err(CodegenError{message: format!("dtor {} failed verify", class.name), span: dtor.span}); }
+        Ok(())
+    }
+
+    /// Class name for a declared local type if it has a destructor.
+    fn dtor_class_for_ty(&self, ty: &Type) -> Option<String> {
+        let name = match ty {
+            Type::Named(n, _) => n.rsplit("::").next().unwrap_or(n).to_string(),
+            Type::Generic(n, _, _) => n.rsplit("::").next().unwrap_or(n).to_string(),
+            _ => return None,
+        };
+        if self.class_destructors.contains_key(&name) { Some(name) } else { None }
+    }
+
+    fn emit_dtor_call(&mut self, alloca: PointerValue<'ctx>, class_name: &str) {
+        if let Some(dtors) = self.class_destructors.get(class_name).cloned() {
+            for (func, _) in dtors {
+                let arg: inkwell::values::BasicMetadataValueEnum = alloca.into();
+                let _ = self.builder.build_call(func, &[arg], "dtor.call");
+            }
+        }
+    }
+
+    /// Emit destructor calls for the innermost scope (reverse declaration order).
+    fn emit_current_scope_dtors(&mut self) {
+        if let Some(scope) = self.scope_dtors.last().cloned() {
+            for (alloca, class_name) in scope.iter().rev() {
+                self.emit_dtor_call(*alloca, class_name);
+            }
+        }
+    }
+
+    /// Emit destructor calls for all active scopes (innermost first).
+    fn emit_all_dtors(&mut self) {
+        let scopes = self.scope_dtors.clone();
+        for scope in scopes.iter().rev() {
+            for (alloca, class_name) in scope.iter().rev() {
+                self.emit_dtor_call(*alloca, class_name);
+            }
+        }
+    }
+
+    /// Emit destructor calls for scopes at or above `target_depth`
+    /// (mirrors `emit_defers_up_to`; `target_depth` is the preserved prefix).
+    fn emit_dtors_up_to(&mut self, target_depth: usize) {
+        let scopes = self.scope_dtors.clone();
+        for scope in scopes.iter().skip(target_depth).rev() {
+            for (alloca, class_name) in scope.iter().rev() {
+                self.emit_dtor_call(*alloca, class_name);
+            }
+        }
+    }
+
     fn codegen_property(&mut self, class: &ClassDecl, prop: &PropertyDecl) -> Result<(), CodegenError> {
         if let Some(getter) = &prop.getter {
             let mangled = format!("{}__get_{}", class.name, prop.name);
@@ -3420,6 +3512,7 @@ impl<'ctx> Codegen<'ctx> {
     fn codegen_block(&mut self, block: &Block) -> Result<bool, CodegenError> {
         self.vars.push(HashMap::new());
         self.defer_stack.push(Vec::new());
+        self.scope_dtors.push(Vec::new());
         let mut always_returns = false;
         for stmt in &block.stmts {
             if self
@@ -3439,13 +3532,18 @@ impl<'ctx> Codegen<'ctx> {
                 always_returns = true;
             }
         }
-        // Emit defers for this block on normal exit
+        // Emit defers for this block on normal exit, then destructors.
+        // Defers run first so deferred code can still use live locals.
         if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
             self.emit_current_scope_defers()?;
+            if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                self.emit_current_scope_dtors();
+            }
         } else {
             // already terminated, just clear any remaining defers for this scope (they were emitted via return/break)
             if let Some(v) = self.defer_stack.last_mut() { v.clear(); }
         }
+        self.scope_dtors.pop();
         self.defer_stack.pop();
         self.vars.pop();
         Ok(always_returns)
@@ -3529,6 +3627,16 @@ impl<'ctx> Codegen<'ctx> {
                 // Track strings for `len()`/`is_empty()` lowering.
                 if matches!(&d.ty, Type::String(_)) {
                     self.string_vars.insert(d.name.clone());
+                }
+                // Track class locals with destructors for RAII scope-exit calls.
+                // `this` is the borrowed receiver, never owned: skip it so a
+                // method/dtor body never destroys its own receiver.
+                if d.name != "this" {
+                    if let Some(class_name) = self.dtor_class_for_ty(&d.ty) {
+                        if let Some(top) = self.scope_dtors.last_mut() {
+                            top.push((alloca, class_name));
+                        }
+                    }
                 }
                 if let Some(init) = &d.init {
                     // Fixed-array initializer: store each element via GEP so
@@ -3872,6 +3980,9 @@ impl<'ctx> Codegen<'ctx> {
             Stmt::Block(b) => self.codegen_block(b),
             Stmt::Return(r) => {
                 self.emit_all_defers()?;
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    self.emit_all_dtors();
+                }
                 if self.cur_is_main {
                     if let Some(expr) = &r.value {
                         let val = self.codegen_expr(expr)?;
@@ -4113,6 +4224,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Create loop scope for var
                 self.vars.push(HashMap::new());
                 self.defer_stack.push(Vec::new());
+                self.scope_dtors.push(Vec::new());
                 // Declare for var in this scope
                 // If iter is array, element type is int
                 let iter_is_vec_here = matches!(&f.iter.kind, ExprKind::Ident(n) if self.is_vec_var(n));
@@ -4203,6 +4315,10 @@ impl<'ctx> Codegen<'ctx> {
                 if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
                     self.emit_current_scope_defers().unwrap();
                 }
+                if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
+                    self.emit_current_scope_dtors();
+                }
+                self.scope_dtors.pop();
                 self.defer_stack.pop();
                 self.vars.pop();
                 if self.builder.get_insert_block().unwrap().get_terminator().is_none() {
@@ -4236,6 +4352,7 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 let ctx = self.loop_stack[target_idx].clone();
                 self.emit_defers_up_to(ctx.defer_depth)?;
+                self.emit_dtors_up_to(ctx.defer_depth);
                 self.builder.build_unconditional_branch(ctx.exit_bb).unwrap();
                 Ok(false)
             }
@@ -4248,6 +4365,7 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 let ctx = self.loop_stack[target_idx].clone();
                 self.emit_defers_up_to(ctx.defer_depth)?;
+                self.emit_dtors_up_to(ctx.defer_depth);
                 self.builder.build_unconditional_branch(ctx.cond_bb).unwrap();
                 Ok(false)
             }
